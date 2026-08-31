@@ -206,11 +206,19 @@ fn start_controller(
         local_vad_cfg: cfg.vad.clone(),
         remote_cfg: cfg.remote.clone(),
     });
+    let builtin = match kikigaki_core::replace::builtin_rules() {
+        Ok(rules) => Arc::new(rules),
+        Err(error) => {
+            tracing::error!(%error, "failed to parse builtin replacement dictionary");
+            Arc::new(kikigaki_core::replace::Rules::default())
+        }
+    };
     let postprocess_factory = Box::new(TauriPostprocessFactory {
         models_dir: cfg.models_dir.clone(),
         replace_file: cfg.replace_file.clone(),
         punct_cfg: cfg.punct.clone(),
         num_threads: usize::try_from(cfg.asr.num_threads).unwrap_or(1),
+        builtin,
     });
     let startup_port = Box::new(crate::startup::StartupCoordinatorPort::new(startup_plan));
     let models_dir = cfg.models_dir.clone();
@@ -379,12 +387,14 @@ struct TauriPostprocessFactory {
     replace_file: std::path::PathBuf,
     punct_cfg: kikigaki_core::config::PunctConfig,
     num_threads: usize,
+    builtin: Arc<kikigaki_core::replace::Rules>,
 }
 
 impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
     fn build(
         &self,
         learned: Arc<kikigaki_core::replace::Rules>,
+        builtin_enabled: bool,
         waker: Option<kikigaki_core::engine::Waker>,
     ) -> anyhow::Result<kikigaki_core::postprocess::PostprocessWorker> {
         let punctuator: Box<dyn kikigaki_core::postprocess::Punctuator> = {
@@ -409,7 +419,13 @@ impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
         Ok(
             kikigaki_core::postprocess::PostprocessWorker::spawn_with_waker(
                 kikigaki_core::postprocess::Pipeline::new(
-                    replace, punctuator, false, false, learned,
+                    replace,
+                    punctuator,
+                    false,
+                    false,
+                    Arc::clone(&self.builtin),
+                    builtin_enabled,
+                    learned,
                 ),
                 waker,
             ),

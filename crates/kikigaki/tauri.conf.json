@@ -28,6 +28,10 @@
     "active": true,
     "targets": ["app", "dmg"],
     "icon": ["icons/icon.png"],
+    "resources": {
+      "../../NOTICE": "NOTICE",
+      "../../licenses/": "licenses/"
+    },
     "macOS": {
       "minimumSystemVersion": "13.0",
       "signingIdentity": "-",

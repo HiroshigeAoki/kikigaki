@@ -1,0 +1,23 @@
+kikigaki bundled license texts
+===============================
+
+This directory ships upstream license texts inside the app bundle
+(Contents/Resources/licenses/), alongside NOTICE at Contents/Resources/NOTICE.
+See ../NOTICE for the full attribution list and the static-library inventory.
+
+Files here:
+
+- sherpa-onnx.LICENSE  — Apache License 2.0 (k2-fsa/sherpa-onnx)
+- onnxruntime.LICENSE  — MIT License (microsoft/onnxruntime)
+- silero-vad.LICENSE   — MIT License (snakers4/silero-vad)
+- hayamimi.LICENSE     — MIT License (oboroge0/hayamimi)
+
+Apache-2.0 model coverage
+--------------------------
+
+ReazonSpeech (the zipformer ASR model) and mojicast-punct-onnx (the punctuation
+model) are both distributed under the Apache License 2.0, but neither upstream
+project ships its own copy of the license text in a redistributable location.
+They are covered by the Apache-2.0 text in sherpa-onnx.LICENSE — the same
+license, verbatim — plus the attribution lines for each in NOTICE. No separate
+license file is duplicated here for them.

@@ -8,3 +8,6 @@ SYNC_SHA
 docs/plans/
 docs/review-mockups/
 docs/reference/
+
+# Claude Code maintainer-local notes
+CLAUDE.local.md

@@ -80,3 +80,5 @@ Wi-Fi	ワイファイ	common ASR form
 PostgreSQL	ポスグレ	common abbreviation (was in placeholder dict)
 PostgreSQL	ポストグレス	common reading (was in placeholder dict)
 COBOL	コボル	language; reading below the 4-char floor, intentionally rejected
+Kubernetes	クマネティス	ASR misrecognition variant of Kubernetes observed in field test; non-word, no collision risk
+Kubernetes	クーベネディス	ASR misrecognition variant of Kubernetes observed in field test; non-word, no collision risk

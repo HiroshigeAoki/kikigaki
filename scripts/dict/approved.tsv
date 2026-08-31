@@ -77,6 +77,8 @@
 クロームキャスト	Chromecast	neologd	neologd-seed.csv.xz:276077	well-known dev term; reading verified
 クーバネティス	Kubernetes	curated-extra	curated-extra.tsv:6: Long-vowel variant	human-authored curated entry
 クーベネティス	Kubernetes	curated-extra	curated-extra.tsv:7: Alternative long-vowel variant	human-authored curated entry
+クマネティス	Kubernetes	curated-extra	curated-extra.tsv:83: ASR misrecognition variant of Kubernetes observed in field test; non-word, no collision risk	human-authored curated entry
+クーベネディス	Kubernetes	curated-extra	curated-extra.tsv:84: ASR misrecognition variant of Kubernetes observed in field test; non-word, no collision risk	human-authored curated entry
 グラファナ	Grafana	curated-extra	curated-extra.tsv:33: Observability dashboard	human-authored curated entry
 グラフキューエル	GraphQL	curated-extra	curated-extra.tsv:29: API query language	human-authored curated entry
 グレイドル	Gradle	neologd	neologd-seed.csv.xz:299892	well-known dev term; reading verified

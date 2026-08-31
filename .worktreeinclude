@@ -1,0 +1,2 @@
+# Files Claude Code copies into new worktrees (gitignored files only)
+CLAUDE.local.md

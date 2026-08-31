@@ -1,0 +1,53 @@
+[package]
+name = "kikigaki"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kikigaki"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kikigaki"
+path = "src/main.rs"
+
+[features]
+default = ["punct"]
+punct = ["kikigaki-engine/punct"]
+devtools = ["tauri/devtools"]
+remote-engine = ["kikigaki-core/remote-engine"]
+
+[dependencies]
+kikigaki-core = { path = "../kikigaki-core" }
+kikigaki-engine = { path = "../kikigaki-engine" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender = "=0.2.5"
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+toml_edit = "=0.22.22"
+dirs.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util.workspace = true
+unicode-segmentation = "=1.12.0"
+tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.18"
+enigo = "0.6"
+arboard = "3.6"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+tauri = { version = "=2.11.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "=2.3.0"
+tauri-plugin-autostart = "=2.5.0"
+tauri-plugin-single-instance = "=2.3.4"
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }

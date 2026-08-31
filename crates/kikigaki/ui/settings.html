@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>kikigaki</title>
+    <link rel="stylesheet" href="settings.css">
+  </head>
+  <body>
+    <main class="body">
+      <div class="scene" id="scene-settings">
+        <div class="status scene-status">
+          <div class="dot load" id="statusDot"></div>
+          <div class="t"><b id="statusMain">準備中</b><span id="statusSub"></span></div>
+          <div class="hint" id="statusHint"></div>
+        </div>
+
+        <section class="group">
+          <h2>ホットキー</h2>
+          <div class="row">
+            <div class="l"><b>押している間だけ聞き取る</b><small>離すと最後の文を貼り付けます</small></div>
+            <button class="hk" id="hkButton" type="button" aria-label="ホットキーを変更">
+              <span class="kbd" id="hkKbd"></span><span class="cap" id="hkCap">変更</span>
+            </button>
+          </div>
+          <p class="note" id="hkNote">クリックしてから新しいキーの組み合わせを押してください。修飾キーを 1 つ以上含む必要があります。</p>
+        </section>
+
+        <section class="group">
+          <h2>文字起こし</h2>
+          <div class="row">
+            <div class="l"><b>句読点</b><small>「、」「。」を自動で入れます。チャット欄などでは文末の「。」だけ省けます</small></div>
+            <div class="seg" id="punctSeg" role="group" aria-label="句読点">
+              <button type="button" data-value="off" aria-pressed="false">付けない</button>
+              <button type="button" data-value="on" aria-pressed="false">付ける</button>
+              <button type="button" data-value="on_strip" aria-pressed="false">文末の「。」は除く</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="group">
+          <h2>最近の聞き取り</h2>
+          <div class="hist" id="historyList"></div>
+          <p class="note">直近 200 件。テキストのみ保存し、音声は残しません。同じ言い間違いが続くときに「直す」と、次から自動で置き換えます。</p>
+          <div class="subsection-heading">置き換え一覧</div>
+          <div class="learned" id="learnedList"></div>
+        </section>
+
+        <section class="group">
+          <h2>一般</h2>
+          <div class="row">
+            <div class="l"><b>ログイン時に起動</b></div>
+            <button class="switch" id="autostartSwitch" type="button" role="switch" aria-checked="false" aria-label="ログイン時に起動"></button>
+          </div>
+          <div class="row">
+            <div class="l"><b>モデル</b><small id="modelsDetail">ReazonSpeech ja-en · Silero VAD · mojicast 句読点</small></div>
+            <span class="status-small ok" id="modelsStatus">インストール済み</span>
+          </div>
+          <div class="row">
+            <div class="l"><b>履歴</b><small>最近の聞き取りをこのウィンドウから消去します</small></div>
+            <button class="btn small" id="clearHistoryButton" type="button">履歴を消去</button>
+          </div>
+          <div class="row">
+            <div class="l"><b>詳細設定</b><small>入力方法・VAD・スレッド数などは設定ファイルで変更できます</small></div>
+            <button class="btn small" id="openConfigButton" type="button">設定ファイルを開く</button>
+          </div>
+          <div class="row">
+            <div class="l"><b>kikigaki を終了</b><small>メニューバーのアイコンをクリックするとこのウィンドウが開閉します</small></div>
+            <button class="btn small" id="quitButton" type="button">終了</button>
+          </div>
+        </section>
+      </div>
+
+      <div class="scene" id="scene-onboarding" hidden>
+        <div class="hero"><h3>kikigaki をはじめる</h3><p>3 つの準備が終わると、ホットキーを押している間の声が文字になります。</p></div>
+        <div class="steps">
+          <div class="step" id="stepMic">
+            <div class="n" id="stepMicNumber">1</div>
+            <div><b>マイクへのアクセス</b><small id="stepMicDetail"></small></div>
+            <button class="btn small primary" id="stepMicButton" type="button">許可する</button>
+          </div>
+          <div class="step" id="stepAx">
+            <div class="n" id="stepAxNumber">2</div>
+            <div><b>アクセシビリティ</b><small id="stepAxDetail">文字を貼り付けるために必要です。</small></div>
+            <button class="btn small primary" id="stepAxButton" type="button">システム設定を開く</button>
+          </div>
+          <div class="step" id="stepModels">
+            <div class="n" id="stepModelsNumber">3</div>
+            <div class="step-body"><b>音声モデルをダウンロード</b><small id="stepModelsDetail"></small>
+              <progress id="stepModelsBar" hidden max="100" value="0"></progress>
+              <div class="prog" id="stepModelsProg" hidden></div>
+            </div>
+            <button class="btn small primary" id="stepModelsButton" type="button">ダウンロード</button>
+          </div>
+        </div>
+        <p class="note onboarding-note">通信はこのダウンロードのみで、音声は端末の外に出ません。</p>
+        <p class="note onboarding-note">Gatekeeper 未署名（not Apple-notarized）のため、初回のみ右クリック › 開く が必要です。</p>
+      </div>
+
+      <div class="scene config-error" id="scene-config-error" hidden>
+        <div class="hero"><h3>設定ファイルにエラーがあります</h3><p id="configErrorMessage"></p></div>
+        <div class="actions config-actions">
+          <button class="btn small" id="configErrorOpenButton" type="button">設定ファイルを開く</button>
+          <button class="btn small primary" id="configErrorRetryButton" type="button">再試行</button>
+        </div>
+        <p class="inline-err scene-error" id="configErrorNote" hidden></p>
+      </div>
+    </main>
+    <script src="settings.js"></script>
+  </body>
+</html>

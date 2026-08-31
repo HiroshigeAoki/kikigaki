@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "neologd-seed",
+      "url": "https://github.com/neologd/mecab-ipadic-neologd/blob/abc61e33d8be3d0ead202e6b1df064c72d5ccf11/seed/mecab-user-dict-seed.20200910.csv.xz",
+      "pinned_commit": "abc61e33d8be3d0ead202e6b1df064c72d5ccf11",
+      "blob_sha": "4f05d9e235af92c7d37e2abaf5918af5d640b2c0",
+      "sha256": "471ae4ac077a7d5f5b40ac5c3d097cdf5d658a71b1cc042db5bdb176790ba2c5",
+      "license": "Apache-2.0",
+      "retrieval_date": "2026-08-31"
+    },
+    {
+      "id": "neologd-copying",
+      "url": "https://github.com/neologd/mecab-ipadic-neologd/blob/abc61e33d8be3d0ead202e6b1df064c72d5ccf11/COPYING",
+      "pinned_commit": "abc61e33d8be3d0ead202e6b1df064c72d5ccf11",
+      "blob_sha": "43d83b44ffb88a799a3c485908ead4ea7f3c9e4a",
+      "sha256": "428ad012b9b7baf3af430fb730998791da30458e4f88fbcd8ef5ac75a0eed81e",
+      "license": "Apache-2.0",
+      "retrieval_date": "2026-08-31"
+    },
+    {
+      "id": "japanese-dev-lingo-readme",
+      "url": "https://github.com/Wizcorp/japanese-dev-lingo/blob/fc110ae27c489cba3af98d0c05eec07790caa230/ReadMe.md",
+      "pinned_commit": "fc110ae27c489cba3af98d0c05eec07790caa230",
+      "blob_sha": "9974cb95f54da7e89c36ef32a8d2da97876e5df5",
+      "sha256": "2c8011740ed602fc0d946bd85ff36f0e6d89be8457f36720960c3630eb7d2e7e",
+      "license": "MIT",
+      "retrieval_date": "2026-08-31"
+    },
+    {
+      "id": "wikidata",
+      "endpoint": "https://query.wikidata.org/sparql",
+      "query": "scripts/gen-dict/wikidata-query.rq",
+      "query_sha256": "2636ec04ae960eea69f972199421ba1f9eb183b99090723782889cc8fc3789aa",
+      "snapshot_sha256": "6aedc482af15b19f8168238ee9177ed306b8067b34db74ca2fc49d99c8f01c2b",
+      "sha256": "6aedc482af15b19f8168238ee9177ed306b8067b34db74ca2fc49d99c8f01c2b",
+      "license": "CC0-1.0",
+      "retrieval_date": "2026-08-31"
+    }
+  ]
+}

@@ -1,1 +1,243 @@
 # reading	surface	source_id	provenance	approval_note
+アイオーエス	iOS	neologd	neologd-seed.csv.xz:308291	well-known dev term; reading verified
+アイパッド	iPad	neologd	neologd-seed.csv.xz:308332	well-known dev term; reading verified
+アイフォン	iPhone	neologd	neologd-seed.csv.xz:3220797	well-known dev term; reading verified
+アイフォーン	iPhone	neologd	neologd-seed.csv.xz:308407	well-known dev term; reading verified
+アウトルック	Outlook	neologd	neologd-seed.csv.xz:210776	well-known dev term; reading verified
+アカマイ	Akamai	neologd	neologd-seed.csv.xz:260493	well-known dev term; reading verified
+アクションスクリプト	ActionScript	wikidata	<http://www.wikidata.org/entity/Q234657>	reviewed Wikidata mapping
+アジュール	Azure	curated-extra	curated-extra.tsv (Stage C gap addition)	cloud; color sense rare in Japanese speech
+アストロ	Astro	curated-extra	curated-extra.tsv:24: Web framework	human-authored curated entry
+アセンブリ	Assembly	neologd	neologd-seed.csv.xz:265013	well-known dev term; reading verified
+アルドゥイーノ	Arduino	neologd	neologd-seed.csv.xz:264052	well-known dev term; reading verified
+アルドゥイーノモシクハアルデュイーノ	Arduino	neologd	neologd-seed.csv.xz:264053	well-known dev term; reading verified
+アレクサ	Alexa	neologd	neologd-seed.csv.xz:261158	well-known dev term; reading verified
+アンギュラー	Angular	curated-extra	curated-extra.tsv (Stage C gap addition)	framework
+アンソロピック	Anthropic	curated-extra	curated-extra.tsv (Stage C gap addition)	AI vendor
+アンドロイド	Android	neologd	neologd-seed.csv.xz:262617	well-known dev term; reading verified
+アンリアルエンジン	Unreal Engine	neologd	neologd-seed.csv.xz:378592	well-known dev term; reading verified
+アーラン	Erlang	neologd	neologd-seed.csv.xz:289782	well-known dev term; reading verified
+イスティオ	Istio	curated-extra	curated-extra.tsv (Stage C gap addition)	service mesh
+インスタグラム	Instagram	neologd	neologd-seed.csv.xz:307949	well-known dev term; reading verified
+インテリジェイ	IntelliJ	neologd	neologd-seed.csv.xz:308027	well-known dev term; reading verified
+イーエスリント	ESLint	curated-extra	curated-extra.tsv (Stage C gap addition)	linter
+イーサネット	Ethernet	neologd	neologd-seed.csv.xz:290049	well-known dev term; reading verified
+イーマックス	Emacs	neologd	neologd-seed.csv.xz:288878	well-known dev term; reading verified
+ウィンドウズ	Windows	curated-extra	curated-extra.tsv (Stage C gap addition)	overwhelmingly the OS in dictation
+ウェブアセンブリ	WebAssembly	curated-extra	curated-extra.tsv:15: Portable binary instruction format	human-authored curated entry
+ウェブジーエル	WebGL	wikidata	<http://www.wikidata.org/entity/Q375913>	reviewed Wikidata mapping
+ウェブストーム	WebStorm	neologd	neologd-seed.csv.xz:382299	well-known dev term; reading verified
+ウェブソケット	WebSocket	neologd	neologd-seed.csv.xz:382296	well-known dev term; reading verified
+ウェブパック	Webpack	curated-extra	curated-extra.tsv (Stage C gap addition)	bundler
+ウブントゥ	Ubuntu	neologd	neologd-seed.csv.xz:377560	well-known dev term; reading verified
+エアビーアンドビー	Airbnb	neologd	neologd-seed.csv.xz:260245	well-known dev term; reading verified
+エアポッズ	AirPods	curated-extra	curated-extra.tsv (Stage C gap addition)	common ASR form
+エアービーアンドビー	Airbnb	neologd	neologd-seed.csv.xz:260244	well-known dev term; reading verified
+エアーポッズ	AirPods	curated-extra	curated-extra.tsv (Stage C gap addition)	common ASR form
+エイチティーティーピーエス	HTTPS	neologd	neologd-seed.csv.xz:305319	well-known dev term; reading verified
+エクセル	Excel	curated-extra	curated-extra.tsv (Stage C gap addition)	ambiguity resolved: co-claimant EXCEL CO. LTD.; borderline (エクセルシオール substring)
+エクリプス	Eclipse	neologd	neologd-seed.csv.xz:287893	well-known dev term; reading verified
+エスキューライト	SQLite	neologd	neologd-seed.csv.xz:364405	well-known dev term; reading verified
+エックスコード	Xcode	neologd	neologd-seed.csv.xz:384656	well-known dev term; reading verified
+エヌビディア	NVIDIA	neologd	neologd-seed.csv.xz:341138	well-known dev term; reading verified
+エバーノート	Evernote	neologd	neologd-seed.csv.xz:290331	well-known dev term; reading verified
+エピックゲームス	Epic Games	neologd	neologd-seed.csv.xz:289594	well-known dev term; reading verified
+エラスティックサーチ	Elasticsearch	neologd	neologd-seed.csv.xz:288557	well-known dev term; reading verified
+エルエルブイエム	LLVM	neologd	neologd-seed.csv.xz:322824	well-known dev term; reading verified
+エルエルヴィーエム	LLVM	neologd	neologd-seed.csv.xz:322825	well-known dev term; reading verified
+エンジンエックス	Nginx	neologd	neologd-seed.csv.xz:337447	well-known dev term; reading verified
+エンヴォイ	Envoy	neologd	neologd-seed.csv.xz:289492	well-known dev term; reading verified
+エーダブリューエス	AWS	curated-extra	curated-extra.tsv (Stage C gap addition)	letter-by-letter reading
+オウオース	OAuth	neologd	neologd-seed.csv.xz:341567	well-known dev term; reading verified
+オブシディアン	Obsidian	curated-extra	curated-extra.tsv (Stage C gap addition)	notes app; mineral sense rare as katakana
+オブジェクティブシー	Objective-C	neologd	neologd-seed.csv.xz:341619	well-known dev term; reading verified
+オラクル	Oracle	curated-extra	curated-extra.tsv (Stage C gap addition)	the vendor; oracle sense rare
+オープンエスエスエル	OpenSSL	neologd	neologd-seed.csv.xz:343092	well-known dev term; reading verified
+オープンエーアイ	OpenAI	curated-extra	curated-extra.tsv:11: AI platform	human-authored curated entry
+オープンシフト	OpenShift	neologd	neologd-seed.csv.xz:343088	well-known dev term; reading verified
+オープンシーヴィ	OpenCV	neologd	neologd-seed.csv.xz:343054	well-known dev term; reading verified
+オープンジーエル	OpenGL	neologd	neologd-seed.csv.xz:343058	well-known dev term; reading verified
+オープンスタック	OpenStack	neologd	neologd-seed.csv.xz:343096	well-known dev term; reading verified
+オープンテレメトリー	OpenTelemetry	curated-extra	curated-extra.tsv:31: Observability standard	human-authored curated entry
+オープンビーエスディー	OpenBSD	neologd	neologd-seed.csv.xz:343050	well-known dev term; reading verified
+キネクト	Kinect	wikidata	<http://www.wikidata.org/entity/Q474334>	reviewed Wikidata mapping
+キントーン	Kintone	wikidata	<http://www.wikidata.org/entity/Q28687881>	reviewed Wikidata mapping
+キンドル	Kindle	neologd	neologd-seed.csv.xz:317341	well-known dev term; reading verified
+キークローク	Keycloak	neologd	neologd-seed.csv.xz:316901	well-known dev term; reading verified
+ギットハブ	GitHub	neologd	neologd-seed.csv.xz:298269	well-known dev term; reading verified
+ギットハブアクションズ	GitHub Actions	curated-extra	curated-extra.tsv:28: Continuous integration service	human-authored curated entry
+ギットハブ・コパイロット	GitHub Copilot	curated-extra	curated-extra.tsv:9: AI coding assistant	human-authored curated entry
+ギットラボ	GitLab	curated-extra	curated-extra.tsv (Stage C gap addition)	dev tool
+クアルコム	Qualcomm	neologd	neologd-seed.csv.xz:349663	well-known dev term; reading verified
+クバネティス	Kubernetes	curated-extra	curated-extra.tsv:5: Common Japanese reading	human-authored curated entry
+クラウドフレア	Cloudflare	neologd	neologd-seed.csv.xz:276874	well-known dev term; reading verified
+クラウドフロント	CloudFront	neologd	neologd-seed.csv.xz:276875	well-known dev term; reading verified
+クロミウム	Chromium	neologd	neologd-seed.csv.xz:142377	well-known dev term; reading verified
+クロード	Claude	curated-extra	curated-extra.tsv (Stage C gap addition)	ambiguity resolved: person-name co-claimants in seed
+クロームキャスト	Chromecast	neologd	neologd-seed.csv.xz:276077	well-known dev term; reading verified
+クーバネティス	Kubernetes	curated-extra	curated-extra.tsv:6: Long-vowel variant	human-authored curated entry
+クーベネティス	Kubernetes	curated-extra	curated-extra.tsv:7: Alternative long-vowel variant	human-authored curated entry
+グラファナ	Grafana	curated-extra	curated-extra.tsv:33: Observability dashboard	human-authored curated entry
+グラフキューエル	GraphQL	curated-extra	curated-extra.tsv:29: API query language	human-authored curated entry
+グレイドル	Gradle	neologd	neologd-seed.csv.xz:299892	well-known dev term; reading verified
+グーグル	Google	curated-extra	curated-extra.tsv (Stage C gap addition)	ambiguity resolved: junk co-claimants Google LLC / goo.gl in NEologd seed
+コトリン	Kotlin	neologd	neologd-seed.csv.xz:318685	well-known dev term; reading verified
+コパイロット	Copilot	curated-extra	curated-extra.tsv (Stage C gap addition)	the product; aviation sense rare in dev dictation (borderline)
+コルタナ	Cortana	neologd	neologd-seed.csv.xz:278360	well-known dev term; reading verified
+コルドバ	Cordova	neologd	neologd-seed.csv.xz:278263	well-known dev term; reading verified
+コンフルエンス	Confluence	curated-extra	curated-extra.tsv (Stage C gap addition)	wiki product; ordinary sense rare
+サイキットラーン	scikit-learn	curated-extra	curated-extra.tsv (Stage C gap addition)	ML library
+サブバージョン	Subversion	neologd	neologd-seed.csv.xz:235469	well-known dev term; reading verified
+サムスン	Samsung	neologd	neologd-seed.csv.xz:356112	well-known dev term; reading verified
+ザマリン	Xamarin	neologd	neologd-seed.csv.xz:384585	well-known dev term; reading verified
+シェアポイント	SharePoint	neologd	neologd-seed.csv.xz:359228	well-known dev term; reading verified
+シャオミ	Xiaomi	neologd	neologd-seed.csv.xz:384752	well-known dev term; reading verified
+ショッピファイ	Shopify	curated-extra	curated-extra.tsv (Stage C gap addition)	commerce platform
+ジェイクエリー	jQuery	neologd	neologd-seed.csv.xz:313172	well-known dev term; reading verified
+ジェミニ	Gemini	curated-extra	curated-extra.tsv:13: AI model family	human-authored curated entry
+ジェンキンス	Jenkins	curated-extra	curated-extra.tsv (Stage C gap addition)	CI server; person-name risk low in Japanese dictation
+ジェンツー	Gentoo	neologd	neologd-seed.csv.xz:297534	well-known dev term; reading verified
+ジャバスクリプト	JavaScript	neologd	neologd-seed.csv.xz:311055	well-known dev term; reading verified
+ジャヴァスクリプト	JavaScript	wikidata	<http://www.wikidata.org/entity/Q2005>	well-known dev term; reading verified
+ジーアールピーシー	gRPC	curated-extra	curated-extra.tsv:30: Remote procedure call framework	human-authored curated entry
+ジーシーピー	GCP	neologd	neologd-seed.csv.xz:297268	well-known dev term; reading verified
+ジーフォース	GeForce	neologd	neologd-seed.csv.xz:297374	well-known dev term; reading verified
+ジーメイル	Gmail	neologd	neologd-seed.csv.xz:298562	well-known dev term; reading verified
+ジーメール	Gmail	neologd	neologd-seed.csv.xz:298563	well-known dev term; reading verified
+スィフト	Swift	neologd	neologd-seed.csv.xz:236334	well-known dev term; reading verified
+スカイプ	Skype	neologd	neologd-seed.csv.xz:361714	well-known dev term; reading verified
+スカイペ	Skype	wikidata	<http://www.wikidata.org/entity/Q40984>	well-known dev term; reading verified
+スカーラ	Scala	neologd	neologd-seed.csv.xz:224320	well-known dev term; reading verified
+スナップチャット	Snapchat	neologd	neologd-seed.csv.xz:362420	well-known dev term; reading verified
+スナップドラゴン	Snapdragon	neologd	neologd-seed.csv.xz:233345	well-known dev term; reading verified
+スノウフレイク	Snowflake	neologd	neologd-seed.csv.xz:233405	well-known dev term; reading verified
+スプランク	Splunk	curated-extra	curated-extra.tsv (Stage C gap addition)	correct reading
+スポティファイ	Spotify	neologd	neologd-seed.csv.xz:364268	well-known dev term; reading verified
+スラック	Slack	curated-extra	curated-extra.tsv (Stage C gap addition)	ambiguity resolved: co-claimant S.L.A.C.K.
+スワッガー	Swagger	neologd	neologd-seed.csv.xz:367147	well-known dev term; reading verified
+スヴェルト	Svelte	curated-extra	curated-extra.tsv:23: Frontend framework	human-authored curated entry
+スーパーベース	Supabase	curated-extra	curated-extra.tsv:16: Backend platform	human-authored curated entry
+ズィーシェル	Zsh	neologd	neologd-seed.csv.xz:387707	well-known dev term; reading verified
+セレニウム	Selenium	neologd	neologd-seed.csv.xz:231360	well-known dev term; reading verified
+セントオーエス	CentOS	neologd	neologd-seed.csv.xz:274710	well-known dev term; reading verified
+セールスフォース	Salesforce	neologd	neologd-seed.csv.xz:355967	well-known dev term; reading verified
+ソラリス	Solaris	neologd	neologd-seed.csv.xz:362973	well-known dev term; reading verified
+タイプスクリプト	TypeScript	wikidata	<http://www.wikidata.org/entity/Q978185>	well-known dev term; reading verified
+ダイナモディービー	DynamoDB	curated-extra	curated-extra.tsv (Stage C gap addition)	cloud product
+ダブルユーゲット	wget	neologd	neologd-seed.csv.xz:382609	well-known dev term; reading verified
+チャットジーピーティー	ChatGPT	curated-extra	curated-extra.tsv:10: Generative AI service	human-authored curated entry
+チャットワーク	Chatwork	neologd	neologd-seed.csv.xz:275248	well-known dev term; reading verified
+チームズ	Teams	curated-extra	curated-extra.tsv (Stage C gap addition)	Microsoft Teams
+ツイッター	Twitter	neologd	neologd-seed.csv.xz:376934	well-known dev term; reading verified
+ツイッチ	Twitch	neologd	neologd-seed.csv.xz:246403	well-known dev term; reading verified
+テイルウィンドシーエスエス	Tailwind CSS	curated-extra	curated-extra.tsv:17: CSS framework	human-authored curated entry
+テストフライト	TestFlight	wikidata	<http://www.wikidata.org/entity/Q21041366>	reviewed Wikidata mapping
+テッセラクト	Tesseract	wikidata	<http://www.wikidata.org/entity/Q945242>	reviewed Wikidata mapping
+テラフォーム	Terraform	curated-extra	curated-extra.tsv:1: Infrastructure-as-code tool	human-authored curated entry
+テンソルフロー	TensorFlow	neologd	neologd-seed.csv.xz:370069	well-known dev term; reading verified
+テンソーフロー	TensorFlow	neologd	neologd-seed.csv.xz:370070	well-known dev term; reading verified
+ディスコード	Discord	curated-extra	curated-extra.tsv (Stage C gap addition)	the product; ordinary sense rare
+ディーノ	Deno	curated-extra	curated-extra.tsv:2: JavaScript and TypeScript runtime, long reading	human-authored curated entry
+ディープマインド	DeepMind	curated-extra	curated-extra.tsv (Stage C gap addition)	AI lab
+デビアン	Debian	neologd	neologd-seed.csv.xz:282231	well-known dev term; reading verified
+デブコンテナ	Dev Container	curated-extra	curated-extra.tsv:26: Development container specification	human-authored curated entry
+データドッグ	Datadog	neologd	neologd-seed.csv.xz:281561	well-known dev term; reading verified
+データブリックス	Databricks	curated-extra	curated-extra.tsv (Stage C gap addition)	data platform
+トゥイッチ	Twitch	neologd	neologd-seed.csv.xz:246402	well-known dev term; reading verified
+トムキャット	Tomcat	neologd	neologd-seed.csv.xz:374609	well-known dev term; reading verified
+ドッカー	Docker	neologd	neologd-seed.csv.xz:151253	well-known dev term; reading verified
+ドッカーコンポーズ	Docker Compose	curated-extra	curated-extra.tsv:27: Multi-container configuration tool	human-authored curated entry
+ドルーパル	Drupal	neologd	neologd-seed.csv.xz:286267	well-known dev term; reading verified
+ドロップボックス	Dropbox	neologd	neologd-seed.csv.xz:286225	well-known dev term; reading verified
+ナムパイ	NumPy	neologd	neologd-seed.csv.xz:341084	well-known dev term; reading verified
+ヌクスト	Nuxt	curated-extra	curated-extra.tsv:19: Vue framework	human-authored curated entry
+ネクストジェイエス	Next.js	curated-extra	curated-extra.tsv:18: React framework	human-authored curated entry
+ネットビーンズ	NetBeans	neologd	neologd-seed.csv.xz:336765	well-known dev term; reading verified
+ネットフリックス	Netflix	neologd	neologd-seed.csv.xz:336776	well-known dev term; reading verified
+ノーション	Notion	curated-extra	curated-extra.tsv (Stage C gap addition)	the product; ordinary sense rare in Japanese speech
+ノードジェイエス	Node.js	curated-extra	curated-extra.tsv (Stage C gap addition)	runtime
+ハイバネート	Hibernate	neologd	neologd-seed.csv.xz:303463	well-known dev term; reading verified
+ハイパーブイ	Hyper-V	neologd	neologd-seed.csv.xz:305618	well-known dev term; reading verified
+ハイパーヴイ	Hyper-V	neologd	neologd-seed.csv.xz:305619	well-known dev term; reading verified
+ハギングフェイス	Hugging Face	curated-extra	curated-extra.tsv:35: Machine-learning platform	human-authored curated entry
+ハスケル	Haskell	neologd	neologd-seed.csv.xz:302336	well-known dev term; reading verified
+ハドゥープ	Hadoop	neologd	neologd-seed.csv.xz:301492	well-known dev term; reading verified
+バイドゥ	Baidu	neologd	neologd-seed.csv.xz:267137	well-known dev term; reading verified
+バッシュ	Bash	neologd	neologd-seed.csv.xz:267610	well-known dev term; reading verified
+バーチャルボックス	VirtualBox	neologd	neologd-seed.csv.xz:380452	well-known dev term; reading verified
+パイソン	Python	neologd	neologd-seed.csv.xz:216523	well-known dev term; reading verified
+パイチャーム	PyCharm	neologd	neologd-seed.csv.xz:349295	well-known dev term; reading verified
+パイトーチ	PyTorch	curated-extra	curated-extra.tsv:34: Machine-learning framework	human-authored curated entry
+パワーシェル	PowerShell	neologd	neologd-seed.csv.xz:348054	well-known dev term; reading verified
+パワーポイント	PowerPoint	neologd	neologd-seed.csv.xz:348050	well-known dev term; reading verified
+パンダズ	pandas	neologd	neologd-seed.csv.xz:213707	well-known dev term; reading verified
+パープレキシティ	Perplexity	curated-extra	curated-extra.tsv (Stage C gap addition)	product and ML metric share the same English surface
+ビッグクエリ	BigQuery	curated-extra	curated-extra.tsv (Stage C gap addition)	cloud product
+ビットバケット	Bitbucket	curated-extra	curated-extra.tsv (Stage C gap addition)	correct reading replacing NEologd joke row
+ピーエイチピー	PHP	neologd	neologd-seed.csv.xz:346406	well-known dev term; reading verified
+ファイアベース	Firebase	wikidata	<http://www.wikidata.org/entity/Q18150728>	well-known dev term; reading verified
+ファイヤーフォックス	Firefox	neologd	neologd-seed.csv.xz:293181	well-known dev term; reading verified
+ファーウェイ	Huawei	neologd	neologd-seed.csv.xz:305335	well-known dev term; reading verified
+フィグマ	Figma	neologd	neologd-seed.csv.xz:292922	well-known dev term; reading verified
+フィドーラ	Fedora	neologd	neologd-seed.csv.xz:292323	well-known dev term; reading verified
+フェイスブック	Facebook	neologd	neologd-seed.csv.xz:291324	well-known dev term; reading verified
+フォトショップ	Photoshop	neologd	neologd-seed.csv.xz:346398	well-known dev term; reading verified
+フォートラン	Fortran	neologd	neologd-seed.csv.xz:294587	well-known dev term; reading verified
+フラッター	Flutter	wikidata	<http://www.wikidata.org/entity/Q39072787>	well-known dev term; reading verified
+フリンク	Flink	curated-extra	curated-extra.tsv (Stage C gap addition)	stream processor
+フリービーエスディー	FreeBSD	neologd	neologd-seed.csv.xz:295039	well-known dev term; reading verified
+ブイエムウェア	VMware	neologd	neologd-seed.csv.xz:380730	well-known dev term; reading verified
+ブルートゥース	Bluetooth	neologd	neologd-seed.csv.xz:270430	well-known dev term; reading verified
+ブレイヴ	Brave	neologd	neologd-seed.csv.xz:136020	well-known dev term; reading verified
+ブロードコム	Broadcom	neologd	neologd-seed.csv.xz:271789	well-known dev term; reading verified
+プレイステーション	PlayStation	neologd	neologd-seed.csv.xz:347236	well-known dev term; reading verified
+プレイライト	Playwright	curated-extra	curated-extra.tsv:22: Browser automation framework	human-authored curated entry
+プロメテウス	Prometheus	curated-extra	curated-extra.tsv:32: Monitoring system	human-authored curated entry
+プロログ	Prolog	neologd	neologd-seed.csv.xz:348682	well-known dev term; reading verified
+ペイパル	PayPal	neologd	neologd-seed.csv.xz:345288	well-known dev term; reading verified
+ポスグレ	PostgreSQL	curated-extra	curated-extra.tsv (Stage C gap addition)	common abbreviation (was in placeholder dict)
+ポストグレエスキューエル	PostgreSQL	neologd	neologd-seed.csv.xz:347923	well-known dev term; reading verified
+ポストグレス	PostgreSQL	curated-extra	curated-extra.tsv (Stage C gap addition)	common reading (was in placeholder dict)
+ポッドマン	Podman	curated-extra	curated-extra.tsv:14: Container engine	human-authored curated entry
+マイエスキューエル	MySQL	neologd	neologd-seed.csv.xz:334605	well-known dev term; reading verified
+マイクロソフト	Microsoft	neologd	neologd-seed.csv.xz:329487	well-known dev term; reading verified
+マインクラフト	Minecraft	neologd	neologd-seed.csv.xz:330109	well-known dev term; reading verified
+マセマティカ	Mathematica	wikidata	<http://www.wikidata.org/entity/Q81294>	reviewed Wikidata mapping
+マックブック	MacBook	neologd	neologd-seed.csv.xz:325212	well-known dev term; reading verified
+マットラブ	MATLAB	neologd	neologd-seed.csv.xz:327364	well-known dev term; reading verified
+マテリアルデザイン	Material Design	wikidata	<http://www.wikidata.org/entity/Q17590603>	reviewed Wikidata mapping
+マリアディービー	MariaDB	neologd	neologd-seed.csv.xz:326534	well-known dev term; reading verified
+マーキュリアル	Mercurial	neologd	neologd-seed.csv.xz:328759	well-known dev term; reading verified
+ミストラル	Mistral	neologd	neologd-seed.csv.xz:330543	well-known dev term; reading verified
+ミッドジャーニー	Midjourney	curated-extra	curated-extra.tsv (Stage C gap addition)	image AI
+メイブン	Maven	neologd	neologd-seed.csv.xz:327519	well-known dev term; reading verified
+メイヴン	Maven	neologd	neologd-seed.csv.xz:327520	well-known dev term; reading verified
+メディアテック	MediaTek	neologd	neologd-seed.csv.xz:328222	well-known dev term; reading verified
+メムキャッシュディ	Memcached	neologd	neologd-seed.csv.xz:328630	well-known dev term; reading verified
+メールチンプ	Mailchimp	wikidata	<http://www.wikidata.org/entity/Q6735673>	reviewed Wikidata mapping
+モンゴディービー	MongoDB	neologd	neologd-seed.csv.xz:331691	well-known dev term; reading verified
+ユニティ	Unity	neologd	neologd-seed.csv.xz:248452	well-known dev term; reading verified
+ユーチューバー	YouTuber	curated-extra	curated-extra.tsv (Stage C gap addition)	protective longest-match so ユーチューバー never becomes YouTubeバー
+ユーチューブ	YouTube	curated-extra	curated-extra.tsv (Stage C gap addition)	ambiguity resolved: co-claimant "You Tube" variant
+ライゼン	Ryzen	neologd	neologd-seed.csv.xz:355029	well-known dev term; reading verified
+ラズベリーパイ	Raspberry Pi	neologd	neologd-seed.csv.xz:350810	well-known dev term; reading verified
+ラデオン	Radeon	curated-extra	curated-extra.tsv (Stage C gap addition)	common reading alongside NEologd レイディオン
+ラビットエムキュー	RabbitMQ	neologd	neologd-seed.csv.xz:350200	well-known dev term; reading verified
+ラングチェイン	LangChain	curated-extra	curated-extra.tsv:36: Large-language-model application framework	human-authored curated entry
+リアクト	React	curated-extra	curated-extra.tsv (Stage C gap addition)	ambiguity resolved: co-claimants RE.ACT / ReAct
+リナックス	Linux	neologd	neologd-seed.csv.xz:322302	well-known dev term; reading verified
+リンクトイン	LinkedIn	neologd	neologd-seed.csv.xz:322260	well-known dev term; reading verified
+レイディオン	Radeon	neologd	neologd-seed.csv.xz:350267	well-known dev term; reading verified
+レイルズ	Rails	neologd	neologd-seed.csv.xz:220062	well-known dev term; reading verified
+レッドシフト	Redshift	curated-extra	curated-extra.tsv (Stage C gap addition)	cloud product; astronomy term is 赤方偏移 in Japanese
+レディス	Redis	neologd	neologd-seed.csv.xz:351565	well-known dev term; reading verified
+レディット	Reddit	neologd	neologd-seed.csv.xz:351549	well-known dev term; reading verified
+ワイファイ	Wi-Fi	curated-extra	curated-extra.tsv (Stage C gap addition)	common ASR form
+ワッツアップ	WhatsApp	neologd	neologd-seed.csv.xz:382638	well-known dev term; reading verified
+ワンドライブ	OneDrive	neologd	neologd-seed.csv.xz:342775	well-known dev term; reading verified
+ワードプレス	WordPress	neologd	neologd-seed.csv.xz:383798	well-known dev term; reading verified
+ヴァイテスト	Vitest	curated-extra	curated-extra.tsv:21: JavaScript test runner	human-authored curated entry
+ヴァルカン	Vulkan	wikidata	<http://www.wikidata.org/entity/Q19407678>	well-known dev term; reading verified
+ヴィヴァルディ	Vivaldi	neologd	neologd-seed.csv.xz:380595	well-known dev term; reading verified
+ヴィート	Vite	curated-extra	curated-extra.tsv:20: Frontend build tool	human-authored curated entry
+ヴェイグラント	Vagrant	neologd	neologd-seed.csv.xz:248868	well-known dev term; reading verified

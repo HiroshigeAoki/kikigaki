@@ -428,6 +428,8 @@ def render_bytes(approved: bytes, lock_manifest: bytes) -> bytes:
                 "\n",
             )
         )
+    if lines and lines[-1] == "\n":
+        lines.pop()  # no trailing blank line at EOF (git diff --check)
     rendered = "".join(lines).encode("utf-8")
     parsed = parse_toml(rendered.decode("utf-8"))
     if parsed != {"rule": expected_rules}:

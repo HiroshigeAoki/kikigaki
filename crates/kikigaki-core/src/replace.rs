@@ -240,9 +240,17 @@ mod tests {
     #[test]
     fn builtin_dict_parses_and_is_sane() {
         let rules = builtin_rules().unwrap();
-        // The generation task later tightens this to the production range 200..=2000
-        // and rejects this placeholder's header.
-        assert!(rules.rules.len() >= 5);
+        // Production artifact gate: the generated dictionary must stay within this
+        // range, and an accidental revert to the hand-written placeholder must fail.
+        assert!(
+            (200..=2000).contains(&rules.rules.len()),
+            "builtin dictionary has {} rules, outside 200..=2000",
+            rules.rules.len()
+        );
+        assert!(
+            !BUILTIN_DICT_TOML.contains("placeholder"),
+            "builtin dictionary artifact looks like the placeholder, not a generated one"
+        );
     }
 
     #[test]

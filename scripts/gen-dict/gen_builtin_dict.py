@@ -396,16 +396,20 @@ def parse_toml(contents: str) -> dict[str, object]:
     return tomllib.loads(contents)
 
 
+def mapping_count(groups: dict[str, set[str]]) -> int:
+    return sum(len(readings) for readings in groups.values())
+
+
 def render_bytes(approved: bytes, lock_manifest: bytes) -> bytes:
     groups = parse_approved(approved)
-    mapping_count = sum(len(readings) for readings in groups.values())
-    if mapping_count == 0:
+    count = mapping_count(groups)
+    if count == 0:
         raise GenerationError(
             "approved.tsv contains no approved mappings; refusing to replace the bootstrap artifact"
         )
-    if not MIN_MAPPINGS <= mapping_count <= MAX_MAPPINGS:
+    if not MIN_MAPPINGS <= count <= MAX_MAPPINGS:
         raise GenerationError(
-            f"rendered mapping count {mapping_count} is outside {MIN_MAPPINGS}..={MAX_MAPPINGS}"
+            f"rendered mapping count {count} is outside {MIN_MAPPINGS}..={MAX_MAPPINGS}"
         )
 
     lines = [
@@ -473,8 +477,7 @@ def render_approved(args: argparse.Namespace) -> int:
     if not args.write:
         raise GenerationError("refusing to overwrite without render --write")
     _atomic_write(args.output, rendered)
-    mapping_count = sum(len(readings) for readings in groups.values())
-    print(f"wrote {mapping_count} approved mappings to {args.output}")
+    print(f"wrote {mapping_count(groups)} approved mappings to {args.output}")
     return 0
 
 

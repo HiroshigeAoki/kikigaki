@@ -518,9 +518,7 @@ document.getElementById('builtinReplaceDictSwitch').addEventListener('click', as
     // SettingsPatch is camelCase on the wire, while returned snapshot settings stay snake_case.
     const settings = await invoke('apply_settings', { patch: { builtinReplaceDict: enabled } });
     cacheSettings(settings);
-    applyBuiltinReplaceDict(settings);
   } catch (error) {
-    if (currentSnapshot) applyBuiltinReplaceDict(currentSnapshot.settings);
     showInlineError(control, error);
   } finally {
     builtinReplaceDictPending = false;

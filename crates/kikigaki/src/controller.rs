@@ -812,19 +812,14 @@ impl Controller {
                             Some(Arc::clone(&self.waker)),
                         ) {
                             Ok(worker) => {
+                                // builtin_replace_dict was already applied via
+                                // postprocess_factory.build() above; only punct settings need
+                                // a follow-up configure() since build() hardcodes those off.
                                 if let Err(error) = worker.configure(
                                     settings.punct_enabled,
                                     settings.strip_trailing_period,
                                 ) {
                                     tracing::warn!(%error, "configure new post-processing worker");
-                                }
-                                if let Err(error) =
-                                    worker.set_builtin_enabled(settings.builtin_replace_dict)
-                                {
-                                    tracing::warn!(%error, "configure builtin dictionary on new post-processing worker");
-                                    self.status = Status::Warning(
-                                        "内蔵置換辞書を反映できませんでした".into(),
-                                    );
                                 }
                                 self.postprocess = Some(worker);
                             }

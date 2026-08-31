@@ -21,6 +21,8 @@ pub struct Config {
     pub silence_pad_ms: u64,
     /// Maximum wait for a final transcription, in milliseconds.
     pub final_timeout_ms: u64,
+    /// Enable the built-in katakana→English replacement dictionary tier. Default false (opt-in).
+    pub builtin_replace_dict: bool,
     /// Replacement dictionary used during transcription post-processing.
     pub replace_file: PathBuf,
     /// Destination JSONL file for latency records.
@@ -273,6 +275,7 @@ impl Default for Config {
             strip_trailing_period: true,
             silence_pad_ms: 500,
             final_timeout_ms: 3_000,
+            builtin_replace_dict: false,
             replace_file: home.join(".config/kikigaki/replace.toml"),
             metrics_path: home.join("Library/Logs/kikigaki/latency.jsonl"),
             models_dir: dirs::data_local_dir()
@@ -465,8 +468,10 @@ mod tests {
     #[test]
     fn default_round_trips_through_toml() {
         let expected = Config::default();
+        assert!(!expected.builtin_replace_dict);
         let actual: Config = toml::from_str(&toml::to_string(&expected).unwrap()).unwrap();
         assert_eq!(actual, expected);
+        assert!(!actual.builtin_replace_dict);
         assert_eq!(actual.engine, EngineKind::Local);
         assert_eq!(actual.asr.num_threads, 4);
         assert_eq!(
@@ -487,6 +492,15 @@ mod tests {
             .learned_file
             .ends_with(".config/kikigaki/learned.toml"));
         assert!(default_path().ends_with(".config/kikigaki/config.toml"));
+    }
+
+    #[test]
+    fn top_level_partial_override_keeps_other_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(&temp, "builtin_replace_dict = true\n");
+        let actual = Config::load(Some(&path)).unwrap();
+        assert!(actual.builtin_replace_dict);
+        assert_eq!(actual.engine, Config::default().engine);
     }
 
     #[test]

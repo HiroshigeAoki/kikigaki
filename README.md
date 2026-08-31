@@ -1,6 +1,15 @@
 # kikigaki
 
-macOS向けのプッシュトゥトーク型日本語ディクテーションアプリ。`Alt+Space` を押しながら話し、キーを離すと認識結果が最前面のアプリにペーストされる。既定ではモデルのダウンロードを除きネットワークを使わず、音声認識と句読点付与はローカルで実行する。
+日本語特化・完全ローカルのプッシュトゥトーク型音声入力アプリ(macOS)。
+
+Fast, private Japanese voice typing. 100% local and open source.
+
+`Alt+Space` を押しながら話し、キーを離すと認識結果が最前面のアプリにペーストされる。
+
+- 音声認識・発話区間検出・句読点付与をすべて端末内で実行
+- 既定ではモデルの初回ダウンロードを除きネットワークを使わない
+- 置換辞書でカタカナ語や固有名詞を好みの表記に変換
+- 無料・オープンソース(MIT)
 
 ## インストール (macOS)
 
@@ -14,6 +23,10 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 初回起動時はオンボーディング画面が開き、マイク権限 → アクセシビリティ権限 → モデルのダウンロードの順に進む。ダウンロードするのはモデルデータのみで約548 MB(展開後は約183 MB)。ONNX Runtimeはアプリに同梱している。リリースは固定の自己署名IDで署名しているため、許可した権限はアップデート後も保持される。
 
+## プライバシー
+
+音声認識(ReazonSpeech)、発話区間検出(Silero VAD)、句読点付与(mojicast)は、すべて端末上で実行される。既定構成でネットワークを使うのはモデルの初回ダウンロードだけで、音声データや認識結果を外部サーバーへ送信しない。`remote-engine` 構成でも、既定では同一マシン上のローカルプロセス(`ws://127.0.0.1`)に接続する。
+
 ## ファイルの場所
 
 | 項目 | パス |
@@ -26,45 +39,7 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 ## 設定
 
-設定ファイルは任意。以下はすべて既定値で、省略した項目は既定値のまま動く。
-
-```toml
-engine = "local"
-hotkey = "Alt+Space"
-paste_method = "clipboard"
-strip_trailing_period = true
-silence_pad_ms = 500
-final_timeout_ms = 3000
-replace_file = "~/.config/kikigaki/replace.toml"
-metrics_path = "~/Library/Logs/kikigaki/latency.jsonl"
-models_dir = "~/Library/Application Support/kikigaki/models"
-
-[asr]
-num_threads = 4
-decoding_method = "modified_beam_search"
-
-[vad]
-min_silence_ms = 350
-min_speech_ms = 250
-max_speech_s = 12.0
-threshold = 0.5
-
-[punct]
-enabled = "auto"
-comma_threshold = 0.5
-period_threshold = 0.5
-
-[remote]
-ws_url = "ws://127.0.0.1:8766/ingest"
-hayamimi_dir = "~/dev/voice-engine/hayamimi"
-python = "~/dev/voice-engine/hayamimi/.venv/bin/python"
-spawn_sidecar = true
-extra_args = ["--serve", "--no-refine"]
-connect_timeout_ms = 30000
-server_punctuates = true
-```
-
-`punct.enabled` は `"auto"` / `true` / `false` を取り、`"auto"` は句読点サポート付きビルドでのみ有効になる。旧名 `hitorigochi` / `koe` の設定は自動では引き継がれない。移行時のスキーマ変更点は [`docs/config-migration.md`](docs/config-migration.md) にまとめている。
+設定ファイルは任意。省略した項目はすべて既定値のまま動く。全項目の一覧と既定値は [`docs/configuration.md`](docs/configuration.md) に記載している。
 
 ### 置換辞書
 
@@ -77,6 +52,16 @@ to = "Kubernetes"
 ```
 
 一致した認識結果はすべて置換されるため、同音異義語や一般的な単語は避けること。
+
+## ロードマップ
+
+- [x] macOS(Apple Silicon)
+- [x] プッシュトゥトーク入力
+- [x] 日本語の音声認識(ReazonSpeech)
+- [x] 自動句読点
+- [x] 置換辞書
+- [ ] 認識精度の改善(カタカナ語の既定置換辞書を含む)
+- [ ] Windows対応
 
 ## 開発
 

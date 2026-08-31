@@ -25,6 +25,7 @@ let hydrated = false;
 let currentSnapshot = null;
 let capturingHotkey = false;
 let autostartPending = false;
+let builtinReplaceDictPending = false;
 let currentOnboarding = null;
 const inlineErrors = new WeakMap();
 
@@ -91,6 +92,12 @@ function applyPunctSeg(settings) {
   for (const button of document.querySelectorAll('#punctSeg button')) {
     button.setAttribute('aria-pressed', String(button.dataset.value === value));
   }
+}
+
+function applyBuiltinReplaceDict(settings) {
+  const control = document.getElementById('builtinReplaceDictSwitch');
+  control.setAttribute('aria-checked', String(settings.builtin_replace_dict));
+  control.disabled = builtinReplaceDictPending;
 }
 
 function cacheSettings(settings) {
@@ -372,6 +379,7 @@ function applySnapshot(snapshot) {
   currentSnapshot = snapshot;
   applyStatus(snapshot.status);
   applyPunctSeg(snapshot.settings);
+  applyBuiltinReplaceDict(snapshot.settings);
   applyAutostart(snapshot.autostart);
   applyHistory(snapshot.history);
   applyLearnedRules(snapshot.learned_rules);
@@ -499,6 +507,26 @@ for (const button of document.querySelectorAll('#punctSeg button')) {
     }
   });
 }
+
+document.getElementById('builtinReplaceDictSwitch').addEventListener('click', async (event) => {
+  const control = event.currentTarget;
+  if (control.disabled || builtinReplaceDictPending) return;
+  const enabled = control.getAttribute('aria-checked') !== 'true';
+  builtinReplaceDictPending = true;
+  control.disabled = true;
+  try {
+    // SettingsPatch is camelCase on the wire, while returned snapshot settings stay snake_case.
+    const settings = await invoke('apply_settings', { patch: { builtinReplaceDict: enabled } });
+    cacheSettings(settings);
+    applyBuiltinReplaceDict(settings);
+  } catch (error) {
+    if (currentSnapshot) applyBuiltinReplaceDict(currentSnapshot.settings);
+    showInlineError(control, error);
+  } finally {
+    builtinReplaceDictPending = false;
+    if (currentSnapshot) applyBuiltinReplaceDict(currentSnapshot.settings);
+  }
+});
 
 document.getElementById('autostartSwitch').addEventListener('click', async (event) => {
   const control = event.currentTarget;

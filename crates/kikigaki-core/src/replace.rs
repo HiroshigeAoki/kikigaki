@@ -31,6 +31,15 @@ struct RuleFile {
     rules: Vec<Rule>,
 }
 
+/// Built-in katakana→English dictionary, embedded at compile time.
+const BUILTIN_DICT_TOML: &str = include_str!("../data/builtin-replace.toml");
+
+/// Parse the embedded builtin dictionary. Static content — callers parse once at
+/// startup and keep the Arc; never wrap this in ReplaceFile.
+pub fn builtin_rules() -> anyhow::Result<Rules> {
+    Rules::parse(BUILTIN_DICT_TOML)
+}
+
 impl Rules {
     /// Parses replacement rules from the `[[rule]]` TOML format.
     pub fn parse(toml: &str) -> anyhow::Result<Self> {
@@ -227,6 +236,32 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn builtin_dict_parses_and_is_sane() {
+        let rules = builtin_rules().unwrap();
+        // The generation task later tightens this to the production range 200..=2000
+        // and rejects this placeholder's header.
+        assert!(rules.rules.len() >= 5);
+    }
+
+    #[test]
+    fn builtin_dict_readings_are_katakana_and_long_enough() {
+        let rules = builtin_rules().unwrap();
+        for from in rules.rules.iter().flat_map(|rule| &rule.from) {
+            assert!(from.chars().count() >= 4, "reading is too short: {from}");
+            assert!(
+                from.chars()
+                    .all(|character| matches!(character, 'ァ'..='ヶ' | 'ー' | '・')),
+                "reading contains a non-katakana character: {from}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_rules_error_path_is_reported() {
+        assert!(Rules::parse("[[rule]\nfrom = [\"broken\"]\n").is_err());
+    }
 
     #[test]
     fn applies_longest_unicode_from_first() {

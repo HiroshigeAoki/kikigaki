@@ -1,0 +1,23 @@
+# Generated builtin katakana→English dictionary — DO NOT EDIT BY HAND.
+# Regenerate with the scripts/gen-dict/ pipeline (Task 7); this is a hand-written
+# placeholder in the identical format until the first generated artifact lands.
+
+[[rule]]
+from = ["クバネティス", "クーバネティス", "クーベネティス"]
+to = "Kubernetes"
+
+[[rule]]
+from = ["ドッカー"]
+to = "Docker"
+
+[[rule]]
+from = ["ギットハブ"]
+to = "GitHub"
+
+[[rule]]
+from = ["タイプスクリプト"]
+to = "TypeScript"
+
+[[rule]]
+from = ["ポスグレ", "ポストグレス"]
+to = "PostgreSQL"

@@ -1,0 +1,36 @@
+Terraform	テラフォーム	Infrastructure-as-code tool
+Deno	ディーノ	JavaScript and TypeScript runtime, long reading
+Deno	デノ	Common short reading; shared length filter intentionally rejects it
+Ollama	オラマ	Local model runner; shared length filter intentionally rejects this short reading
+Kubernetes	クバネティス	Common Japanese reading
+Kubernetes	クーバネティス	Long-vowel variant
+Kubernetes	クーベネティス	Alternative long-vowel variant
+Rust	ラスト	Unsafe collision; deny-readings.txt intentionally rejects it
+GitHub Copilot	ギットハブ・コパイロット	AI coding assistant
+ChatGPT	チャットジーピーティー	Generative AI service
+OpenAI	オープンエーアイ	AI platform
+Claude	クロード	AI assistant
+Gemini	ジェミニ	AI model family
+Podman	ポッドマン	Container engine
+WebAssembly	ウェブアセンブリ	Portable binary instruction format
+Supabase	スーパーベース	Backend platform
+Tailwind CSS	テイルウィンドシーエスエス	CSS framework
+Next.js	ネクストジェイエス	React framework
+Nuxt	ヌクスト	Vue framework
+Vite	ヴィート	Frontend build tool
+Vitest	ヴァイテスト	JavaScript test runner
+Playwright	プレイライト	Browser automation framework
+Svelte	スヴェルト	Frontend framework
+Astro	アストロ	Web framework
+Nix	ニックス	Package manager and language
+Dev Container	デブコンテナ	Development container specification
+Docker Compose	ドッカーコンポーズ	Multi-container configuration tool
+GitHub Actions	ギットハブアクションズ	Continuous integration service
+GraphQL	グラフキューエル	API query language
+gRPC	ジーアールピーシー	Remote procedure call framework
+OpenTelemetry	オープンテレメトリー	Observability standard
+Prometheus	プロメテウス	Monitoring system
+Grafana	グラファナ	Observability dashboard
+PyTorch	パイトーチ	Machine-learning framework
+Hugging Face	ハギングフェイス	Machine-learning platform
+LangChain	ラングチェイン	Large-language-model application framework

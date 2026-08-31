@@ -1,0 +1,46 @@
+ゴー	# Common reading for numbers, counters, and the board game; unsafe for Go
+ラスト	# Ordinary Japanese loanword meaning last; unsafe for Rust
+スイフト	# Ordinary adjective and proper-name reading; unsafe for Swift
+ドック	# Common dock, dog, and medical-check word; unsafe as a product mapping
+パス	# Common path/pass loanword used in ordinary Japanese
+メール	# Common Japanese word for electronic mail
+アプリ	# Common Japanese abbreviation for application
+アップ	# Common Japanese loanword for upward changes and uploads
+ダウン	# Common Japanese loanword for downward changes and downloads
+オンライン	# Common Japanese adjective, not a product name
+オフライン	# Common Japanese adjective, not a product name
+データ	# Common technical loanword used as Japanese prose
+コード	# Common word for code, cord, and chord
+ソース	# Common word for source and sauce
+ファイル	# Common Japanese computing noun
+フォルダ	# Common Japanese computing noun
+ページ	# Common Japanese publishing and computing noun
+サイト	# Common Japanese word for a website or location
+ウェブ	# Common Japanese word for the web
+ネット	# Common abbreviation for internet and net
+クラウド	# Common Japanese computing and weather loanword
+サービス	# Common Japanese business and computing noun
+システム	# Common Japanese computing and organizational noun
+ツール	# Common Japanese word for a tool
+ソフト	# Common abbreviation for software and ordinary adjective
+ハード	# Common abbreviation for hardware and ordinary adjective
+タスク	# Common Japanese work-management noun
+ジョブ	# Common Japanese work and batch-processing noun
+エラー	# Common Japanese computing noun
+テスト	# Common Japanese education and computing noun
+ビルド	# Common Japanese computing and construction noun
+リリース	# Common Japanese publishing and software noun
+バージョン	# Common Japanese software and edition noun
+モデル	# Common Japanese noun for models and product variants
+プロセス	# Common Japanese business and computing noun
+スレッド	# Common Japanese sewing and computing noun
+スタック	# Common Japanese computing noun used generically
+キャッシュ	# Common Japanese computing noun and homophone of cash
+バックアップ	# Common Japanese computing noun used generically
+セキュリティ	# Common Japanese safety and computing noun
+ユーザー	# Common Japanese word for a user
+アカウント	# Common Japanese computing and finance noun
+コメント	# Common Japanese word for a comment
+ポート	# Common Japanese harbor and computing noun
+ホスト	# Common Japanese hospitality and computing noun
+ルート	# Common Japanese word for route, root, and mathematical roots

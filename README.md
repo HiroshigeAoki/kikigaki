@@ -53,6 +53,8 @@ to = "Kubernetes"
 
 一致した認識結果はすべて置換されるため、同音異義語や一般的な単語は避けること。
 
+クバネティス→Kubernetesのように変換するカタカナ語→英語の内蔵辞書も利用できる。既定では無効で、設定画面の「カタカナ語→英語辞書」または設定項目 `builtin_replace_dict` で有効にする。`replace.toml` のユーザー定義ルールと学習済みの修正は、常に内蔵辞書より優先される。
+
 ## ロードマップ
 
 - [x] macOS(Apple Silicon)
@@ -60,7 +62,8 @@ to = "Kubernetes"
 - [x] 日本語の音声認識(ReazonSpeech)
 - [x] 自動句読点
 - [x] 置換辞書
-- [ ] 認識精度の改善(カタカナ語の既定置換辞書を含む)
+- [x] カタカナ語の既定置換辞書
+- [ ] 認識精度の改善
 - [ ] Windows対応
 
 ## 開発
@@ -79,5 +82,8 @@ to = "Kubernetes"
 | [mojicast-punct-onnx](https://huggingface.co/ishiki-emo/mojicast-punct-onnx) | Apache-2.0(モデル) | 句読点付与モデル |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | 句読点モデルの実行 |
 | [hayamimi](https://github.com/oboroge0/hayamimi) | MIT | 句読点パイプラインの移植元 |
+| [mecab-ipadic-NEologd](https://github.com/neologd/mecab-ipadic-neologd) | Apache-2.0 | 内蔵カタカナ語→英語辞書のデータ |
+| [Wikidata](https://www.wikidata.org) | CC0 1.0 | 内蔵カタカナ語→英語辞書のデータ |
+| [japanese-dev-lingo](https://github.com/Wizcorp/japanese-dev-lingo) | MIT | 内蔵カタカナ語→英語辞書のデータ |
 
 静的ライブラリの一覧と追加のライセンス情報は [NOTICE](NOTICE) に記載している。

@@ -257,6 +257,21 @@ required = (
 raise SystemExit(0 if all(doc.get(key) is True for key in required) else 1)
 PY
 
+echo "== NOTICE/license bundling gate =="
+RESOURCES="$APP/Contents/Resources"
+for required in \
+  "$RESOURCES/NOTICE" \
+  "$RESOURCES/licenses/sherpa-onnx.LICENSE" \
+  "$RESOURCES/licenses/onnxruntime.LICENSE" \
+  "$RESOURCES/licenses/silero-vad.LICENSE" \
+  "$RESOURCES/licenses/hayamimi.LICENSE" \
+  "$RESOURCES/licenses/README"; do
+  if [[ ! -s "$required" ]]; then
+    echo "release-mac: required notice/license file missing or empty: $required" >&2
+    exit 1
+  fi
+done
+
 echo "== DMG =="
 mkdir -p "$DMG_DIR"
 STAGE="$LIST_DIR/dmg-root"

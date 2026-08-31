@@ -56,6 +56,13 @@ files.
 | libpiper_phonemize.a, libucd.a | rhasspy/piper-phonemize | MIT |
 | libespeak-ng.a | espeak-ng | GPL-3.0-or-later |
 
+Bundled license texts
+----------------------
+
+This NOTICE file and the upstream license texts under licenses/ (see
+licenses/README for the file-by-file mapping) ship inside the built app at
+Contents/Resources/NOTICE and Contents/Resources/licenses/.
+
 macOS espeak-ng dead-strip note
 --------------------------------
 

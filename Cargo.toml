@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/kikigaki-core", "crates/kikigaki-engine", "crates/kikigaki"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+dirs = "6"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "io-util", "signal"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"

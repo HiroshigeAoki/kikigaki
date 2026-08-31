@@ -1,0 +1,10 @@
+target/
+*.jsonl
+.DS_Store
+.worktrees/
+SYNC_SHA
+
+# Internal docs stay local-only (full history on archive/pre-publish)
+docs/plans/
+docs/review-mockups/
+docs/reference/

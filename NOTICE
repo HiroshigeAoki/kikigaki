@@ -1,0 +1,45 @@
+kikigaki third-party notices
+================================
+
+This product includes or uses the following upstream software and model artifacts:
+
+- sherpa-onnx, Apache License 2.0
+  https://github.com/k2-fsa/sherpa-onnx
+- ONNX Runtime, MIT License
+  https://github.com/microsoft/onnxruntime
+- ReazonSpeech zipformer model, Apache License 2.0
+  https://research.reazon.jp/projects/ReazonSpeech/
+- Silero VAD, MIT License
+  https://github.com/snakers4/silero-vad
+- mojicast-punct-onnx, Apache License 2.0
+  https://huggingface.co/ishiki-emo/mojicast-punct-onnx
+- hayamimi, MIT License (copyright oboroge0). kikigaki's punctuation
+  implementation is a Rust port of hayamimi's punctuation pipeline.
+  https://github.com/oboroge0/hayamimi
+
+Static-library inventory
+------------------------
+
+The sherpa-onnx 1.13.6 osx-arm64 and linux-aarch64 static archives contain the same library
+inventory. The upstream archives contain headers and static libraries, but no LICENSE or NOTICE
+files.
+
+| Library | Upstream | License |
+| --- | --- | --- |
+| libsherpa-onnx-{core,c-api,cxx-api,fst,fstfar,kaldifst-core}.a | k2-fsa/sherpa-onnx, openfst/kaldifst | Apache-2.0 |
+| libonnxruntime.a (1.27.1) | microsoft/onnxruntime | MIT |
+| libkaldi-decoder-core.a, libkaldi-native-fbank-core.a | k2-fsa | Apache-2.0 |
+| libkissfft-float.a | mborgerding/kissfft | BSD-3-Clause |
+| libssentencepiece_core.a | google/sentencepiece | Apache-2.0 |
+| libsherpa-onnx-portaudio_static.a | PortAudio | MIT-style PortAudio license |
+| libpiper_phonemize.a, libucd.a | rhasspy/piper-phonemize | MIT |
+| libespeak-ng.a | espeak-ng | GPL-3.0-or-later |
+
+macOS espeak-ng dead-strip note
+--------------------------------
+
+The prebuilt static archive contains libespeak-ng.a, but Apple ld's atom-level dead stripping
+removed the unused TTS path from the measured macOS arm64 binary: `nm` found no `espeak_*` or
+`OfflineTts*` symbols, and `strings` found no `espeak-ng-data` string. This is a platform-specific
+result. The same archive linked on Linux retained espeak-ng code; a Linux or Windows release must
+repeat the license gate and must not assume the macOS result applies.

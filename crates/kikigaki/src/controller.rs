@@ -712,6 +712,7 @@ impl Controller {
         match self.settings.apply(SettingsPatch {
             hotkey: Some(chord.clone()),
             punctuation: None,
+            builtin_replace_dict: None,
         }) {
             Ok(snapshot) => {
                 tracing::info!(chord = %chord, "hotkey re-registered after settings change");
@@ -1350,6 +1351,8 @@ mod tests {
                     Box::new(PeriodPunctuator),
                     false,
                     false,
+                    Arc::new(kikigaki_core::replace::Rules::default()),
+                    false,
                     learned,
                 ),
                 waker,
@@ -1741,6 +1744,7 @@ mod tests {
             patch: SettingsPatch {
                 hotkey: Some(chord.into()),
                 punctuation: None,
+                builtin_replace_dict: None,
             },
             reply,
         })
@@ -1769,6 +1773,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: Some("Alt+A".into()),
                     punctuation: None,
+                    builtin_replace_dict: None,
                 },
                 reply: a_tx,
             })
@@ -1780,6 +1785,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: Some("Alt+B".into()),
                     punctuation: None,
+                    builtin_replace_dict: None,
                 },
                 reply: b_tx,
             })
@@ -1961,6 +1967,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: None,
                     punctuation: Some(PunctSetting::On),
+                    builtin_replace_dict: None,
                 },
                 reply,
             })
@@ -2033,6 +2040,7 @@ mod tests {
                     patch: SettingsPatch {
                         hotkey: None,
                         punctuation: None,
+                        builtin_replace_dict: None,
                     },
                     reply,
                 })

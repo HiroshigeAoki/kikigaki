@@ -1,10 +1,11 @@
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::engine::{join_workers, EngineMsg, SinkError, Waker};
 use crate::protocol;
-use crate::replace::ReplaceFile;
+use crate::replace::{ReplaceFile, Rules};
 use crate::text::strip_trailing_period;
 
 /// Adds punctuation to transcription text.
@@ -32,8 +33,10 @@ pub struct Pipeline {
     pub punct_enabled: bool,
     /// Whether to remove one trailing Japanese or ASCII period.
     pub strip_trailing_period: bool,
-    learned: std::sync::Arc<crate::replace::Rules>,
-    effective: std::sync::Arc<crate::replace::Rules>,
+    builtin: Arc<Rules>,
+    builtin_enabled: bool,
+    learned: Arc<Rules>,
+    effective: Arc<Rules>,
     effective_replace_generation: u64,
 }
 
@@ -49,32 +52,58 @@ pub struct Processed {
 impl Pipeline {
     /// Constructs a pipeline and its initial effective-rule cache.
     pub fn new(
-        mut replace: ReplaceFile,
+        replace: ReplaceFile,
         punctuator: Box<dyn Punctuator>,
         punct_enabled: bool,
         strip_trailing_period: bool,
-        learned: std::sync::Arc<crate::replace::Rules>,
+        builtin: Arc<Rules>,
+        builtin_enabled: bool,
+        learned: Arc<Rules>,
     ) -> Self {
-        let effective =
-            std::sync::Arc::new(crate::replace::Rules::merge(replace.rules(), &learned));
         let effective_replace_generation = replace.generation();
-        Self {
+        let mut pipeline = Self {
             replace,
             punctuator,
             punct_enabled,
             strip_trailing_period,
+            builtin,
+            builtin_enabled,
             learned,
-            effective,
+            effective: Arc::new(Rules::default()),
             effective_replace_generation,
-        }
+        };
+        pipeline.rebuild_effective();
+        pipeline
     }
 
     /// Replaces the learned overlay and immediately rebuilds the effective-rule cache.
-    pub fn set_learned(&mut self, learned: std::sync::Arc<crate::replace::Rules>) {
-        self.effective =
-            std::sync::Arc::new(crate::replace::Rules::merge(self.replace.rules(), &learned));
-        self.effective_replace_generation = self.replace.generation();
+    pub fn set_learned(&mut self, learned: Arc<Rules>) {
         self.learned = learned;
+        self.rebuild_effective();
+    }
+
+    /// Enables or disables the builtin dictionary and rebuilds only on change.
+    pub fn set_builtin_enabled(&mut self, enabled: bool) {
+        if self.builtin_enabled == enabled {
+            return;
+        }
+        self.builtin_enabled = enabled;
+        self.rebuild_effective();
+    }
+
+    /// Rebuilds builtin, user-file, and learned rules.
+    ///
+    /// Exact-source overrides across tiers, longest match otherwise.
+    fn rebuild_effective(&mut self) {
+        let empty = Rules::default();
+        let builtin_or_empty = if self.builtin_enabled {
+            self.builtin.as_ref()
+        } else {
+            &empty
+        };
+        let builtin_and_user = Rules::merge(builtin_or_empty, self.replace.rules());
+        self.effective = Arc::new(Rules::merge(&builtin_and_user, &self.learned));
+        self.effective_replace_generation = self.replace.generation();
     }
 
     /// Runs trim, replacement, punctuation, and optional trailing-period removal in order.
@@ -82,11 +111,7 @@ impl Pipeline {
         let started = Instant::now();
         let _ = self.replace.rules();
         if self.replace.generation() != self.effective_replace_generation {
-            self.effective = std::sync::Arc::new(crate::replace::Rules::merge(
-                self.replace.rules(),
-                &self.learned,
-            ));
-            self.effective_replace_generation = self.replace.generation();
+            self.rebuild_effective();
         }
         let replaced = self.effective.apply(raw.trim());
         let punctuated = if self.punct_enabled {
@@ -142,7 +167,8 @@ enum Work {
         punct_enabled: bool,
         strip_trailing_period: bool,
     },
-    ReloadRules(std::sync::Arc<crate::replace::Rules>),
+    ReloadRules(Arc<Rules>),
+    SetBuiltinEnabled(bool),
     Shutdown,
 }
 
@@ -213,6 +239,9 @@ impl PostprocessWorker {
                             pipeline.strip_trailing_period = strip_trailing_period;
                         }
                         Work::ReloadRules(rules) => pipeline.set_learned(rules),
+                        Work::SetBuiltinEnabled(enabled) => {
+                            pipeline.set_builtin_enabled(enabled);
+                        }
                         Work::Shutdown => break,
                     }
                 }
@@ -253,14 +282,20 @@ impl PostprocessWorker {
     }
 
     /// Replaces the learned-rule overlay before subsequently queued finals.
-    pub fn reload_rules(
-        &self,
-        rules: std::sync::Arc<crate::replace::Rules>,
-    ) -> Result<(), SinkError> {
+    pub fn reload_rules(&self, rules: Arc<Rules>) -> Result<(), SinkError> {
         self.tx
             .as_ref()
             .ok_or(SinkError::Closed)?
             .send(Work::ReloadRules(rules))
+            .map_err(|_| SinkError::Closed)
+    }
+
+    /// Applies the builtin-dictionary setting before subsequently queued finals.
+    pub fn set_builtin_enabled(&self, enabled: bool) -> Result<(), SinkError> {
+        self.tx
+            .as_ref()
+            .ok_or(SinkError::Closed)?
+            .send(Work::SetBuiltinEnabled(enabled))
             .map_err(|_| SinkError::Closed)
     }
 
@@ -347,7 +382,9 @@ mod tests {
                 punctuator,
                 true,
                 strip,
-                std::sync::Arc::new(crate::replace::Rules::default()),
+                Arc::new(crate::replace::Rules::default()),
+                false,
+                Arc::new(crate::replace::Rules::default()),
             ),
         )
     }
@@ -394,6 +431,172 @@ mod tests {
     }
 
     #[test]
+    fn builtin_rule_applies_when_enabled() {
+        let (_temp, replace) = replace_file("");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            Arc::new(crate::replace::builtin_rules().unwrap()),
+            true,
+            Arc::new(crate::replace::Rules::default()),
+        );
+
+        assert_eq!(pipeline.run("クバネティス").text, "Kubernetes");
+    }
+
+    #[test]
+    fn builtin_tier_is_inert_when_disabled() {
+        let (_temp, replace) = replace_file("");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            Arc::new(crate::replace::builtin_rules().unwrap()),
+            false,
+            Arc::new(crate::replace::Rules::default()),
+        );
+
+        assert_eq!(pipeline.run("クバネティス").text, "クバネティス");
+    }
+
+    #[test]
+    fn user_rule_overrides_builtin_on_shared_source() {
+        let (_temp, replace) =
+            replace_file("[[rule]]\nfrom = [\"クバネティス\"]\nto = \"user Kubernetes\"\n");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            Arc::new(crate::replace::builtin_rules().unwrap()),
+            true,
+            Arc::new(crate::replace::Rules::default()),
+        );
+
+        assert_eq!(pipeline.run("クバネティス").text, "user Kubernetes");
+    }
+
+    #[test]
+    fn learned_wins_three_way_collision_after_toggle_and_user_hot_reload() {
+        let source = "コリジョン";
+        let (temp, replace) =
+            replace_file(&format!("[[rule]]\nfrom = [\"{source}\"]\nto = \"user\"\n"));
+        let builtin = Arc::new(
+            crate::replace::Rules::parse(&format!(
+                "[[rule]]\nfrom = [\"{source}\"]\nto = \"builtin\"\n"
+            ))
+            .unwrap(),
+        );
+        let learned = Arc::new(
+            crate::replace::Rules::parse(&format!(
+                "[[rule]]\nfrom = [\"{source}\"]\nto = \"learned\"\n"
+            ))
+            .unwrap(),
+        );
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            builtin,
+            true,
+            learned,
+        );
+
+        assert_eq!(pipeline.run(source).text, "learned");
+        pipeline.set_builtin_enabled(false);
+        assert_eq!(pipeline.run(source).text, "learned");
+
+        thread::sleep(Duration::from_millis(2));
+        std::fs::write(
+            temp.path().join("replace.toml"),
+            format!("[[rule]]\nfrom = [\"{source}\"]\nto = \"user reloaded\"\n"),
+        )
+        .unwrap();
+        assert_eq!(pipeline.run(source).text, "learned");
+    }
+
+    #[test]
+    fn replace_file_hot_reload_keeps_builtin_rules() {
+        let (temp, replace) = replace_file("");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            Arc::new(crate::replace::builtin_rules().unwrap()),
+            true,
+            Arc::new(crate::replace::Rules::default()),
+        );
+        assert_eq!(pipeline.run("クバネティス").text, "Kubernetes");
+
+        thread::sleep(Duration::from_millis(2));
+        std::fs::write(
+            temp.path().join("replace.toml"),
+            "[[rule]]\nfrom = [\"別の語\"]\nto = \"other\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(pipeline.run("クバネティス").text, "Kubernetes");
+    }
+
+    #[test]
+    fn builtin_toggle_applies_on_next_run_and_noop_preserves_cache() {
+        let (_temp, replace) = replace_file("");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            Arc::new(crate::replace::builtin_rules().unwrap()),
+            false,
+            Arc::new(crate::replace::Rules::default()),
+        );
+        let disabled_cache = Arc::clone(&pipeline.effective);
+
+        pipeline.set_builtin_enabled(false);
+        assert!(Arc::ptr_eq(&disabled_cache, &pipeline.effective));
+        assert_eq!(pipeline.run("クバネティス").text, "クバネティス");
+
+        pipeline.set_builtin_enabled(true);
+        assert!(!Arc::ptr_eq(&disabled_cache, &pipeline.effective));
+        assert_eq!(pipeline.run("クバネティス").text, "Kubernetes");
+
+        pipeline.set_builtin_enabled(false);
+        assert_eq!(pipeline.run("クバネティス").text, "クバネティス");
+    }
+
+    #[test]
+    fn longer_builtin_source_wins_over_overlapping_shorter_user_source() {
+        let (_temp, replace) =
+            replace_file("[[rule]]\nfrom = [\"クラウド\"]\nto = \"user-short\"\n");
+        let builtin = Arc::new(
+            crate::replace::Rules::parse(
+                "[[rule]]\nfrom = [\"クラウドフレア\"]\nto = \"Cloudflare\"\n",
+            )
+            .unwrap(),
+        );
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            builtin,
+            true,
+            Arc::new(crate::replace::Rules::default()),
+        );
+
+        // Sources differ, so tier priority does not apply; longest match wins.
+        assert_eq!(
+            pipeline.run("クラウドフレアを使う").text,
+            "Cloudflareを使う"
+        );
+    }
+
+    #[test]
     fn replacement_runs_before_punctuation() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (_temp, replace) = replace_file("[[rule]]\nfrom = [\"raw\"]\nto = \"replaced\"\n");
@@ -402,7 +605,9 @@ mod tests {
             Box::new(RecordingPunctuator(Arc::clone(&seen))),
             true,
             true,
-            std::sync::Arc::new(crate::replace::Rules::default()),
+            Arc::new(crate::replace::Rules::default()),
+            false,
+            Arc::new(crate::replace::Rules::default()),
         );
         assert_eq!(pipeline.run("raw").text, "replaced");
         assert_eq!(*seen.lock().unwrap(), ["replaced"]);
@@ -481,7 +686,15 @@ mod tests {
         let learned = std::sync::Arc::new(
             crate::replace::Rules::from_learned_checked(learned_rules).unwrap(),
         );
-        let mut pipeline = Pipeline::new(replace, Box::new(NoopPunctuator), true, false, learned);
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            true,
+            false,
+            Arc::new(crate::replace::Rules::default()),
+            false,
+            learned,
+        );
         pipeline.run("a");
         let cached = std::sync::Arc::clone(&pipeline.effective);
         for _ in 0..50 {
@@ -508,6 +721,119 @@ mod tests {
             .unwrap();
         worker.submit(2, final_msg(2, "x")).unwrap();
         assert_eq!(recv(&worker).text, "z");
+    }
+
+    #[test]
+    fn worker_orders_builtin_toggle_between_finals() {
+        let (_temp, replace) = replace_file("");
+        let pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            Arc::new(crate::replace::builtin_rules().unwrap()),
+            false,
+            Arc::new(crate::replace::Rules::default()),
+        );
+        let worker = PostprocessWorker::spawn(pipeline);
+
+        worker.set_builtin_enabled(true).unwrap();
+        worker.submit(1, final_msg(1, "クバネティス")).unwrap();
+        worker.set_builtin_enabled(false).unwrap();
+        worker.submit(2, final_msg(2, "クバネティス")).unwrap();
+
+        assert_eq!(recv(&worker).text, "Kubernetes");
+        assert_eq!(recv(&worker).text, "クバネティス");
+    }
+
+    #[test]
+    #[ignore = "release-mode performance benchmark"]
+    fn bench_apply_full_dictionary() {
+        fn synthetic_source(index: usize) -> String {
+            const DIGITS: &[u8] = "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン".as_bytes();
+            const WIDTH: usize = 3;
+            let digit_count = DIGITS.len() / WIDTH;
+            let first = &DIGITS[index % digit_count * WIDTH..index % digit_count * WIDTH + WIDTH];
+            let second_index = index / digit_count % digit_count;
+            let second = &DIGITS[second_index * WIDTH..second_index * WIDTH + WIDTH];
+            let third_index = index / digit_count / digit_count;
+            let third = &DIGITS[third_index * WIDTH..third_index * WIDTH + WIDTH];
+            format!(
+                "ヲ{}{}{}",
+                std::str::from_utf8(first).unwrap(),
+                std::str::from_utf8(second).unwrap(),
+                std::str::from_utf8(third).unwrap()
+            )
+        }
+
+        fn utterance(seed: &str) -> String {
+            seed.chars().cycle().take(100).collect()
+        }
+
+        let rules = (0..2_000)
+            .map(|index| crate::replace::Rule {
+                from: vec![synthetic_source(index)],
+                to: format!("term{index}"),
+            })
+            .collect();
+        let builtin = Arc::new(crate::replace::Rules::from_learned_checked(rules).unwrap());
+        let corpus = [
+            utterance(&format!(
+                "{}{}を使って音声認識を検証する。",
+                synthetic_source(0),
+                synthetic_source(1_999)
+            )),
+            utterance(&format!(
+                "新しい{}と{}の組み合わせを試す。",
+                synthetic_source(731),
+                synthetic_source(1_204)
+            )),
+            utterance("今日は静かな会議室で長い日本語の文章を読み上げました。"),
+            utterance("辞書には存在しない一般的な表現がそのまま残ることを確認します。"),
+        ];
+        assert!(corpus.iter().all(|text| text.chars().count() == 100));
+
+        let (_temp, replace) = replace_file("");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            builtin,
+            true,
+            Arc::new(crate::replace::Rules::default()),
+        );
+
+        let run_iterations = |pipeline: &mut Pipeline, iterations: usize| {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                for text in &corpus {
+                    std::hint::black_box(pipeline.run(std::hint::black_box(text)).text);
+                }
+            }
+            started.elapsed()
+        };
+
+        run_iterations(&mut pipeline, 10);
+        let enabled_elapsed = run_iterations(&mut pipeline, 100);
+        pipeline.set_builtin_enabled(false);
+        run_iterations(&mut pipeline, 10);
+        let disabled_elapsed = run_iterations(&mut pipeline, 100);
+        let utterance_count = (100 * corpus.len()) as f64;
+        let enabled_ms = enabled_elapsed.as_secs_f64() * 1_000.0 / utterance_count;
+        let disabled_ms = disabled_elapsed.as_secs_f64() * 1_000.0 / utterance_count;
+
+        println!(
+            "2,000 rules, 100 chars/utterance: enabled={enabled_ms:.3} ms, disabled={disabled_ms:.3} ms"
+        );
+        assert!(
+            enabled_ms < 1.0,
+            "enabled dictionary took {enabled_ms:.3} ms per 100-char utterance"
+        );
+        assert!(
+            disabled_ms < 1.0,
+            "disabled dictionary took {disabled_ms:.3} ms per 100-char utterance"
+        );
     }
 
     #[test]

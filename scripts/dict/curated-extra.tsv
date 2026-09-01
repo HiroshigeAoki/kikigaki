@@ -1,0 +1,84 @@
+Terraform	テラフォーム	Infrastructure-as-code tool
+Deno	ディーノ	JavaScript and TypeScript runtime, long reading
+Deno	デノ	Common short reading; shared length filter intentionally rejects it
+Ollama	オラマ	Local model runner; shared length filter intentionally rejects this short reading
+Kubernetes	クバネティス	Common Japanese reading
+Kubernetes	クーバネティス	Long-vowel variant
+Kubernetes	クーベネティス	Alternative long-vowel variant
+Rust	ラスト	Unsafe collision; deny-readings.txt intentionally rejects it
+GitHub Copilot	ギットハブ・コパイロット	AI coding assistant
+ChatGPT	チャットジーピーティー	Generative AI service
+OpenAI	オープンエーアイ	AI platform
+Claude	クロード	AI assistant
+Gemini	ジェミニ	AI model family
+Podman	ポッドマン	Container engine
+WebAssembly	ウェブアセンブリ	Portable binary instruction format
+Supabase	スーパーベース	Backend platform
+Tailwind CSS	テイルウィンドシーエスエス	CSS framework
+Next.js	ネクストジェイエス	React framework
+Nuxt	ヌクスト	Vue framework
+Vite	ヴィート	Frontend build tool
+Vitest	ヴァイテスト	JavaScript test runner
+Playwright	プレイライト	Browser automation framework
+Svelte	スヴェルト	Frontend framework
+Astro	アストロ	Web framework
+Nix	ニックス	Package manager and language
+Dev Container	デブコンテナ	Development container specification
+Docker Compose	ドッカーコンポーズ	Multi-container configuration tool
+GitHub Actions	ギットハブアクションズ	Continuous integration service
+GraphQL	グラフキューエル	API query language
+gRPC	ジーアールピーシー	Remote procedure call framework
+OpenTelemetry	オープンテレメトリー	Observability standard
+Prometheus	プロメテウス	Monitoring system
+Grafana	グラファナ	Observability dashboard
+PyTorch	パイトーチ	Machine-learning framework
+Hugging Face	ハギングフェイス	Machine-learning platform
+LangChain	ラングチェイン	Large-language-model application framework
+Google	グーグル	ambiguity resolved: junk co-claimants Google LLC / goo.gl in NEologd seed
+YouTube	ユーチューブ	ambiguity resolved: co-claimant "You Tube" variant
+YouTuber	ユーチューバー	protective longest-match so ユーチューバー never becomes YouTubeバー
+Excel	エクセル	ambiguity resolved: co-claimant EXCEL CO. LTD.; borderline (エクセルシオール substring)
+Slack	スラック	ambiguity resolved: co-claimant S.L.A.C.K.
+React	リアクト	ambiguity resolved: co-claimants RE.ACT / ReAct
+Claude	クロード	ambiguity resolved: person-name co-claimants in seed
+Windows	ウィンドウズ	overwhelmingly the OS in dictation
+Teams	チームズ	Microsoft Teams
+Notion	ノーション	the product; ordinary sense rare in Japanese speech
+Discord	ディスコード	the product; ordinary sense rare
+GitLab	ギットラボ	dev tool
+Azure	アジュール	cloud; color sense rare in Japanese speech
+AWS	エーダブリューエス	letter-by-letter reading
+Oracle	オラクル	the vendor; oracle sense rare
+BigQuery	ビッグクエリ	cloud product
+Redshift	レッドシフト	cloud product; astronomy term is 赤方偏移 in Japanese
+DynamoDB	ダイナモディービー	cloud product
+Node.js	ノードジェイエス	runtime
+Angular	アンギュラー	framework
+Webpack	ウェブパック	bundler
+ESLint	イーエスリント	linter
+Jenkins	ジェンキンス	CI server; person-name risk low in Japanese dictation
+Istio	イスティオ	service mesh
+Keras	ケラス	ML framework; reading below the 4-char floor, intentionally rejected
+scikit-learn	サイキットラーン	ML library
+Anthropic	アンソロピック	AI vendor
+Copilot	コパイロット	the product; aviation sense rare in dev dictation (borderline)
+Midjourney	ミッドジャーニー	image AI
+DeepMind	ディープマインド	AI lab
+Perplexity	パープレキシティ	product and ML metric share the same English surface
+Shopify	ショッピファイ	commerce platform
+Confluence	コンフルエンス	wiki product; ordinary sense rare
+Trello	トレロ	kanban tool; reading below the 4-char floor, intentionally rejected
+Obsidian	オブシディアン	notes app; mineral sense rare as katakana
+Databricks	データブリックス	data platform
+Flink	フリンク	stream processor
+Bitbucket	ビットバケット	correct reading replacing NEologd joke row
+Splunk	スプランク	correct reading
+AirPods	エアポッズ	common ASR form
+AirPods	エアーポッズ	common ASR form
+Radeon	ラデオン	common reading alongside NEologd レイディオン
+Wi-Fi	ワイファイ	common ASR form
+PostgreSQL	ポスグレ	common abbreviation (was in placeholder dict)
+PostgreSQL	ポストグレス	common reading (was in placeholder dict)
+COBOL	コボル	language; reading below the 4-char floor, intentionally rejected
+Kubernetes	クマネティス	ASR misrecognition variant of Kubernetes observed in field test; non-word, no collision risk
+Kubernetes	クーベネディス	ASR misrecognition variant of Kubernetes observed in field test; non-word, no collision risk

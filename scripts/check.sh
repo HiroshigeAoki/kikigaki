@@ -2,6 +2,13 @@
 set -euo pipefail
 cd "$(dirname -- "$0")/.."
 
+echo "== builtin dictionary generator self-test =="
+if command -v python3 >/dev/null 2>&1; then
+  python3 scripts/gen-dict/gen_builtin_dict.py --self-test
+else
+  echo "SKIP: python3 is unavailable; builtin dictionary generator self-test not run"
+fi
+
 echo "== fmt =="
 cargo fmt --all --check
 

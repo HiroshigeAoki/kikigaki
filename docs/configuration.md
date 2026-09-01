@@ -11,6 +11,7 @@ paste_method = "clipboard"
 strip_trailing_period = true
 silence_pad_ms = 500
 final_timeout_ms = 3000
+builtin_replace_dict = false
 replace_file = "~/.config/kikigaki/replace.toml"
 metrics_path = "~/Library/Logs/kikigaki/latency.jsonl"
 models_dir = "~/Library/Application Support/kikigaki/models"
@@ -49,3 +50,7 @@ server_punctuates = true
 ## 置換辞書
 
 `~/.config/kikigaki/replace.toml` の書き方は [README](../README.md#置換辞書) を参照。
+
+`builtin_replace_dict` は真偽値で、既定値は `false`。精査済みのOSSソースから構築してバイナリに同梱した、カタカナ語→英語の内蔵置換辞書を有効にする。`replace.toml` のユーザー定義ルールと学習済みの修正は、内蔵辞書より優先される。
+
+動作だけを元に戻す場合は、`builtin_replace_dict = false` に設定するか、設定画面のトグルをオフにする。古いkikigakiバイナリへダウングレードする場合は、この行自体を削除すること。古いバイナリは未知の設定項目を含む `config.toml` を拒否するため、行を残したままダウングレードすると起動できない。

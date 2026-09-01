@@ -95,6 +95,7 @@ pub trait PostprocessFactory: Send {
     fn build(
         &self,
         learned: std::sync::Arc<kikigaki_core::replace::Rules>,
+        builtin_enabled: bool,
         waker: Option<Waker>,
     ) -> anyhow::Result<PostprocessWorker>;
 }
@@ -523,6 +524,15 @@ impl Controller {
                         {
                             tracing::warn!(%error, "configure post-processing");
                         }
+                        if let Err(error) =
+                            worker.set_builtin_enabled(snapshot.builtin_replace_dict)
+                        {
+                            tracing::warn!(%error, "configure builtin replacement dictionary");
+                            self.status =
+                                Status::Warning("内蔵置換辞書を反映できませんでした".into());
+                            // Persistence is authoritative: disk state can run ahead of the live
+                            // worker after a delivery failure, so return the persisted snapshot.
+                        }
                     }
                 }
                 let _ = reply.send(result);
@@ -712,6 +722,7 @@ impl Controller {
         match self.settings.apply(SettingsPatch {
             hotkey: Some(chord.clone()),
             punctuation: None,
+            builtin_replace_dict: None,
         }) {
             Ok(snapshot) => {
                 tracing::info!(chord = %chord, "hotkey re-registered after settings change");
@@ -794,12 +805,16 @@ impl Controller {
                         continue;
                     }
                     if self.postprocess.is_none() {
-                        match self
-                            .postprocess_factory
-                            .build(self.learned.as_core_rules(), Some(Arc::clone(&self.waker)))
-                        {
+                        let settings = self.settings.snapshot();
+                        match self.postprocess_factory.build(
+                            self.learned.as_core_rules(),
+                            settings.builtin_replace_dict,
+                            Some(Arc::clone(&self.waker)),
+                        ) {
                             Ok(worker) => {
-                                let settings = self.settings.snapshot();
+                                // builtin_replace_dict was already applied via
+                                // postprocess_factory.build() above; only punct settings need
+                                // a follow-up configure() since build() hardcodes those off.
                                 if let Err(error) = worker.configure(
                                     settings.punct_enabled,
                                     settings.strip_trailing_period,
@@ -1331,6 +1346,7 @@ mod tests {
 
     struct FakePostprocessFactory {
         replace_file: PathBuf,
+        builtin: Arc<kikigaki_core::replace::Rules>,
         gate: Mutex<Option<BuildGate>>,
     }
 
@@ -1338,6 +1354,7 @@ mod tests {
         fn build(
             &self,
             learned: Arc<kikigaki_core::replace::Rules>,
+            builtin_enabled: bool,
             waker: Option<Waker>,
         ) -> anyhow::Result<PostprocessWorker> {
             if let Some(gate) = self.gate.lock().unwrap().take() {
@@ -1350,6 +1367,8 @@ mod tests {
                     Box::new(PeriodPunctuator),
                     false,
                     false,
+                    Arc::clone(&self.builtin),
+                    builtin_enabled,
                     learned,
                 ),
                 waker,
@@ -1505,6 +1524,31 @@ mod tests {
         gate: Option<BuildGate>,
         poll_interval: Duration,
     ) -> Harness {
+        harness_with_initial_builtin_and_poll_interval(
+            punct,
+            false,
+            bootstrap,
+            hotkey_plan,
+            rescans,
+            reject_late_paste,
+            clock,
+            gate,
+            poll_interval,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn harness_with_initial_builtin_and_poll_interval(
+        punct: bool,
+        builtin_replace_dict: bool,
+        bootstrap: BootstrapOutcome,
+        hotkey_plan: Vec<Result<(), String>>,
+        rescans: Vec<Option<OnboardingState>>,
+        reject_late_paste: bool,
+        clock: Option<Instant>,
+        gate: Option<BuildGate>,
+        poll_interval: Duration,
+    ) -> Harness {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         let replace_file = temp.path().join("replace.toml");
@@ -1515,8 +1559,8 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "hotkey = \"Alt+Space\"\nstrip_trailing_period = false\nreplace_file = {:?}\nlearned_file = {:?}\nmetrics_path = {:?}\nmodels_dir = {:?}\n[punct]\nenabled = {}\n",
-                replace_file, learned_file, metrics_path, models_dir, punct
+                "hotkey = \"Alt+Space\"\nstrip_trailing_period = false\nbuiltin_replace_dict = {builtin_replace_dict}\nreplace_file = {:?}\nlearned_file = {:?}\nmetrics_path = {:?}\nmodels_dir = {:?}\n[punct]\nenabled = {}\n",
+                replace_file, learned_file, metrics_path, models_dir, punct,
             ),
         )
         .unwrap();
@@ -1560,6 +1604,7 @@ mod tests {
             Box::new(FakeMic(Arc::clone(&mic_starts))),
             Box::new(FakePostprocessFactory {
                 replace_file,
+                builtin: Arc::new(kikigaki_core::replace::builtin_rules().unwrap()),
                 gate: Mutex::new(gate),
             }),
             Box::new(FakeStartup {
@@ -1639,6 +1684,22 @@ mod tests {
             None,
             None,
             poll_interval,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        harness
+    }
+
+    fn ready_harness_with_builtin_enabled() -> Harness {
+        let harness = harness_with_initial_builtin_and_poll_interval(
+            false,
+            true,
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         harness
@@ -1741,6 +1802,7 @@ mod tests {
             patch: SettingsPatch {
                 hotkey: Some(chord.into()),
                 punctuation: None,
+                builtin_replace_dict: None,
             },
             reply,
         })
@@ -1769,6 +1831,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: Some("Alt+A".into()),
                     punctuation: None,
+                    builtin_replace_dict: None,
                 },
                 reply: a_tx,
             })
@@ -1780,6 +1843,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: Some("Alt+B".into()),
                     punctuation: None,
+                    builtin_replace_dict: None,
                 },
                 reply: b_tx,
             })
@@ -1961,6 +2025,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: None,
                     punctuation: Some(PunctSetting::On),
+                    builtin_replace_dict: None,
                 },
                 reply,
             })
@@ -1977,6 +2042,117 @@ mod tests {
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
             "y。"
+        );
+    }
+
+    #[test]
+    fn builtin_dictionary_toggle_changes_live_transcription_output() {
+        let harness = ready_harness();
+        transcribe(&harness, 1, "クバネティス");
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "クバネティス"
+        );
+
+        harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::ApplySettings {
+                patch: SettingsPatch {
+                    hotkey: None,
+                    punctuation: None,
+                    builtin_replace_dict: Some(true),
+                },
+                reply,
+            })
+            .unwrap();
+
+        transcribe(&harness, 2, "クバネティス");
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "Kubernetes"
+        );
+    }
+
+    #[test]
+    fn builtin_dictionary_enabled_before_worker_creation_applies_to_first_transcription() {
+        let harness = ready_harness_with_builtin_enabled();
+
+        transcribe(&harness, 1, "クバネティス");
+
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "Kubernetes"
+        );
+    }
+
+    #[test]
+    fn externally_rejected_builtin_patch_leaves_live_worker_behavior_unchanged() {
+        let harness = ready_harness();
+        transcribe(&harness, 1, "クバネティス");
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "クバネティス"
+        );
+
+        let config_path = harness._temp.path().join("config.toml");
+        let mut externally_edited = std::fs::read_to_string(&config_path).unwrap();
+        externally_edited.push_str("# external edit\n");
+        std::fs::write(config_path, externally_edited).unwrap();
+        let error = harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::ApplySettings {
+                patch: SettingsPatch {
+                    hotkey: None,
+                    punctuation: None,
+                    builtin_replace_dict: Some(true),
+                },
+                reply,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "external_change");
+
+        transcribe(&harness, 2, "クバネティス");
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "クバネティス"
+        );
+    }
+
+    #[test]
+    fn correction_learned_with_builtin_enabled_uses_raw_asr_and_survives_toggle_off() {
+        let harness = ready_harness_with_builtin_enabled();
+        transcribe(&harness, 1, "クバネティス");
+        let first = wait_snapshot(&harness, |snapshot| snapshot.history.len() == 1);
+        assert_eq!(first.history[0].raw, "クバネティス");
+        assert_eq!(first.history[0].text, "Kubernetes");
+
+        harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::RememberCorrection {
+                entry_id: first.history[0].id,
+                corrected: "Kubernetes".into(),
+                reply,
+            })
+            .unwrap();
+        let learned = wait_snapshot(&harness, |snapshot| snapshot.learned_rules.len() == 1);
+        assert_eq!(learned.learned_rules[0].from, ["クバネティス"]);
+        assert_eq!(learned.learned_rules[0].to, "Kubernetes");
+
+        harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::ApplySettings {
+                patch: SettingsPatch {
+                    hotkey: None,
+                    punctuation: None,
+                    builtin_replace_dict: Some(false),
+                },
+                reply,
+            })
+            .unwrap();
+        transcribe(&harness, 2, "クバネティス");
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "Kubernetes"
         );
     }
 
@@ -2033,6 +2209,7 @@ mod tests {
                     patch: SettingsPatch {
                         hotkey: None,
                         punctuation: None,
+                        builtin_replace_dict: None,
                     },
                     reply,
                 })

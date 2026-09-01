@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct SettingsPatch {
     pub hotkey: Option<String>,
     pub punctuation: Option<PunctSetting>,
+    /// JSON uses `builtinReplaceDict`; snapshots and persisted TOML stay snake_case.
+    pub builtin_replace_dict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -25,6 +27,7 @@ pub struct SettingsSnapshot {
     pub hotkey: String,
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
+    pub builtin_replace_dict: bool,
     pub paste_method: kikigaki_core::config::PasteMethod,
 }
 
@@ -52,6 +55,7 @@ impl SettingsCoordinator {
             hotkey: self.config.hotkey.clone(),
             punct_enabled: kikigaki_core::config::punct_effective(&self.config, self.capabilities),
             strip_trailing_period: self.config.strip_trailing_period,
+            builtin_replace_dict: self.config.builtin_replace_dict,
             paste_method: self.config.paste_method,
         }
     }
@@ -102,6 +106,10 @@ impl SettingsCoordinator {
                 PunctEnabled::Off
             };
             candidate.strip_trailing_period = strip;
+        }
+        if let Some(enabled) = patch.builtin_replace_dict {
+            document["builtin_replace_dict"] = toml_edit::value(enabled);
+            candidate.builtin_replace_dict = enabled;
         }
 
         let body = document.to_string();
@@ -175,6 +183,17 @@ mod tests {
     use kikigaki_core::config::Capabilities;
 
     #[test]
+    fn builtin_replace_dict_patch_uses_camel_case_json_wire_key() {
+        let camel_case: SettingsPatch =
+            serde_json::from_str(r#"{"builtinReplaceDict": true}"#).unwrap();
+        assert_eq!(camel_case.builtin_replace_dict, Some(true));
+
+        let snake_case: SettingsPatch =
+            serde_json::from_str(r#"{"builtin_replace_dict": true}"#).unwrap();
+        assert_eq!(snake_case.builtin_replace_dict, None);
+    }
+
+    #[test]
     fn atomic_write_creates_missing_parent_directories() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp
@@ -239,12 +258,76 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Cmd+Shift+Space".into()),
                 punctuation: None,
+                builtin_replace_dict: None,
             })
             .unwrap();
         let on_disk = std::fs::read_to_string(path).unwrap();
         assert!(on_disk.contains("# a comment"));
         assert!(on_disk.contains("threshold = 0.6"));
         assert!(on_disk.contains("hotkey = \"Cmd+Shift+Space\""));
+    }
+
+    #[test]
+    fn builtin_replace_dict_patch_persists_and_updates_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# a comment\nhotkey = \"Alt+Space\"\n[vad]\nthreshold = 0.6\n",
+        )
+        .unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+            },
+        )
+        .unwrap();
+
+        let snapshot = coordinator
+            .apply(SettingsPatch {
+                hotkey: None,
+                punctuation: None,
+                builtin_replace_dict: Some(true),
+            })
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert!(on_disk.contains("# a comment"));
+        assert!(on_disk.contains("threshold = 0.6"));
+        assert!(on_disk.contains("builtin_replace_dict = true"));
+        assert!(snapshot.builtin_replace_dict);
+        assert!(coordinator.snapshot().builtin_replace_dict);
+    }
+
+    #[test]
+    fn absent_builtin_replace_dict_patch_leaves_file_and_config_value_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+            },
+        )
+        .unwrap();
+        let config_value = coordinator.config().builtin_replace_dict;
+
+        let snapshot = coordinator
+            .apply(SettingsPatch {
+                hotkey: None,
+                punctuation: None,
+                builtin_replace_dict: None,
+            })
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert!(!on_disk.contains("builtin_replace_dict"));
+        assert_eq!(snapshot.builtin_replace_dict, config_value);
+        assert_eq!(coordinator.config().builtin_replace_dict, config_value);
     }
 
     #[test]
@@ -264,6 +347,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: Some(PunctSetting::OnStrip),
+                builtin_replace_dict: None,
             })
             .unwrap();
         assert!(snapshot.punct_enabled && snapshot.strip_trailing_period);
@@ -308,9 +392,40 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Ctrl+Space".into()),
                 punctuation: None,
+                builtin_replace_dict: None,
             })
             .unwrap_err();
         assert_eq!(error.code, "external_change");
+    }
+
+    #[test]
+    fn external_edit_rejects_builtin_replace_dict_patch_without_partial_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+            },
+        )
+        .unwrap();
+        let externally_edited = "# external edit\nhotkey = \"Cmd+Space\"\n";
+        std::fs::write(&path, externally_edited).unwrap();
+
+        let error = coordinator
+            .apply(SettingsPatch {
+                hotkey: None,
+                punctuation: None,
+                builtin_replace_dict: Some(true),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "external_change");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), externally_edited);
+        assert!(!coordinator.config().builtin_replace_dict);
+        assert!(!coordinator.snapshot().builtin_replace_dict);
     }
 
     #[test]
@@ -332,6 +447,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Cmd+Space".into()),
                 punctuation: None,
+                builtin_replace_dict: None,
             })
             .is_err());
         assert_eq!(coordinator.snapshot().hotkey, "Alt+Space");

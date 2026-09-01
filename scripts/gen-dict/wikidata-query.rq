@@ -1,0 +1,30 @@
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+SELECT DISTINCT ?item ?surface ?reading WHERE {
+  VALUES ?class {
+    wd:Q7397
+    wd:Q9143
+    wd:Q9135
+    wd:Q6368
+    wd:Q271680
+    wd:Q176165
+  }
+  ?item wdt:P31 ?class;
+        rdfs:label ?englishLabel.
+  FILTER(LANG(?englishLabel) = "en")
+  {
+    ?item rdfs:label ?japaneseLabel.
+    FILTER(LANG(?japaneseLabel) = "ja")
+  }
+  UNION
+  {
+    ?item skos:altLabel ?japaneseLabel.
+    FILTER(LANG(?japaneseLabel) = "ja")
+  }
+  BIND(STR(?englishLabel) AS ?surface)
+  BIND(STR(?japaneseLabel) AS ?reading)
+}
+ORDER BY ?surface ?reading ?item

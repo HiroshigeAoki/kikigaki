@@ -17,7 +17,7 @@ use kikigaki_engine::sherpa::{build_recognizer, build_recognizer_with_hotwords};
 use serde::Serialize;
 
 const DEFAULT_HOTWORDS_SCORE: f32 = 1.5;
-const USAGE: &str = "usage: hotword-eval --models-dir D --manifest M.tsv [--manifest M.tsv ...] --wavs-dir W --out R.jsonl [--hotwords-file F] [--hotwords-score S] [--num-threads N]";
+const USAGE: &str = "usage: hotword-eval --models-dir D --manifest M.tsv [--manifest M.tsv ...] --wavs-dir W --out R.jsonl [--hotwords-file F --bpe-vocab V] [--hotwords-score S] [--num-threads N]";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -27,6 +27,7 @@ struct Args {
     wavs_dir: PathBuf,
     out: PathBuf,
     hotwords_file: Option<PathBuf>,
+    bpe_vocab: Option<PathBuf>,
     hotwords_score: Option<f32>,
     num_threads: u32,
 }
@@ -59,6 +60,8 @@ struct RunMetadata {
     hotwords_file_sha256: Option<String>,
     hotwords_line_count: Option<usize>,
     hotwords_score: Option<f32>,
+    bpe_vocab_sha256: Option<String>,
+    bpe_vocab_line_count: Option<usize>,
     num_threads: u32,
     manifest_sha256: Vec<String>,
     git_head: String,
@@ -111,6 +114,7 @@ fn run() -> anyhow::Result<()> {
             &asr_config,
             metadata.path.as_path(),
             metadata.score,
+            metadata.bpe_vocab_path.as_path(),
         )
         .context("build recognizer with hotwords")?,
         None => build_recognizer(&args.models_dir, &asr_config).context("build recognizer")?,
@@ -123,6 +127,12 @@ fn run() -> anyhow::Result<()> {
         hotwords_file_sha256: hotwords.as_ref().map(|metadata| metadata.sha256.clone()),
         hotwords_line_count: hotwords.as_ref().map(|metadata| metadata.line_count),
         hotwords_score: hotwords.as_ref().map(|metadata| metadata.score),
+        bpe_vocab_sha256: hotwords
+            .as_ref()
+            .map(|metadata| metadata.bpe_vocab_sha256.clone()),
+        bpe_vocab_line_count: hotwords
+            .as_ref()
+            .map(|metadata| metadata.bpe_vocab_line_count),
         num_threads: args.num_threads,
         manifest_sha256,
         git_head,
@@ -186,6 +196,9 @@ struct HotwordsMetadata {
     score: f32,
     sha256: String,
     line_count: usize,
+    bpe_vocab_path: PathBuf,
+    bpe_vocab_sha256: String,
+    bpe_vocab_line_count: usize,
 }
 
 fn hotwords_metadata(args: &Args) -> anyhow::Result<Option<HotwordsMetadata>> {
@@ -204,11 +217,26 @@ fn hotwords_metadata(args: &Args) -> anyhow::Result<Option<HotwordsMetadata>> {
     let bytes = fs::read(path).with_context(|| format!("read hotwords file {}", path.display()))?;
     let text = std::str::from_utf8(&bytes)
         .with_context(|| format!("hotwords file is not UTF-8: {}", path.display()))?;
+    let bpe_vocab_path = args
+        .bpe_vocab
+        .as_ref()
+        .context("--hotwords-file requires --bpe-vocab")?;
+    let bpe_vocab_bytes = fs::read(bpe_vocab_path)
+        .with_context(|| format!("read BPE vocabulary file {}", bpe_vocab_path.display()))?;
+    let bpe_vocab_text = std::str::from_utf8(&bpe_vocab_bytes).with_context(|| {
+        format!(
+            "BPE vocabulary file is not UTF-8: {}",
+            bpe_vocab_path.display()
+        )
+    })?;
     Ok(Some(HotwordsMetadata {
         path: path.clone(),
         score,
         sha256: sha256_hex(&bytes),
         line_count: text.lines().count(),
+        bpe_vocab_path: bpe_vocab_path.clone(),
+        bpe_vocab_sha256: sha256_hex(&bpe_vocab_bytes),
+        bpe_vocab_line_count: bpe_vocab_text.lines().count(),
     }))
 }
 
@@ -365,6 +393,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
     let mut wavs_dir = None;
     let mut out = None;
     let mut hotwords_file = None;
+    let mut bpe_vocab = None;
     let mut hotwords_score = None;
     let mut num_threads = 1;
     let mut arguments = arguments.into_iter();
@@ -381,6 +410,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
             "--hotwords-file" => {
                 set_once(&mut hotwords_file, take_path(&mut arguments, flag)?, flag)?
             }
+            "--bpe-vocab" => set_once(&mut bpe_vocab, take_path(&mut arguments, flag)?, flag)?,
             "--hotwords-score" => {
                 let value = take_utf8(&mut arguments, flag)?;
                 let score = value
@@ -406,12 +436,21 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
         !manifests.is_empty(),
         "at least one --manifest is required\n{USAGE}"
     );
+    match (&hotwords_file, &bpe_vocab) {
+        (Some(_), None) => bail!("--hotwords-file requires --bpe-vocab\n{USAGE}"),
+        (None, Some(_)) => bail!("--bpe-vocab requires --hotwords-file\n{USAGE}"),
+        (None, None) if hotwords_score.is_some() => {
+            bail!("--hotwords-score requires --hotwords-file\n{USAGE}")
+        }
+        _ => {}
+    }
     Ok(Args {
         models_dir: models_dir.ok_or_else(|| anyhow!("--models-dir is required\n{USAGE}"))?,
         manifests,
         wavs_dir: wavs_dir.ok_or_else(|| anyhow!("--wavs-dir is required\n{USAGE}"))?,
         out: out.ok_or_else(|| anyhow!("--out is required\n{USAGE}"))?,
         hotwords_file,
+        bpe_vocab,
         hotwords_score,
         num_threads,
     })
@@ -602,6 +641,8 @@ mod tests {
             hotwords_file_sha256: None,
             hotwords_line_count: None,
             hotwords_score: None,
+            bpe_vocab_sha256: None,
+            bpe_vocab_line_count: None,
             num_threads: 1,
             manifest_sha256: vec!["abc".into(), "def".into()],
             git_head: "012345".into(),
@@ -610,7 +651,7 @@ mod tests {
 
         assert_eq!(
             json_line(&header).unwrap(),
-            "{\"condition\":\"B\",\"hotwords_file_sha256\":null,\"hotwords_line_count\":null,\"hotwords_score\":null,\"num_threads\":1,\"manifest_sha256\":[\"abc\",\"def\"],\"git_head\":\"012345\",\"model_dir\":\"reazonspeech-ja-en-2025-01-17\"}\n"
+            "{\"condition\":\"B\",\"hotwords_file_sha256\":null,\"hotwords_line_count\":null,\"hotwords_score\":null,\"bpe_vocab_sha256\":null,\"bpe_vocab_line_count\":null,\"num_threads\":1,\"manifest_sha256\":[\"abc\",\"def\"],\"git_head\":\"012345\",\"model_dir\":\"reazonspeech-ja-en-2025-01-17\"}\n"
         );
     }
 
@@ -621,6 +662,8 @@ mod tests {
             hotwords_file_sha256: Some("hotwords-hash".into()),
             hotwords_line_count: Some(242),
             hotwords_score: Some(2.0),
+            bpe_vocab_sha256: Some("vocab-hash".into()),
+            bpe_vocab_line_count: Some(2000),
             num_threads: 3,
             manifest_sha256: vec!["manifest-hash".into()],
             git_head: "012345".into(),
@@ -629,8 +672,54 @@ mod tests {
 
         assert_eq!(
             json_line(&header).unwrap(),
-            "{\"condition\":\"D\",\"hotwords_file_sha256\":\"hotwords-hash\",\"hotwords_line_count\":242,\"hotwords_score\":2.0,\"num_threads\":3,\"manifest_sha256\":[\"manifest-hash\"],\"git_head\":\"012345\",\"model_dir\":\"model-id\"}\n"
+            "{\"condition\":\"D\",\"hotwords_file_sha256\":\"hotwords-hash\",\"hotwords_line_count\":242,\"hotwords_score\":2.0,\"bpe_vocab_sha256\":\"vocab-hash\",\"bpe_vocab_line_count\":2000,\"num_threads\":3,\"manifest_sha256\":[\"manifest-hash\"],\"git_head\":\"012345\",\"model_dir\":\"model-id\"}\n"
         );
+    }
+
+    #[test]
+    fn hotwords_and_bpe_vocab_must_be_supplied_together() {
+        let required = [
+            "--models-dir",
+            "models",
+            "--manifest",
+            "manifest.tsv",
+            "--wavs-dir",
+            "wavs",
+            "--out",
+            "result.jsonl",
+        ];
+
+        let only_hotwords = parse_args(
+            required
+                .into_iter()
+                .chain(["--hotwords-file", "hotwords.txt"])
+                .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(only_hotwords.to_string().contains("--bpe-vocab"));
+
+        let only_vocab = parse_args(
+            required
+                .into_iter()
+                .chain(["--bpe-vocab", "bpe.vocab"])
+                .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(only_vocab.to_string().contains("--hotwords-file"));
+
+        let paired = parse_args(
+            required
+                .into_iter()
+                .chain([
+                    "--hotwords-file",
+                    "hotwords.txt",
+                    "--bpe-vocab",
+                    "bpe.vocab",
+                ])
+                .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(paired.bpe_vocab.as_deref(), Some(Path::new("bpe.vocab")));
     }
 
     #[test]

@@ -53,11 +53,15 @@ pub fn build_recognizer(models_dir: &Path, config: &AsrConfig) -> anyhow::Result
 }
 
 /// Loads the configured ReazonSpeech transducer with hotword biasing enabled.
+///
+/// `bpe_vocab` supplies the sentencepiece-style vocabulary required to encode
+/// hotwords for the model's byte-level BPE tokens.
 pub fn build_recognizer_with_hotwords(
     models_dir: &Path,
     config: &AsrConfig,
     hotwords_file: &Path,
     score: f32,
+    bpe_vocab: &Path,
 ) -> anyhow::Result<SherpaAsr> {
     ensure!(
         config.decoding_method == DecodingMethod::ModifiedBeamSearch,
@@ -72,8 +76,14 @@ pub fn build_recognizer_with_hotwords(
         "hotwords file does not exist: {}",
         hotwords_file.display()
     );
+    ensure!(
+        bpe_vocab.exists(),
+        "BPE vocabulary file does not exist: {}",
+        bpe_vocab.display()
+    );
 
-    let sherpa_config = recognizer_config(models_dir, config, Some((hotwords_file, score)))?;
+    let sherpa_config =
+        recognizer_config(models_dir, config, Some((hotwords_file, score, bpe_vocab)))?;
     let path = models_dir.join(ASR_MODEL_ID);
     let recognizer = OfflineRecognizer::create(&sherpa_config)
         .ok_or_else(|| anyhow!("failed to load {ASR_MODEL_ID} from {}", path.display()))?;
@@ -83,7 +93,7 @@ pub fn build_recognizer_with_hotwords(
 fn recognizer_config(
     models_dir: &Path,
     config: &AsrConfig,
-    hotwords: Option<(&Path, f32)>,
+    hotwords: Option<(&Path, f32, &Path)>,
 ) -> anyhow::Result<OfflineRecognizerConfig> {
     let mut sherpa_config = OfflineRecognizerConfig::default();
     let path = models_dir.join(ASR_MODEL_ID);
@@ -113,7 +123,9 @@ fn recognizer_config(
     sherpa_config.model_config.modeling_unit = Some("cjkchar".into());
     sherpa_config.decoding_method = Some(config.decoding_method.as_sherpa_str().into());
     sherpa_config.max_active_paths = 4;
-    if let Some((hotwords_file, score)) = hotwords {
+    if let Some((hotwords_file, score, bpe_vocab)) = hotwords {
+        sherpa_config.model_config.modeling_unit = Some("bbpe".into());
+        sherpa_config.model_config.bpe_vocab = Some(bpe_vocab.to_string_lossy().into_owned());
         sherpa_config.hotwords_file = Some(hotwords_file.to_string_lossy().into_owned());
         sherpa_config.hotwords_score = score;
     }
@@ -215,6 +227,7 @@ mod tests {
             actual.model_config.modeling_unit.as_deref(),
             Some("cjkchar")
         );
+        assert_eq!(actual.model_config.bpe_vocab, None);
         assert_eq!(
             actual.decoding_method.as_deref(),
             Some("modified_beam_search")
@@ -227,14 +240,20 @@ mod tests {
     #[test]
     fn recognizer_config_sets_hotwords() {
         let hotwords_file = Path::new("/hotwords.txt");
+        let bpe_vocab = Path::new("/bpe.vocab");
 
         let actual = recognizer_config(
             Path::new("/models"),
             &AsrConfig::default(),
-            Some((hotwords_file, 2.0)),
+            Some((hotwords_file, 2.0, bpe_vocab)),
         )
         .unwrap();
 
+        assert_eq!(actual.model_config.modeling_unit.as_deref(), Some("bbpe"));
+        assert_eq!(
+            actual.model_config.bpe_vocab.as_deref(),
+            Some(bpe_vocab.to_str().unwrap())
+        );
         assert_eq!(
             actual.hotwords_file.as_deref(),
             Some(hotwords_file.to_str().unwrap())

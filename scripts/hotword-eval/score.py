@@ -31,6 +31,10 @@ HEADER_KEYS = {
     "model_dir",
 }
 RESULT_KEYS = {"id", "ref", "hyp", "decode_ms"}
+# Optional provenance fields written by the eval CLI since the bbpe amendment
+# (synthesized-vocab sha256 + line count). Tolerated but not required, so
+# fixtures and pre-amendment result files stay valid.
+OPTIONAL_HEADER_KEYS = {"bpe_vocab_sha256", "bpe_vocab_line_count"}
 
 
 class ScoringError(RuntimeError):
@@ -299,6 +303,8 @@ def _is_number(value: object) -> bool:
 
 
 def parse_metadata(value: object, path: Path) -> RunMetadata:
+    if isinstance(value, dict):
+        value = {k: v for k, v in value.items() if k not in OPTIONAL_HEADER_KEYS}
     record = _expect_exact_keys(value, HEADER_KEYS, path, 1, "metadata header")
     condition = record["condition"]
     if condition not in {"B", "D"}:

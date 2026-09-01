@@ -15,3 +15,4 @@ CLAUDE.local.md
 # Builtin dictionary source cache and unreviewed Stage B output
 scripts/dict/cache/
 scripts/dict/candidates.tsv
+scripts/hotword-eval/out/

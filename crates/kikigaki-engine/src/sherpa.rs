@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Context};
-use kikigaki_core::config::{AsrConfig, VadConfig};
+use anyhow::{anyhow, ensure, Context};
+use kikigaki_core::config::{AsrConfig, DecodingMethod, VadConfig};
 use kikigaki_core::models::{ASR_MODEL_ID, VAD_MODEL_ID};
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, SileroVadModelConfig, VadModelConfig,
@@ -45,8 +45,48 @@ pub fn build_vad(models_dir: &Path, config: &VadConfig) -> anyhow::Result<Sherpa
 
 /// Loads the configured ReazonSpeech transducer from `models_dir`.
 pub fn build_recognizer(models_dir: &Path, config: &AsrConfig) -> anyhow::Result<SherpaAsr> {
+    let sherpa_config = recognizer_config(models_dir, config, None)?;
     let path = models_dir.join(ASR_MODEL_ID);
+    let recognizer = OfflineRecognizer::create(&sherpa_config)
+        .ok_or_else(|| anyhow!("failed to load {ASR_MODEL_ID} from {}", path.display()))?;
+    Ok(SherpaAsr { recognizer })
+}
+
+/// Loads the configured ReazonSpeech transducer with hotword biasing enabled.
+pub fn build_recognizer_with_hotwords(
+    models_dir: &Path,
+    config: &AsrConfig,
+    hotwords_file: &Path,
+    score: f32,
+) -> anyhow::Result<SherpaAsr> {
+    ensure!(
+        config.decoding_method == DecodingMethod::ModifiedBeamSearch,
+        "hotwords require the modified_beam_search decoding method"
+    );
+    ensure!(
+        score.is_finite() && score > 0.0,
+        "hotwords score must be finite and greater than zero, got {score}"
+    );
+    ensure!(
+        hotwords_file.exists(),
+        "hotwords file does not exist: {}",
+        hotwords_file.display()
+    );
+
+    let sherpa_config = recognizer_config(models_dir, config, Some((hotwords_file, score)))?;
+    let path = models_dir.join(ASR_MODEL_ID);
+    let recognizer = OfflineRecognizer::create(&sherpa_config)
+        .ok_or_else(|| anyhow!("failed to load {ASR_MODEL_ID} from {}", path.display()))?;
+    Ok(SherpaAsr { recognizer })
+}
+
+fn recognizer_config(
+    models_dir: &Path,
+    config: &AsrConfig,
+    hotwords: Option<(&Path, f32)>,
+) -> anyhow::Result<OfflineRecognizerConfig> {
     let mut sherpa_config = OfflineRecognizerConfig::default();
+    let path = models_dir.join(ASR_MODEL_ID);
     sherpa_config.feat_config.sample_rate = 16_000;
     sherpa_config.feat_config.feature_dim = 80;
     sherpa_config.model_config.transducer.encoder = Some(
@@ -73,10 +113,12 @@ pub fn build_recognizer(models_dir: &Path, config: &AsrConfig) -> anyhow::Result
     sherpa_config.model_config.modeling_unit = Some("cjkchar".into());
     sherpa_config.decoding_method = Some(config.decoding_method.as_sherpa_str().into());
     sherpa_config.max_active_paths = 4;
+    if let Some((hotwords_file, score)) = hotwords {
+        sherpa_config.hotwords_file = Some(hotwords_file.to_string_lossy().into_owned());
+        sherpa_config.hotwords_score = score;
+    }
 
-    let recognizer = OfflineRecognizer::create(&sherpa_config)
-        .ok_or_else(|| anyhow!("failed to load {ASR_MODEL_ID} from {}", path.display()))?;
-    Ok(SherpaAsr { recognizer })
+    Ok(sherpa_config)
 }
 
 /// Decodes one 16 kHz mono segment with a loaded recognizer.
@@ -118,5 +160,100 @@ impl Vad for SherpaVad {
 impl Recognizer for SherpaAsr {
     fn transcribe(&mut self, samples: &[f32]) -> Option<String> {
         decode(&self.recognizer, samples)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizer_config_preserves_existing_defaults() {
+        let models_dir = Path::new("/models");
+        let config = AsrConfig::default();
+
+        let actual = recognizer_config(models_dir, &config, None).unwrap();
+        let model_dir = models_dir.join(ASR_MODEL_ID);
+
+        assert_eq!(actual.feat_config.sample_rate, 16_000);
+        assert_eq!(actual.feat_config.feature_dim, 80);
+        assert_eq!(
+            actual.model_config.transducer.encoder.as_deref(),
+            Some(
+                model_dir
+                    .join("encoder-epoch-35-avg-1.int8.onnx")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            actual.model_config.transducer.decoder.as_deref(),
+            Some(
+                model_dir
+                    .join("decoder-epoch-35-avg-1.int8.onnx")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            actual.model_config.transducer.joiner.as_deref(),
+            Some(
+                model_dir
+                    .join("joiner-epoch-35-avg-1.int8.onnx")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            actual.model_config.tokens.as_deref(),
+            Some(model_dir.join("tokens.txt").to_str().unwrap())
+        );
+        assert_eq!(actual.model_config.num_threads, 4);
+        assert_eq!(actual.model_config.provider.as_deref(), Some("cpu"));
+        assert_eq!(actual.model_config.model_type.as_deref(), Some("zipformer"));
+        assert_eq!(
+            actual.model_config.modeling_unit.as_deref(),
+            Some("cjkchar")
+        );
+        assert_eq!(
+            actual.decoding_method.as_deref(),
+            Some("modified_beam_search")
+        );
+        assert_eq!(actual.max_active_paths, 4);
+        assert_eq!(actual.hotwords_file, None);
+        assert_eq!(actual.hotwords_score, 0.0);
+    }
+
+    #[test]
+    fn recognizer_config_sets_hotwords() {
+        let hotwords_file = Path::new("/hotwords.txt");
+
+        let actual = recognizer_config(
+            Path::new("/models"),
+            &AsrConfig::default(),
+            Some((hotwords_file, 2.0)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual.hotwords_file.as_deref(),
+            Some(hotwords_file.to_str().unwrap())
+        );
+        assert_eq!(actual.hotwords_score, 2.0);
+    }
+
+    #[test]
+    fn recognizer_config_rejects_thread_count_outside_sherpa_range() {
+        let config = AsrConfig {
+            num_threads: u32::MAX,
+            ..AsrConfig::default()
+        };
+
+        let error = recognizer_config(Path::new("/models"), &config, None).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "ASR thread count exceeds sherpa-onnx range"
+        );
     }
 }

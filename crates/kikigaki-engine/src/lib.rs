@@ -5,6 +5,8 @@
 
 #![deny(missing_docs)]
 
+/// WAV decoding and sample-rate conversion helpers.
+pub mod audio;
 mod framer;
 /// Local in-process engine and its testable worker interfaces.
 pub mod local;

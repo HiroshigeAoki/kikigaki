@@ -3,7 +3,7 @@ use std::sync::mpsc::Receiver;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use kikigaki_core::config::{AsrConfig, VadConfig};
 use kikigaki_core::engine::{
     self, join_workers, run_worker, AudioSink, Engine, EngineCmd, EngineMsg, EventSender, Waker,
@@ -11,7 +11,8 @@ use kikigaki_core::engine::{
 use kikigaki_core::models::{ASR_MODEL_ID, VAD_MODEL_ID};
 
 use crate::framer::Framer;
-use crate::sherpa::{build_recognizer, build_vad};
+use crate::hotwords::HotwordSetup;
+use crate::sherpa::{build_recognizer_auto, build_vad};
 
 const SAMPLE_RATE: usize = 16_000;
 const PREROLL_MS: usize = 1_000;
@@ -113,6 +114,7 @@ impl LocalEngine {
         models_dir: std::path::PathBuf,
         asr: AsrConfig,
         vad: VadConfig,
+        hotwords_score: Option<f32>,
     ) -> anyhow::Result<Self> {
         let (sink, cmds) = engine::channel();
         let (events_tx, events_rx) = engine::event_channel(32);
@@ -120,28 +122,31 @@ impl LocalEngine {
         let worker_sink = sink.clone();
         let worker_events = events_tx.clone();
         let failure_reporter = events_tx.clone();
+        let tracing_dispatch = tracing::dispatcher::get_default(Clone::clone);
         let worker = thread::Builder::new()
             .name("local-engine".into())
             .spawn(move || {
-                let vad_models_dir = models_dir.clone();
-                let vad_config = vad.clone();
-                let failure_events = worker_events.clone();
-                run_worker(&failure_reporter, &done_tx, || {
-                    let result = run_with_loaders(
-                        cmds,
-                        worker_events,
-                        worker_sink,
-                        vad.max_speech_s,
-                        move || {
-                            build_vad(&vad_models_dir, &vad_config)
-                                .map(|detector| Box::new(detector) as Box<dyn Vad>)
-                        },
-                        move || {
-                            build_recognizer(&models_dir, &asr)
-                                .map(|recognizer| Box::new(recognizer) as Box<dyn Recognizer>)
-                        },
-                    );
-                    report_model_load_failure(&failure_events, result)
+                tracing::dispatcher::with_default(&tracing_dispatch, || {
+                    let vad_models_dir = models_dir.clone();
+                    let vad_config = vad.clone();
+                    let failure_events = worker_events.clone();
+                    run_worker(&failure_reporter, &done_tx, || {
+                        let result = run_with_loaders(
+                            cmds,
+                            worker_events,
+                            worker_sink,
+                            vad.max_speech_s,
+                            move || {
+                                build_vad(&vad_models_dir, &vad_config)
+                                    .map(|detector| Box::new(detector) as Box<dyn Vad>)
+                            },
+                            move || {
+                                build_recognizer_auto(&models_dir, &asr, hotwords_score)
+                                    .map(|recognizer| Box::new(recognizer) as Box<dyn Recognizer>)
+                            },
+                        );
+                        report_model_load_failure(&failure_events, result)
+                    });
                 });
             })
             .context("spawn local engine worker")?;
@@ -153,6 +158,46 @@ impl LocalEngine {
             done_rx,
             worker: Some(worker),
         })
+    }
+}
+
+/// Runs the optional hotword setup/build path, degrading to the baseline builder on failure.
+///
+/// Invalid scores are configuration errors and are rejected before materialization. Filesystem
+/// and recognizer-construction failures are optional-feature failures, so they are logged and the
+/// baseline builder is used instead.
+pub(crate) fn with_hotword_fallback<T, M, B, H>(
+    hotwords_score: Option<f32>,
+    materialize_hotwords: M,
+    build_baseline: B,
+    build_with_hotwords: H,
+) -> anyhow::Result<T>
+where
+    M: FnOnce() -> anyhow::Result<HotwordSetup>,
+    B: FnOnce() -> anyhow::Result<T>,
+    H: FnOnce(HotwordSetup, f32) -> anyhow::Result<T>,
+{
+    let Some(score) = hotwords_score else {
+        return build_baseline();
+    };
+    ensure!(
+        score.is_finite() && score > 0.0,
+        "hotwords score must be finite and greater than zero, got {score}"
+    );
+
+    let setup = match materialize_hotwords() {
+        Ok(setup) => setup,
+        Err(error) => {
+            tracing::warn!(%error, "hotword setup failed; continuing without hotwords");
+            return build_baseline();
+        }
+    };
+    match build_with_hotwords(setup, score) {
+        Ok(recognizer) => Ok(recognizer),
+        Err(error) => {
+            tracing::warn!(%error, "hotword recognizer build failed; continuing without hotwords");
+            build_baseline()
+        }
     }
 }
 
@@ -438,8 +483,78 @@ mod tests {
     use kikigaki_core::models::{ASR_MODEL_ID, VAD_MODEL_ID};
 
     use super::{
-        report_model_load_failure, run_local_worker, run_with_loaders, Recognizer, Vad, VadSegment,
+        report_model_load_failure, run_local_worker, run_with_loaders, with_hotword_fallback,
+        Recognizer, Vad, VadSegment,
     };
+
+    #[test]
+    fn hotword_setup_failure_warns_and_selects_baseline_config() {
+        let models_dir = std::path::Path::new("/models");
+        let asr = kikigaki_core::config::AsrConfig::default();
+        let expected = crate::sherpa::recognizer_config(models_dir, &asr, None).unwrap();
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = WarningSubscriber(Arc::clone(&messages));
+
+        let actual = tracing::subscriber::with_default(subscriber, || {
+            with_hotword_fallback(
+                Some(3.0),
+                || anyhow::bail!("injected materialization failure"),
+                || crate::sherpa::recognizer_config(models_dir, &asr, None),
+                |setup, score| {
+                    crate::sherpa::recognizer_config(
+                        models_dir,
+                        &asr,
+                        Some((&setup.hotwords_file, score, &setup.bpe_vocab)),
+                    )
+                },
+            )
+        })
+        .unwrap();
+
+        assert_eq!(format!("{actual:#?}"), format!("{expected:#?}"));
+        let warning = messages.lock().unwrap().join("\n");
+        assert!(
+            warning.contains("injected materialization failure"),
+            "{warning:?}"
+        );
+        assert!(warning.contains("without hotwords"), "{warning:?}");
+    }
+
+    struct WarningSubscriber(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for WarningSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     struct FakeVad {
         every: usize,

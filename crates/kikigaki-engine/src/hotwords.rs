@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
+use kikigaki_core::config::DecodingMethod;
 use kikigaki_core::models::{Payload, ASR_MODEL_ID, MODELS};
 use sha2::{Digest, Sha256};
 
@@ -17,6 +18,19 @@ pub struct HotwordSetup {
     pub hotwords_file: PathBuf,
     /// Sentencepiece-style vocabulary synthesized from the installed model tokens.
     pub bpe_vocab: PathBuf,
+}
+
+/// Resolves the optional recognizer argument for the requested hotword state.
+///
+/// sherpa-onnx only supports hotword biasing with modified-beam-search decoding. Callers that
+/// requested hotwords with greedy search should warn that recognition will continue without
+/// hotwords.
+pub fn resolve_hotword_arg(
+    enabled: bool,
+    score: f32,
+    decoding_method: DecodingMethod,
+) -> Option<f32> {
+    (enabled && decoding_method == DecodingMethod::ModifiedBeamSearch).then_some(score)
 }
 
 /// Materializes `hotwords.txt` and a synthesized `bpe.vocab` under `models_dir/hotwords/`.
@@ -166,6 +180,44 @@ mod tests {
 
     fn fixture_sha256() -> String {
         hex::encode(Sha256::digest(FIXTURE_TOKENS))
+    }
+
+    #[test]
+    fn resolves_hotword_argument_for_modified_beam_search() {
+        assert_eq!(
+            resolve_hotword_arg(true, 3.0, DecodingMethod::ModifiedBeamSearch),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn disabled_hotwords_have_no_argument_for_any_decoder() {
+        assert_eq!(
+            resolve_hotword_arg(false, 3.0, DecodingMethod::ModifiedBeamSearch),
+            None
+        );
+        assert_eq!(
+            resolve_hotword_arg(false, 3.0, DecodingMethod::GreedySearch),
+            None
+        );
+    }
+
+    #[test]
+    fn greedy_search_caller_warns_when_hotwords_are_degraded() {
+        let warning = capture_warning(|| {
+            let resolved = resolve_hotword_arg(true, 3.0, DecodingMethod::GreedySearch);
+            if resolved.is_none() {
+                tracing::warn!(
+                    "hotword biasing requires modified_beam_search; continuing without hotwords"
+                );
+            }
+            anyhow::anyhow!("capture subscriber output")
+        });
+
+        assert!(
+            warning.contains("requires modified_beam_search"),
+            "{warning:?}"
+        );
     }
 
     #[test]

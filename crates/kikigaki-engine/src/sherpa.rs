@@ -8,6 +8,7 @@ use sherpa_onnx::{
     VoiceActivityDetector,
 };
 
+use crate::hotwords::materialize;
 use crate::local::{Recognizer, Vad, VadSegment};
 
 /// A loaded sherpa-onnx voice activity detector.
@@ -52,6 +53,32 @@ pub fn build_recognizer(models_dir: &Path, config: &AsrConfig) -> anyhow::Result
     Ok(SherpaAsr { recognizer })
 }
 
+/// Loads the configured recognizer, optionally enabling embedded hotword biasing.
+///
+/// Hotword materialization and hotword-specific recognizer failures degrade to the baseline
+/// recognizer. Invalid scores remain configuration errors and are rejected before the filesystem
+/// is accessed.
+pub fn build_recognizer_auto(
+    models_dir: &Path,
+    config: &AsrConfig,
+    hotwords: Option<f32>,
+) -> anyhow::Result<SherpaAsr> {
+    crate::local::with_hotword_fallback(
+        hotwords,
+        || materialize(models_dir),
+        || build_recognizer(models_dir, config),
+        |setup, score| {
+            build_recognizer_with_hotwords(
+                models_dir,
+                config,
+                &setup.hotwords_file,
+                score,
+                &setup.bpe_vocab,
+            )
+        },
+    )
+}
+
 /// Loads the configured ReazonSpeech transducer with hotword biasing enabled.
 ///
 /// `bpe_vocab` supplies the sentencepiece-style vocabulary required to encode
@@ -90,7 +117,7 @@ pub fn build_recognizer_with_hotwords(
     Ok(SherpaAsr { recognizer })
 }
 
-fn recognizer_config(
+pub(crate) fn recognizer_config(
     models_dir: &Path,
     config: &AsrConfig,
     hotwords: Option<(&Path, f32, &Path)>,
@@ -178,6 +205,54 @@ impl Recognizer for SherpaAsr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_baseline_configs_match(
+        actual: &OfflineRecognizerConfig,
+        expected: &OfflineRecognizerConfig,
+    ) {
+        assert_eq!(format!("{actual:#?}"), format!("{expected:#?}"));
+    }
+
+    #[test]
+    fn recognizer_auto_without_hotwords_preserves_baseline_config() {
+        let models_dir = Path::new("/models");
+        let config = AsrConfig::default();
+        let expected = recognizer_config(models_dir, &config, None).unwrap();
+
+        let actual = crate::local::with_hotword_fallback(
+            None,
+            || panic!("disabled hotwords must not be materialized"),
+            || recognizer_config(models_dir, &config, None),
+            |setup, score| {
+                recognizer_config(
+                    models_dir,
+                    &config,
+                    Some((&setup.hotwords_file, score, &setup.bpe_vocab)),
+                )
+            },
+        )
+        .unwrap();
+
+        assert_baseline_configs_match(&actual, &expected);
+    }
+
+    #[test]
+    fn recognizer_auto_rejects_invalid_scores_before_materializing() {
+        for score in [f32::NEG_INFINITY, -1.0, 0.0, f32::INFINITY, f32::NAN] {
+            let error = build_recognizer_auto(
+                Path::new("/models-that-must-not-be-read"),
+                &AsrConfig::default(),
+                Some(score),
+            )
+            .err()
+            .expect("invalid score must fail");
+
+            assert!(
+                error.to_string().contains("finite and greater than zero"),
+                "unexpected error for {score:?}: {error:#}"
+            );
+        }
+    }
 
     #[test]
     fn recognizer_config_preserves_existing_defaults() {

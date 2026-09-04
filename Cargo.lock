@@ -2364,6 +2364,8 @@ dependencies = [
  "anyhow",
  "kikigaki-core",
  "ort",
+ "serde",
+ "serde_json",
  "sherpa-onnx",
  "tempfile",
  "tracing",

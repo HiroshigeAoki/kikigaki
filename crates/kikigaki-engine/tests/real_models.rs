@@ -6,11 +6,31 @@ use std::time::{Duration, Instant};
 
 use kikigaki_core::config::{AsrConfig, VadConfig};
 use kikigaki_core::engine::{Engine, EngineCmd, EngineMsg};
+use kikigaki_engine::hotwords::materialize;
 use kikigaki_engine::local::{LocalEngine, Recognizer, Vad};
 use kikigaki_engine::sherpa::{build_recognizer, build_vad};
+use sha2::{Digest, Sha256};
 use sherpa_onnx::LinearResampler;
 
 use common::load_wav_16k;
+
+#[test]
+fn materialized_hotwords_match_real_model_tokens() {
+    let Some(dir) = std::env::var_os("KIKIGAKI_MODELS_DIR") else {
+        eprintln!("SKIPPED: models missing (KIKIGAKI_MODELS_DIR unset)");
+        return;
+    };
+    let setup = materialize(&PathBuf::from(dir)).unwrap();
+    let vocab = std::fs::read(&setup.bpe_vocab).unwrap();
+    // Tied to the current ASR_MODEL_ID tokens.txt. Model updates must regenerate this value and
+    // rerun the hotword evaluation harness against the new tokenization.
+    let expected_vocab_sha256 = "ec46034586fa6e35f317af744273adca09c95ef7ad699b9a723d98548eba6f09";
+    assert_eq!(hex::encode(Sha256::digest(vocab)), expected_vocab_sha256);
+
+    let materialized = std::fs::read_to_string(setup.hotwords_file).unwrap();
+    let embedded = include_str!("../data/hotwords.txt");
+    assert_eq!(materialized.lines().count(), embedded.lines().count());
+}
 
 #[test]
 fn transcribe_test_ja_1_golden() {

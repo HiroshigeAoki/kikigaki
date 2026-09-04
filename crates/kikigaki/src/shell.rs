@@ -1,5 +1,6 @@
 //! macOS Tauri shell and adapters for the platform-independent controller.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -199,11 +200,13 @@ fn start_controller(
         tracing::info!(chord = %cfg.hotkey, "initial hotkey registered");
     }
     let startup_plan = kikigaki_core::startup::StartupPlan::from_config(&cfg, capabilities);
-    let engine_factory = Box::new(TauriEngineFactory {
+    let engine_factory = Arc::new(TauriEngineFactory {
         engine_kind: cfg.engine,
         local_models_dir: cfg.models_dir.clone(),
         local_asr_cfg: cfg.asr.clone(),
         local_vad_cfg: cfg.vad.clone(),
+        hotwords_enabled: AtomicBool::new(cfg.builtin_replace_dict),
+        hotwords_score: cfg.asr.hotwords_score,
         remote_cfg: cfg.remote.clone(),
     });
     let builtin = match kikigaki_core::replace::builtin_rules() {
@@ -353,6 +356,8 @@ struct TauriEngineFactory {
     local_models_dir: std::path::PathBuf,
     local_asr_cfg: kikigaki_core::config::AsrConfig,
     local_vad_cfg: kikigaki_core::config::VadConfig,
+    hotwords_enabled: AtomicBool,
+    hotwords_score: f32,
     #[cfg_attr(not(feature = "remote-engine"), allow(dead_code))]
     remote_cfg: kikigaki_core::config::RemoteConfig,
 }
@@ -360,12 +365,26 @@ struct TauriEngineFactory {
 impl crate::controller::EngineFactory for TauriEngineFactory {
     fn build(&self) -> anyhow::Result<Box<dyn kikigaki_core::engine::Engine>> {
         match self.engine_kind {
-            kikigaki_core::config::EngineKind::Local => kikigaki_engine::local::LocalEngine::start(
-                self.local_models_dir.clone(),
-                self.local_asr_cfg.clone(),
-                self.local_vad_cfg.clone(),
-            )
-            .map(|engine| Box::new(engine) as Box<dyn kikigaki_core::engine::Engine>),
+            kikigaki_core::config::EngineKind::Local => {
+                let enabled = self.hotwords_enabled.load(Ordering::Relaxed);
+                let hotwords_score = kikigaki_engine::hotwords::resolve_hotword_arg(
+                    enabled,
+                    self.hotwords_score,
+                    self.local_asr_cfg.decoding_method,
+                );
+                if enabled && hotwords_score.is_none() {
+                    tracing::warn!(
+                        "hotword biasing requires modified_beam_search; continuing without hotwords"
+                    );
+                }
+                kikigaki_engine::local::LocalEngine::start(
+                    self.local_models_dir.clone(),
+                    self.local_asr_cfg.clone(),
+                    self.local_vad_cfg.clone(),
+                    hotwords_score,
+                )
+                .map(|engine| Box::new(engine) as Box<dyn kikigaki_core::engine::Engine>)
+            }
             #[cfg(feature = "remote-engine")]
             kikigaki_core::config::EngineKind::Remote => {
                 kikigaki_core::remote::RemoteEngine::start(
@@ -379,6 +398,10 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
                 anyhow::bail!("engine = \"remote\" requires a build with the remote-engine feature")
             }
         }
+    }
+
+    fn set_hotwords_enabled(&self, enabled: bool) {
+        self.hotwords_enabled.store(enabled, Ordering::Relaxed);
     }
 }
 

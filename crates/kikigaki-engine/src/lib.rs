@@ -17,3 +17,5 @@ pub mod local;
 pub mod punct;
 /// Thin sherpa-onnx model construction and inference wrappers.
 pub mod sherpa;
+#[cfg(test)]
+mod test_support;

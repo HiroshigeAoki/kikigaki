@@ -204,14 +204,13 @@ mod tests {
 
     #[test]
     fn greedy_search_caller_warns_when_hotwords_are_degraded() {
-        let warning = capture_warning(|| {
+        let (_, warning) = crate::test_support::capture_warnings(|| {
             let resolved = resolve_hotword_arg(true, 3.0, DecodingMethod::GreedySearch);
             if resolved.is_none() {
                 tracing::warn!(
                     "hotword biasing requires modified_beam_search; continuing without hotwords"
                 );
             }
-            anyhow::anyhow!("capture subscriber output")
         });
 
         assert!(
@@ -306,56 +305,11 @@ mod tests {
     #[test]
     fn digest_mismatch_warns_and_errors() {
         let dir = fixture_models_dir();
-        let warning = capture_warning(|| materialize(dir.path()).unwrap_err());
+        let (_, warning) =
+            crate::test_support::capture_warnings(|| materialize(dir.path()).unwrap_err());
         assert!(
             warning.contains("digest mismatch"),
             "warning was {warning:?}"
         );
-    }
-
-    fn capture_warning(run: impl FnOnce() -> anyhow::Error) -> String {
-        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = WarningSubscriber(messages.clone());
-        let _error = tracing::subscriber::with_default(subscriber, run);
-        let output = messages.lock().unwrap().join("\n");
-        output
-    }
-
-    struct WarningSubscriber(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-    impl tracing::Subscriber for WarningSubscriber {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            *metadata.level() == tracing::Level::WARN
-        }
-
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Visitor(String);
-            impl tracing::field::Visit for Visitor {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0.push_str(&format!("{value:?}"));
-                    }
-                }
-            }
-            let mut visitor = Visitor(String::new());
-            event.record(&mut visitor);
-            self.0.lock().unwrap().push(visitor.0);
-        }
-
-        fn enter(&self, _: &tracing::span::Id) {}
-
-        fn exit(&self, _: &tracing::span::Id) {}
     }
 }

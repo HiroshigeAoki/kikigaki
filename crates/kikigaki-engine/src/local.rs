@@ -492,10 +492,8 @@ mod tests {
         let models_dir = std::path::Path::new("/models");
         let asr = kikigaki_core::config::AsrConfig::default();
         let expected = crate::sherpa::recognizer_config(models_dir, &asr, None).unwrap();
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = WarningSubscriber(Arc::clone(&messages));
 
-        let actual = tracing::subscriber::with_default(subscriber, || {
+        let (actual, warning) = crate::test_support::capture_warnings(|| {
             with_hotword_fallback(
                 Some(3.0),
                 || anyhow::bail!("injected materialization failure"),
@@ -508,52 +506,15 @@ mod tests {
                     )
                 },
             )
-        })
-        .unwrap();
+        });
+        let actual = actual.unwrap();
 
         assert_eq!(format!("{actual:#?}"), format!("{expected:#?}"));
-        let warning = messages.lock().unwrap().join("\n");
         assert!(
             warning.contains("injected materialization failure"),
             "{warning:?}"
         );
         assert!(warning.contains("without hotwords"), "{warning:?}");
-    }
-
-    struct WarningSubscriber(Arc<Mutex<Vec<String>>>);
-
-    impl tracing::Subscriber for WarningSubscriber {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            *metadata.level() == tracing::Level::WARN
-        }
-
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            struct Visitor(String);
-            impl tracing::field::Visit for Visitor {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.0.push_str(&format!("{}={value:?} ", field.name()));
-                }
-            }
-            let mut visitor = Visitor(String::new());
-            event.record(&mut visitor);
-            self.0.lock().unwrap().push(visitor.0);
-        }
-
-        fn enter(&self, _: &tracing::span::Id) {}
-
-        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     struct FakeVad {

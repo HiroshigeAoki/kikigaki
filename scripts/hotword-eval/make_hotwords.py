@@ -10,6 +10,7 @@ import re
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TextIO
 
@@ -31,9 +32,13 @@ def valid_reading(reading: str) -> bool:
     return len(reading) >= 4 and bool(READING_RE.fullmatch(reading))
 
 
-def load_readings(rows: TextIO, source_name: str) -> list[str]:
-    readings: list[str] = []
-    seen: set[str] = set()
+def iter_approved_rows(
+    rows: TextIO, source_name: str
+) -> Iterator[tuple[int, list[str]]]:
+    """Yields each non-comment, non-blank `approved.tsv` row as `(line_number, fields)`.
+
+    Raises if a row does not split into exactly the five expected columns.
+    """
     for line_number, line in enumerate(rows, 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
@@ -43,6 +48,13 @@ def load_readings(rows: TextIO, source_name: str) -> list[str]:
                 f"{source_name}:{line_number}: expected reading, surface, "
                 "source_id, provenance, approval_note"
             )
+        yield line_number, fields
+
+
+def load_readings(rows: TextIO, source_name: str) -> list[str]:
+    readings: list[str] = []
+    seen: set[str] = set()
+    for _line_number, fields in iter_approved_rows(rows, source_name):
         reading, _surface, _source_id, provenance, approval_note = fields
         if (
             "misrecognition" in approval_note
@@ -57,18 +69,7 @@ def load_readings(rows: TextIO, source_name: str) -> list[str]:
 
 
 def load_approved_reading_names(rows: TextIO, source_name: str) -> set[str]:
-    readings: set[str] = set()
-    for line_number, line in enumerate(rows, 1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        fields = line.rstrip("\r\n").split("\t")
-        if len(fields) != 5:
-            raise GenerationError(
-                f"{source_name}:{line_number}: expected reading, surface, "
-                "source_id, provenance, approval_note"
-            )
-        readings.add(fields[0])
-    return readings
+    return {fields[0] for _line_number, fields in iter_approved_rows(rows, source_name)}
 
 
 def load_exclusions(
@@ -123,6 +124,14 @@ def checked_render(readings: list[str]) -> tuple[bytes, int]:
     return contents, output_count
 
 
+def write_artifact(output: Path, contents: bytes) -> None:
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(contents)
+    except OSError as error:
+        raise GenerationError(f"cannot write {output}: {error}") from error
+
+
 def validate_tokens(readings: list[str], rows: TextIO, source_name: str) -> int:
     vocabulary = {
         fields[0] for line in rows if (fields := line.strip().split())
@@ -161,11 +170,7 @@ def generate(output: Path, tokens: Path | None) -> int:
                 f"{output_count}"
             )
 
-    try:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(contents)
-    except OSError as error:
-        raise GenerationError(f"cannot write {output}: {error}") from error
+    write_artifact(output, contents)
 
     print(f"wrote {output_count} hotwords to {output}")
     if tokens is not None:
@@ -212,11 +217,7 @@ def render_approved(args: argparse.Namespace) -> int:
         return 0
     if not args.write:
         raise GenerationError("refusing to overwrite without render --write")
-    try:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_bytes(contents)
-    except OSError as error:
-        raise GenerationError(f"cannot write {args.output}: {error}") from error
+    write_artifact(args.output, contents)
     print(f"wrote {output_count} hotwords to {args.output}")
     return 0
 

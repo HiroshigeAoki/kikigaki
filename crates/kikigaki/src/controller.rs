@@ -1957,6 +1957,17 @@ mod tests {
         }
     }
 
+    /// Polls `condition` every 10ms for up to 3 seconds, returning whether it became true.
+    fn poll(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..300 {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
     fn transcribe(harness: &Harness, gen: u64, text: &str) {
         let attempts = harness.pastes.attempts.lock().unwrap().len();
         harness.hotkey.send(HotkeyEdge::Pressed);
@@ -1964,13 +1975,10 @@ mod tests {
         harness.hotkey.send(HotkeyEdge::Released);
         wait_snapshot(harness, |snapshot| snapshot.status.state == "finalizing");
         harness.engine.send(final_message(gen, text));
-        for _ in 0..300 {
-            if harness.pastes.attempts.lock().unwrap().len() > attempts {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("paste was not attempted");
+        assert!(
+            poll(|| harness.pastes.attempts.lock().unwrap().len() > attempts),
+            "paste was not attempted"
+        );
     }
 
     fn apply_builtin(harness: &Harness, enabled: bool) -> SettingsSnapshot {
@@ -1988,13 +1996,8 @@ mod tests {
     }
 
     fn wait_for_builds(harness: &Harness, expected: usize) {
-        for _ in 0..300 {
-            if harness.engine.builds.load(Ordering::Relaxed) == expected {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!(
+        assert!(
+            poll(|| harness.engine.builds.load(Ordering::Relaxed) == expected),
             "engine build count did not reach {expected}; actual={}",
             harness.engine.builds.load(Ordering::Relaxed)
         );

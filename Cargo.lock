@@ -2362,10 +2362,12 @@ name = "kikigaki-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "kikigaki-core",
  "ort",
  "serde",
  "serde_json",
+ "sha2",
  "sherpa-onnx",
  "tempfile",
  "tracing",

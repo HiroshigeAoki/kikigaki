@@ -239,6 +239,7 @@ mod tests {
     fn manifest_entries_are_well_formed() {
         let mut ids = HashSet::new();
         for model in MODELS {
+            assert_ne!(model.id, "hotwords", "model id is reserved: hotwords");
             assert!(ids.insert(model.id), "duplicate model id: {}", model.id);
             for file in model.files() {
                 assert!(!file.name.is_empty());

@@ -1,0 +1,1 @@
+# Katakana readings excluded from recognition biasing due to observed regressions.

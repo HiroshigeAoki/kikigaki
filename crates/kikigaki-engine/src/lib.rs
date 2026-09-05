@@ -8,6 +8,8 @@
 /// WAV decoding and sample-rate conversion helpers.
 pub mod audio;
 mod framer;
+/// Hotword artifact materialization and model-derived BPE vocabulary synthesis.
+pub mod hotwords;
 /// Local in-process engine and its testable worker interfaces.
 pub mod local;
 /// Mojicast punctuation inference through dynamically loaded ONNX Runtime.
@@ -15,3 +17,5 @@ pub mod local;
 pub mod punct;
 /// Thin sherpa-onnx model construction and inference wrappers.
 pub mod sherpa;
+#[cfg(test)]
+mod test_support;

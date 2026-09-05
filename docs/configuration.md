@@ -19,6 +19,7 @@ models_dir = "~/Library/Application Support/kikigaki/models"
 [asr]
 num_threads = 4
 decoding_method = "modified_beam_search"
+hotwords_score = 3.0
 
 [vad]
 min_silence_ms = 350
@@ -53,4 +54,8 @@ server_punctuates = true
 
 `builtin_replace_dict` は真偽値で、既定値は `false`。精査済みのOSSソースから構築してバイナリに同梱した、カタカナ語→英語の内蔵置換辞書を有効にする。`replace.toml` のユーザー定義ルールと学習済みの修正は、内蔵辞書より優先される。
 
-動作だけを元に戻す場合は、`builtin_replace_dict = false` に設定するか、設定画面のトグルをオフにする。古いkikigakiバイナリへダウングレードする場合は、この行自体を削除すること。古いバイナリは未知の設定項目を含む `config.toml` を拒否するため、行を残したままダウングレードすると起動できない。
+`asr.hotwords_score` は、内蔵辞書を有効化した際に適用される、登録語の認識を促す強さで、既定値は `3.0`。変更はkikigakiの再起動後に反映される。`asr.decoding_method = "greedy_search"` と内蔵辞書を同時に有効にした場合、ホットワードによる認識バイアスは利用できない。ログに警告を出し、認識はバイアスなしのベースライン相当で続行する。置換辞書は引き続き適用される。
+
+動作だけを元に戻す場合は、`builtin_replace_dict = false` に設定するか、設定画面のトグルをオフにする。古いkikigakiバイナリへダウングレードする場合は、`builtin_replace_dict` と `asr.hotwords_score` の行を削除すること。設定スキーマは未知の項目を拒否するため、未対応の行を残したままダウングレードすると起動できない。
+
+メンテナ向け: 生成する `bpe.vocab` のSHA-256固定値は、`ASR_MODEL_ID` が示すモデルの `tokens.txt` に対応している。ASRモデルを更新するときは固定値を更新し、ホットワード評価ハーネスを再実行すること。

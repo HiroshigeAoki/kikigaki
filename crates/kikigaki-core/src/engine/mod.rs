@@ -280,6 +280,10 @@ impl EngineSupervisor {
     }
 
     /// Restarts a ready or failed engine, or returns `false` while startup is still in progress.
+    ///
+    /// Called by the controller's idle desired-state reconciliation and its pre-existing
+    /// disconnect `Reconnect` path. Callers must not tear down an in-flight session; this method
+    /// enforces only the engine-phase precondition.
     pub fn restart(&mut self) -> anyhow::Result<bool> {
         if self.phase == EnginePhase::Starting {
             tracing::info!("engine still starting");

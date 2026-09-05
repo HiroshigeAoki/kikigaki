@@ -82,8 +82,10 @@ pub trait Paster: Send {
     fn paste(&self, text: String, deadline: Instant) -> Result<(), String>;
 }
 
-pub trait EngineFactory: Send {
+pub trait EngineFactory: Send + Sync {
     fn build(&self) -> anyhow::Result<Box<dyn Engine>>;
+
+    fn set_hotwords_enabled(&self, _enabled: bool) {}
 }
 
 pub trait MicPort: Send {
@@ -245,7 +247,7 @@ pub fn spawn(
     sink: Box<dyn ControllerEventSink>,
     hotkeys: Box<dyn HotkeyPort>,
     paster: Box<dyn Paster>,
-    engine_factory: Box<dyn EngineFactory>,
+    engine_factory: Arc<dyn EngineFactory>,
     mic: Box<dyn MicPort>,
     postprocess_factory: Box<dyn PostprocessFactory>,
     startup: Box<dyn StartupPort>,
@@ -277,7 +279,7 @@ fn spawn_with_poll_interval(
     sink: Box<dyn ControllerEventSink>,
     hotkeys: Box<dyn HotkeyPort>,
     paster: Box<dyn Paster>,
-    engine_factory: Box<dyn EngineFactory>,
+    engine_factory: Arc<dyn EngineFactory>,
     mic: Box<dyn MicPort>,
     postprocess_factory: Box<dyn PostprocessFactory>,
     startup: Box<dyn StartupPort>,
@@ -352,7 +354,7 @@ fn run(
     sink: Box<dyn ControllerEventSink>,
     hotkeys: Box<dyn HotkeyPort>,
     paster: Box<dyn Paster>,
-    engine_factory: Box<dyn EngineFactory>,
+    engine_factory: Arc<dyn EngineFactory>,
     mic: Box<dyn MicPort>,
     postprocess_factory: Box<dyn PostprocessFactory>,
     startup: Box<dyn StartupPort>,
@@ -371,6 +373,7 @@ fn run(
         silence_pad_ms: settings.config().silence_pad_ms,
         final_timeout: Duration::from_millis(settings.config().final_timeout_ms),
     });
+    let hotwords_enabled = settings.config().builtin_replace_dict;
     let learned_path = settings.config().learned_file.clone();
     let (onboarding, bootstrap_error, auto_start) = match bootstrap {
         BootstrapOutcome::ReadyToStart => {
@@ -401,13 +404,15 @@ fn run(
         }
     };
     let waker: Waker = Arc::new(move || controller_client.wake());
-    let supervisor = EngineSupervisor::new(Box::new(move || engine_factory.build()))
+    let supervisor_factory = Arc::clone(&engine_factory);
+    let supervisor = EngineSupervisor::new(Box::new(move || supervisor_factory.build()))
         .with_waker(Arc::clone(&waker));
     let mut controller = Controller {
         settings,
         session,
         mic,
         supervisor: Some(supervisor),
+        engine_factory,
         startup,
         postprocess_factory,
         waker,
@@ -432,6 +437,11 @@ fn run(
         first_ready: true,
         pending_finals: HashMap::new(),
         active_generation: 0,
+        hotwords_desired: hotwords_enabled,
+        hotwords_applied: hotwords_enabled,
+        reconcile_pending: false,
+        engine_build_generation: 0,
+        postprocess_degraded: None,
         shutting_down: false,
     };
 
@@ -462,6 +472,7 @@ fn run(
         while let Ok(edge) = hotkey_rx.try_recv() {
             controller.handle_hotkey_edge(edge, &mut outputs);
         }
+        controller.reconcile_hotwords(&mut outputs);
         controller.handle_startup_events(&mut outputs);
         controller.handle_postprocess_events(&mut outputs);
         controller.handle_engine_messages(&mut outputs);
@@ -480,6 +491,7 @@ struct Controller {
     session: Session,
     mic: Box<dyn MicPort>,
     supervisor: Option<EngineSupervisor>,
+    engine_factory: Arc<dyn EngineFactory>,
     startup: Box<dyn StartupPort>,
     postprocess_factory: Box<dyn PostprocessFactory>,
     waker: Waker,
@@ -504,6 +516,11 @@ struct Controller {
     first_ready: bool,
     pending_finals: HashMap<u64, (String, String)>,
     active_generation: u64,
+    hotwords_desired: bool,
+    hotwords_applied: bool,
+    reconcile_pending: bool,
+    engine_build_generation: u64,
+    postprocess_degraded: Option<String>,
     shutting_down: bool,
 }
 
@@ -518,6 +535,8 @@ impl Controller {
             ControllerCmd::ApplySettings { patch, reply } => {
                 let result = self.settings.apply(patch);
                 if let Ok(snapshot) = &result {
+                    self.hotwords_desired = snapshot.builtin_replace_dict;
+                    self.reconcile_pending = self.hotwords_desired != self.hotwords_applied;
                     if let Some(worker) = self.postprocess.as_ref() {
                         if let Err(error) =
                             worker.configure(snapshot.punct_enabled, snapshot.strip_trailing_period)
@@ -528,10 +547,12 @@ impl Controller {
                             worker.set_builtin_enabled(snapshot.builtin_replace_dict)
                         {
                             tracing::warn!(%error, "configure builtin replacement dictionary");
-                            self.status =
-                                Status::Warning("内蔵置換辞書を反映できませんでした".into());
+                            self.postprocess_degraded =
+                                Some("内蔵置換辞書を反映できませんでした".into());
                             // Persistence is authoritative: disk state can run ahead of the live
                             // worker after a delivery failure, so return the persisted snapshot.
+                        } else {
+                            self.postprocess_degraded = None;
                         }
                     }
                 }
@@ -737,15 +758,63 @@ impl Controller {
     }
 
     fn handle_hotkey_edge(&mut self, edge: HotkeyEdge, outputs: &mut Vec<Output>) {
-        if self.window_focused || self.capturing_hotkey {
+        let Some(input) = hotkey_input(edge, self.window_focused, self.capturing_hotkey) else {
+            return;
+        };
+        self.dirty = true;
+        outputs.extend(self.session.handle(input, self.clock.now()));
+    }
+
+    fn reconcile_hotwords(&mut self, outputs: &mut Vec<Output>) {
+        if !self.reconcile_pending {
             return;
         }
+        if self.hotwords_desired == self.hotwords_applied {
+            self.reconcile_pending = false;
+            return;
+        }
+        if self.settings.config().engine == EngineKind::Remote {
+            self.hotwords_applied = self.hotwords_desired;
+            self.reconcile_pending = false;
+            return;
+        }
+        if self.session.state() != State::Idle
+            || self
+                .supervisor
+                .as_ref()
+                .is_none_or(|supervisor| supervisor.phase() == EnginePhase::Starting)
+        {
+            return;
+        }
+
+        let previously_applied = self.hotwords_applied;
+        self.engine_factory
+            .set_hotwords_enabled(self.hotwords_desired);
+        self.engine_build_generation = self.engine_build_generation.wrapping_add(1);
+        let restart = self
+            .supervisor
+            .as_mut()
+            .expect("supervisor checked above")
+            .restart();
+        match restart {
+            Ok(true) => {
+                self.hotwords_applied = self.hotwords_desired;
+                self.reconcile_pending = false;
+            }
+            Ok(false) => {
+                self.engine_factory.set_hotwords_enabled(previously_applied);
+            }
+            Err(error) => {
+                self.engine_factory.set_hotwords_enabled(previously_applied);
+                self.mic.stop();
+                self.status = Status::EngineFailed(format!("Engine restart failed — {error}"));
+                outputs.extend(
+                    self.session
+                        .handle(Input::EngineDisconnected, self.clock.now()),
+                );
+            }
+        }
         self.dirty = true;
-        let input = match edge {
-            HotkeyEdge::Pressed => Input::Pressed,
-            HotkeyEdge::Released => Input::Released,
-        };
-        outputs.extend(self.session.handle(input, self.clock.now()));
     }
 
     fn handle_startup_events(&mut self, outputs: &mut Vec<Output>) {
@@ -906,26 +975,36 @@ impl Controller {
             self.dirty = true;
             let input = match message {
                 EngineMsg::Ready => {
-                    let process_to_ready_ms = self
-                        .clock
-                        .now()
-                        .saturating_duration_since(self.process_started_at)
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX);
-                    tracing::info!(process_to_ready_ms, "engine ready");
-                    if self.first_ready {
-                        append_metric(
-                            self.settings.config(),
-                            metrics::MetricRow::Startup(metrics::Startup {
-                                ts: metric_timestamp(),
-                                process_to_ready_ms,
-                                cold: self.startup_cold,
-                            }),
+                    let stale = self.settings.config().engine == EngineKind::Local
+                        && self.hotwords_applied != self.hotwords_desired;
+                    if stale {
+                        self.reconcile_pending = true;
+                        tracing::info!(
+                            engine_build_generation = self.engine_build_generation,
+                            "engine ready for superseded hotword configuration"
                         );
-                        self.first_ready = false;
+                    } else {
+                        let process_to_ready_ms = self
+                            .clock
+                            .now()
+                            .saturating_duration_since(self.process_started_at)
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX);
+                        tracing::info!(process_to_ready_ms, "engine ready");
+                        if self.first_ready {
+                            append_metric(
+                                self.settings.config(),
+                                metrics::MetricRow::Startup(metrics::Startup {
+                                    ts: metric_timestamp(),
+                                    process_to_ready_ms,
+                                    cold: self.startup_cold,
+                                }),
+                            );
+                            self.first_ready = false;
+                        }
+                        self.status = Status::Ok;
                     }
-                    self.status = Status::Ok;
                     Input::Engine(Event::Ready { sr: SAMPLE_RATE })
                 }
                 final_message @ EngineMsg::Final { gen, .. } => {
@@ -1046,6 +1125,10 @@ impl Controller {
                             }
                         }
                     } else if let Some(supervisor) = self.supervisor.as_mut() {
+                        if supervisor.phase() != EnginePhase::Starting {
+                            self.engine_build_generation =
+                                self.engine_build_generation.wrapping_add(1);
+                        }
                         match supervisor.restart() {
                             Ok(_) => {}
                             Err(error) => {
@@ -1068,12 +1151,13 @@ impl Controller {
             .supervisor
             .as_ref()
             .map_or(EnginePhase::Failed, EngineSupervisor::phase);
+        let status = self.effective_status();
         UiSnapshot {
             revision: self.revision,
             status: UiStatus {
                 state: state_name(self.session.state()),
-                phase: phase_name(self.status.phase(phase)),
-                message: self.status.message().map(str::to_owned),
+                phase: phase_name(status.phase(phase)),
+                message: status.message().map(str::to_owned),
                 hotkey: settings.hotkey.clone(),
                 punct_enabled: settings.punct_enabled,
                 strip_trailing_period: settings.strip_trailing_period,
@@ -1092,6 +1176,16 @@ impl Controller {
             history: self.history.list(),
             learned_rules: self.learned.list().to_vec(),
             bootstrap_error: self.bootstrap_error.clone(),
+        }
+    }
+
+    fn effective_status(&self) -> Status {
+        match (&self.status, &self.postprocess_degraded) {
+            (Status::EngineFailed(engine), Some(postprocess)) => {
+                Status::EngineFailed(format!("{engine} / {postprocess}"))
+            }
+            (Status::StartupFailed(_), _) | (_, None) => self.status.clone(),
+            (_, Some(postprocess)) => Status::Warning(postprocess.clone()),
         }
     }
 
@@ -1123,6 +1217,14 @@ impl Controller {
             tracing::warn!("startup worker did not join before shutdown deadline");
         }
         self.publish_if_changed();
+    }
+}
+
+fn hotkey_input(edge: HotkeyEdge, window_focused: bool, capturing_hotkey: bool) -> Option<Input> {
+    match edge {
+        HotkeyEdge::Pressed if window_focused || capturing_hotkey => None,
+        HotkeyEdge::Pressed => Some(Input::Pressed),
+        HotkeyEdge::Released => Some(Input::Released),
     }
 }
 
@@ -1302,39 +1404,121 @@ mod tests {
         }
     }
 
+    enum FakeEngineBuild {
+        Ready,
+        Pending,
+        Fail(String),
+    }
+
+    #[derive(Default)]
+    struct FakeEngineState {
+        enabled: AtomicBool,
+        builds: AtomicUsize,
+        observed_enabled: Mutex<Vec<bool>>,
+        plans: Mutex<VecDeque<FakeEngineBuild>>,
+        event_senders: Mutex<Vec<SyncSender<EngineMsg>>>,
+    }
+
+    impl FakeEngineState {
+        fn send(&self, message: EngineMsg) {
+            self.event_senders
+                .lock()
+                .unwrap()
+                .last()
+                .expect("engine has been built")
+                .send(message)
+                .unwrap();
+        }
+    }
+
     struct FakeEngineFactory {
-        events: Mutex<Option<Receiver<EngineMsg>>>,
-        ready: SyncSender<EngineMsg>,
+        state: Arc<FakeEngineState>,
     }
 
     impl EngineFactory for FakeEngineFactory {
         fn build(&self) -> anyhow::Result<Box<dyn Engine>> {
-            let events = self.events.lock().unwrap().take().unwrap();
-            let (sink, commands) = engine::channel();
-            self.ready.send(EngineMsg::Ready).unwrap();
-            Ok(Box::new(TestEngine {
-                sink,
-                _commands: commands,
-                events,
-            }))
+            self.state.builds.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .observed_enabled
+                .lock()
+                .unwrap()
+                .push(self.state.enabled.load(Ordering::Relaxed));
+            match self
+                .state
+                .plans
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(FakeEngineBuild::Ready)
+            {
+                FakeEngineBuild::Fail(message) => anyhow::bail!(message),
+                plan => {
+                    let (event_tx, events) = mpsc::sync_channel(64);
+                    self.state
+                        .event_senders
+                        .lock()
+                        .unwrap()
+                        .push(event_tx.clone());
+                    if matches!(plan, FakeEngineBuild::Ready) {
+                        event_tx.send(EngineMsg::Ready).unwrap();
+                    }
+                    let (sink, commands) = engine::channel();
+                    Ok(Box::new(TestEngine {
+                        sink,
+                        _commands: commands,
+                        events,
+                    }))
+                }
+            }
+        }
+
+        fn set_hotwords_enabled(&self, enabled: bool) {
+            self.state.enabled.store(enabled, Ordering::Relaxed);
         }
     }
 
-    struct FakeMic(Arc<Mutex<usize>>);
+    impl FakeEngineFactory {
+        fn new(state: Arc<FakeEngineState>) -> Self {
+            Self { state }
+        }
+    }
+
+    #[derive(Default)]
+    struct MicState {
+        starts: AtomicUsize,
+        stops: AtomicUsize,
+        running: AtomicBool,
+    }
+
+    struct FakeMic(Arc<MicState>);
 
     impl MicPort for FakeMic {
         fn start(&mut self, _sink: AudioSink) -> anyhow::Result<()> {
-            *self.0.lock().unwrap() += 1;
+            self.0.starts.fetch_add(1, Ordering::Relaxed);
+            self.0.running.store(true, Ordering::Relaxed);
             Ok(())
         }
 
-        fn stop(&mut self) {}
+        fn stop(&mut self) {
+            self.0.stops.fetch_add(1, Ordering::Relaxed);
+            self.0.running.store(false, Ordering::Relaxed);
+        }
     }
 
-    struct PeriodPunctuator;
+    #[derive(Default)]
+    struct PunctuatorState {
+        panic: AtomicBool,
+        panicked: AtomicBool,
+    }
+
+    struct PeriodPunctuator(Arc<PunctuatorState>);
 
     impl Punctuator for PeriodPunctuator {
         fn punctuate(&mut self, text: &str) -> anyhow::Result<String> {
+            if self.0.panic.load(Ordering::Relaxed) {
+                self.0.panicked.store(true, Ordering::Relaxed);
+                panic!("scripted post-processing failure");
+            }
             Ok(format!("{text}。"))
         }
     }
@@ -1348,6 +1532,7 @@ mod tests {
         replace_file: PathBuf,
         builtin: Arc<kikigaki_core::replace::Rules>,
         gate: Mutex<Option<BuildGate>>,
+        punctuator: Arc<PunctuatorState>,
     }
 
     impl PostprocessFactory for FakePostprocessFactory {
@@ -1364,7 +1549,7 @@ mod tests {
             Ok(PostprocessWorker::spawn_with_waker(
                 Pipeline::new(
                     ReplaceFile::new(self.replace_file.clone()),
-                    Box::new(PeriodPunctuator),
+                    Box::new(PeriodPunctuator(Arc::clone(&self.punctuator))),
                     false,
                     false,
                     Arc::clone(&self.builtin),
@@ -1459,8 +1644,9 @@ mod tests {
         snapshots: SinkState,
         hotkeys: Arc<HotkeyState>,
         pastes: Arc<PasteState>,
-        engine_tx: SyncSender<EngineMsg>,
-        mic_starts: Arc<Mutex<usize>>,
+        engine: Arc<FakeEngineState>,
+        mic: Arc<MicState>,
+        punctuator: Arc<PunctuatorState>,
         metrics_path: PathBuf,
         startup: Arc<StartupState>,
     }
@@ -1549,6 +1735,35 @@ mod tests {
         gate: Option<BuildGate>,
         poll_interval: Duration,
     ) -> Harness {
+        harness_with_engine_options(
+            punct,
+            builtin_replace_dict,
+            EngineKind::Local,
+            VecDeque::new(),
+            bootstrap,
+            hotkey_plan,
+            rescans,
+            reject_late_paste,
+            clock,
+            gate,
+            poll_interval,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn harness_with_engine_options(
+        punct: bool,
+        builtin_replace_dict: bool,
+        engine_kind: EngineKind,
+        engine_plans: VecDeque<FakeEngineBuild>,
+        bootstrap: BootstrapOutcome,
+        hotkey_plan: Vec<Result<(), String>>,
+        rescans: Vec<Option<OnboardingState>>,
+        reject_late_paste: bool,
+        clock: Option<Instant>,
+        gate: Option<BuildGate>,
+        poll_interval: Duration,
+    ) -> Harness {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         let replace_file = temp.path().join("replace.toml");
@@ -1556,10 +1771,14 @@ mod tests {
         let metrics_path = temp.path().join("metrics.jsonl");
         let models_dir = temp.path().join("models");
         std::fs::write(&replace_file, "").unwrap();
+        let engine_name = match engine_kind {
+            EngineKind::Local => "local",
+            EngineKind::Remote => "remote",
+        };
         std::fs::write(
             &config_path,
             format!(
-                "hotkey = \"Alt+Space\"\nstrip_trailing_period = false\nbuiltin_replace_dict = {builtin_replace_dict}\nreplace_file = {:?}\nlearned_file = {:?}\nmetrics_path = {:?}\nmodels_dir = {:?}\n[punct]\nenabled = {}\n",
+                "hotkey = \"Alt+Space\"\nengine = \"{engine_name}\"\nstrip_trailing_period = false\nbuiltin_replace_dict = {builtin_replace_dict}\nreplace_file = {:?}\nlearned_file = {:?}\nmetrics_path = {:?}\nmodels_dir = {:?}\n[punct]\nenabled = {}\n",
                 replace_file, learned_file, metrics_path, models_dir, punct,
             ),
         )
@@ -1580,9 +1799,14 @@ mod tests {
             reject_late: reject_late_paste,
             ..PasteState::default()
         });
-        let mic_starts = Arc::new(Mutex::new(0));
+        let mic = Arc::new(MicState::default());
+        let punctuator = Arc::new(PunctuatorState::default());
         let startup = Arc::new(StartupState::default());
-        let (engine_tx, engine_rx) = mpsc::sync_channel(64);
+        let engine = Arc::new(FakeEngineState {
+            enabled: AtomicBool::new(builtin_replace_dict),
+            plans: Mutex::new(engine_plans),
+            ..FakeEngineState::default()
+        });
         let (handle, _exited) = spawn_with_poll_interval(
             ControllerConfig {
                 settings,
@@ -1597,15 +1821,13 @@ mod tests {
             Box::new(FakeSink(snapshots.clone())),
             Box::new(ScriptedHotkeys(Arc::clone(&hotkeys))),
             Box::new(FakePaster(Arc::clone(&pastes))),
-            Box::new(FakeEngineFactory {
-                events: Mutex::new(Some(engine_rx)),
-                ready: engine_tx.clone(),
-            }),
-            Box::new(FakeMic(Arc::clone(&mic_starts))),
+            Arc::new(FakeEngineFactory::new(Arc::clone(&engine))),
+            Box::new(FakeMic(Arc::clone(&mic))),
             Box::new(FakePostprocessFactory {
                 replace_file,
                 builtin: Arc::new(kikigaki_core::replace::builtin_rules().unwrap()),
                 gate: Mutex::new(gate),
+                punctuator: Arc::clone(&punctuator),
             }),
             Box::new(FakeStartup {
                 rescans: rescans.into(),
@@ -1626,8 +1848,9 @@ mod tests {
             snapshots,
             hotkeys,
             pastes,
-            engine_tx,
-            mic_starts,
+            engine,
+            mic,
+            punctuator,
             metrics_path,
             startup,
         }
@@ -1734,20 +1957,497 @@ mod tests {
         }
     }
 
+    /// Polls `condition` every 10ms for up to 3 seconds, returning whether it became true.
+    fn poll(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..300 {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
     fn transcribe(harness: &Harness, gen: u64, text: &str) {
         let attempts = harness.pastes.attempts.lock().unwrap().len();
         harness.hotkey.send(HotkeyEdge::Pressed);
         wait_snapshot(harness, |snapshot| snapshot.status.state == "recording");
         harness.hotkey.send(HotkeyEdge::Released);
         wait_snapshot(harness, |snapshot| snapshot.status.state == "finalizing");
-        harness.engine_tx.send(final_message(gen, text)).unwrap();
+        harness.engine.send(final_message(gen, text));
+        assert!(
+            poll(|| harness.pastes.attempts.lock().unwrap().len() > attempts),
+            "paste was not attempted"
+        );
+    }
+
+    fn apply_builtin(harness: &Harness, enabled: bool) -> SettingsSnapshot {
+        harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::ApplySettings {
+                patch: SettingsPatch {
+                    hotkey: None,
+                    punctuation: None,
+                    builtin_replace_dict: Some(enabled),
+                },
+                reply,
+            })
+            .unwrap()
+    }
+
+    fn wait_for_builds(harness: &Harness, expected: usize) {
+        assert!(
+            poll(|| harness.engine.builds.load(Ordering::Relaxed) == expected),
+            "engine build count did not reach {expected}; actual={}",
+            harness.engine.builds.load(Ordering::Relaxed)
+        );
+    }
+
+    fn startup_metric_count(harness: &Harness) -> usize {
+        std::fs::read_to_string(&harness.metrics_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(r#""kind":"startup""#))
+            .count()
+    }
+
+    fn crash_postprocess_worker(harness: &Harness) {
+        harness.punctuator.panic.store(true, Ordering::Relaxed);
+        harness.engine.send(final_message(999, "crash"));
+        harness.client.wake();
         for _ in 0..300 {
-            if harness.pastes.attempts.lock().unwrap().len() > attempts {
+            if harness.punctuator.panicked.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
                 return;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("paste was not attempted");
+        panic!("post-processing worker did not execute the scripted panic");
+    }
+
+    #[test]
+    fn hotword_toggle_reconciles_once_on_next_idle_tick() {
+        let harness = ready_harness();
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
+
+        assert!(apply_builtin(&harness, true).builtin_replace_dict);
+        wait_for_builds(&harness, 2);
+        thread::sleep(Duration::from_millis(60));
+
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *harness.engine.observed_enabled.lock().unwrap(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn hotword_toggle_waits_through_recording_and_finalizing() {
+        let harness = ready_harness();
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
+
+        apply_builtin(&harness, true);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+
+        harness.hotkey.send(HotkeyEdge::Released);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+
+        harness.engine.send(final_message(1, "done"));
+        harness.client.wake();
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        wait_for_builds(&harness, 2);
+        assert_eq!(
+            *harness.engine.observed_enabled.lock().unwrap(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn hotword_toggle_while_finalizing_waits_for_idle() {
+        let harness = ready_harness();
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
+        harness.hotkey.send(HotkeyEdge::Released);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
+
+        apply_builtin(&harness, true);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+
+        harness.engine.send(final_message(1, "done"));
+        harness.client.wake();
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        wait_for_builds(&harness, 2);
+        assert_eq!(
+            *harness.engine.observed_enabled.lock().unwrap(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn hotword_flips_coalesce_while_engine_is_starting() {
+        let harness = harness_with_engine_options(
+            false,
+            false,
+            EngineKind::Local,
+            VecDeque::from([FakeEngineBuild::Pending]),
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
+        );
+        wait_for_builds(&harness, 1);
+
+        apply_builtin(&harness, true);
+        apply_builtin(&harness, false);
+        apply_builtin(&harness, true);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+
+        harness.engine.send(EngineMsg::Ready);
+        harness.client.wake();
+        wait_for_builds(&harness, 2);
+        assert_eq!(
+            *harness.engine.observed_enabled.lock().unwrap(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn hotword_flip_back_during_starting_cancels_reconcile() {
+        let harness = harness_with_engine_options(
+            false,
+            false,
+            EngineKind::Local,
+            VecDeque::from([FakeEngineBuild::Pending]),
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
+        );
+        wait_for_builds(&harness, 1);
+
+        apply_builtin(&harness, true);
+        apply_builtin(&harness, false);
+        harness.engine.send(EngineMsg::Ready);
+        harness.client.wake();
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        thread::sleep(Duration::from_millis(60));
+
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(*harness.engine.observed_enabled.lock().unwrap(), [false]);
+    }
+
+    #[test]
+    fn hotword_reconcile_failure_disconnects_stops_mic_and_retries() {
+        let harness = ready_harness();
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Fail("scripted build failure".into()));
+        harness.mic.running.store(true, Ordering::Relaxed);
+        let stops_before = harness.mic.stops.load(Ordering::Relaxed);
+
+        apply_builtin(&harness, true);
+        let failed = wait_snapshot(&harness, |snapshot| {
+            snapshot.status.state == "disconnected"
+                && snapshot
+                    .status
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("scripted build failure"))
+        });
+        assert_eq!(failed.status.phase, "failed");
+        assert!(!harness.mic.running.load(Ordering::Relaxed));
+        assert!(harness.mic.stops.load(Ordering::Relaxed) > stops_before);
+
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        wait_for_builds(&harness, 4);
+        assert_eq!(
+            *harness.engine.observed_enabled.lock().unwrap(),
+            [false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn postprocess_failure_survives_successful_engine_reconcile() {
+        let harness = harness(
+            true,
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        crash_postprocess_worker(&harness);
+
+        apply_builtin(&harness, true);
+        wait_for_builds(&harness, 2);
+        let snapshot = wait_snapshot(&harness, |snapshot| {
+            snapshot
+                .status
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("内蔵置換辞書"))
+        });
+
+        assert_eq!(snapshot.status.phase, "ready");
+        assert_eq!(
+            *harness.engine.observed_enabled.lock().unwrap(),
+            [false, true]
+        );
+
+        apply_builtin(&harness, true);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 2);
+        assert!(latest(&harness)
+            .unwrap()
+            .status
+            .message
+            .is_some_and(|message| message.contains("内蔵置換辞書")));
+    }
+
+    #[test]
+    fn engine_reconcile_failure_does_not_mark_postprocess_degraded() {
+        let harness = ready_harness();
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Fail("engine tier failed".into()));
+
+        apply_builtin(&harness, true);
+        let snapshot = wait_snapshot(&harness, |snapshot| {
+            snapshot
+                .status
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("engine tier failed"))
+        });
+
+        assert_eq!(snapshot.status.phase, "failed");
+        assert!(!snapshot.status.message.unwrap().contains("内蔵置換辞書"));
+    }
+
+    #[test]
+    fn combined_status_names_postprocess_and_engine_failures() {
+        let harness = harness(
+            true,
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        crash_postprocess_worker(&harness);
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Fail("engine tier failed".into()));
+
+        apply_builtin(&harness, true);
+        let snapshot = wait_snapshot(&harness, |snapshot| {
+            snapshot.status.message.as_deref().is_some_and(|message| {
+                message.contains("engine tier failed") && message.contains("内蔵置換辞書")
+            })
+        });
+
+        assert_eq!(snapshot.status.phase, "failed");
+    }
+
+    #[test]
+    fn remote_hotword_toggle_only_updates_postprocess() {
+        let harness = harness_with_engine_options(
+            false,
+            false,
+            EngineKind::Remote,
+            VecDeque::new(),
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+
+        apply_builtin(&harness, true);
+        thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(*harness.engine.observed_enabled.lock().unwrap(), [false]);
+        transcribe(&harness, 1, "クバネティス");
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "Kubernetes"
+        );
+    }
+
+    #[test]
+    fn stale_ready_does_not_clear_warning_or_consume_startup_metric() {
+        let harness = harness_with_engine_options(
+            false,
+            false,
+            EngineKind::Local,
+            VecDeque::from([FakeEngineBuild::Pending, FakeEngineBuild::Pending]),
+            BootstrapOutcome::ReadyToStart,
+            vec![Err("new failed".into()), Err("old failed".into())],
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
+        );
+        wait_for_builds(&harness, 1);
+        let error = harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::EndHotkeyCapture {
+                new_chord: Some("Cmd+Z".into()),
+                reply,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "register_failed");
+        apply_builtin(&harness, true);
+
+        harness.engine.send(EngineMsg::Ready);
+        harness.client.wake();
+        wait_for_builds(&harness, 2);
+        wait_snapshot(&harness, |snapshot| {
+            snapshot.status.phase == "starting"
+                && snapshot.status.message.as_deref()
+                    == Some("ホットキーが無効 — 再設定してください")
+        });
+        assert_eq!(startup_metric_count(&harness), 0);
+
+        harness.engine.send(EngineMsg::Ready);
+        harness.client.wake();
+        wait_snapshot(&harness, |snapshot| {
+            snapshot.status.state == "idle" && snapshot.status.message.is_none()
+        });
+        assert_eq!(startup_metric_count(&harness), 1);
+    }
+
+    #[test]
+    fn reconnect_restart_preserves_pending_hotword_reconcile() {
+        let harness = ready_harness();
+        harness.engine.send(EngineMsg::Disconnected {
+            reason: "connection lost".into(),
+            failed_model: None,
+        });
+        harness.client.wake();
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "disconnected");
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .extend([FakeEngineBuild::Pending, FakeEngineBuild::Pending]);
+
+        apply_builtin(&harness, true);
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        wait_for_builds(&harness, 2);
+        assert_eq!(
+            *harness.engine.observed_enabled.lock().unwrap(),
+            [false, false]
+        );
+
+        harness.engine.send(EngineMsg::Ready);
+        harness.client.wake();
+        wait_for_builds(&harness, 3);
+        let interim = wait_snapshot(&harness, |snapshot| snapshot.status.phase == "starting");
+        assert_eq!(interim.status.state, "idle");
+        assert_eq!(interim.status.message.as_deref(), Some("connection lost"));
+        assert_eq!(
+            *harness.engine.observed_enabled.lock().unwrap(),
+            [false, false, true]
+        );
+
+        harness.engine.send(EngineMsg::Ready);
+        harness.client.wake();
+        wait_snapshot(&harness, |snapshot| snapshot.status.message.is_none());
+    }
+
+    #[test]
+    fn release_while_window_focused_is_honored() {
+        let harness = ready_harness();
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
+        harness.client.send(ControllerCmd::SetWindowFocused(true));
+        thread::sleep(Duration::from_millis(30));
+
+        harness.hotkey.send(HotkeyEdge::Released);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
+        harness.engine.send(final_message(1, "done"));
+        harness.client.wake();
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+    }
+
+    #[test]
+    fn release_during_hotkey_capture_is_honored() {
+        let mut session = Session::new(SessionConfig {
+            silence_pad_ms: 500,
+            final_timeout: Duration::from_secs(3),
+        });
+        let now = Instant::now();
+        session.handle(Input::Engine(Event::Ready { sr: SAMPLE_RATE }), now);
+        let pressed = hotkey_input(HotkeyEdge::Pressed, false, false).unwrap();
+        session.handle(pressed, now);
+        assert_eq!(session.state(), State::Recording);
+
+        let released = hotkey_input(HotkeyEdge::Released, false, true).unwrap();
+        session.handle(released, now + Duration::from_millis(1));
+        assert_eq!(session.state(), State::Finalizing);
+        session.handle(
+            Input::Engine(Event::Final(kikigaki_core::protocol::Final {
+                gen: 1,
+                text: String::new(),
+                lang: String::new(),
+                engine_latency_ms: None,
+                dropped_chunks: 0,
+                vad_close_to_asr_end_ms: None,
+                postprocess_ms: None,
+            })),
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(session.state(), State::Idle);
     }
 
     #[test]
@@ -1759,7 +2459,7 @@ mod tests {
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
 
         let started = Instant::now();
-        harness.engine_tx.send(final_message(1, "awake")).unwrap();
+        harness.engine.send(final_message(1, "awake"));
         harness.client.wake();
         while harness.pastes.attempts.lock().unwrap().is_empty() {
             assert!(
@@ -1932,13 +2632,10 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(true);
-        harness
-            .engine_tx
-            .send(EngineMsg::Disconnected {
-                reason: "bad model".into(),
-                failed_model: Some("asr"),
-            })
-            .unwrap();
+        harness.engine.send(EngineMsg::Disconnected {
+            reason: "bad model".into(),
+            failed_model: Some("asr"),
+        });
         let snapshot = wait_snapshot(&harness, |snapshot| {
             snapshot.status.message.as_deref() == Some("bad model")
         });
@@ -1946,13 +2643,10 @@ mod tests {
         assert_eq!(*harness.startup.invalidated.lock().unwrap(), ["asr"]);
 
         let harness = ready_harness();
-        harness
-            .engine_tx
-            .send(EngineMsg::Disconnected {
-                reason: "engine stopped".into(),
-                failed_model: None,
-            })
-            .unwrap();
+        harness.engine.send(EngineMsg::Disconnected {
+            reason: "engine stopped".into(),
+            failed_model: None,
+        });
         let snapshot = wait_snapshot(&harness, |snapshot| {
             snapshot.status.message.as_deref() == Some("engine stopped")
         });
@@ -1963,7 +2657,7 @@ mod tests {
     #[test]
     fn first_ready_records_startup_metric_once() {
         let harness = ready_harness();
-        harness.engine_tx.send(EngineMsg::Ready).unwrap();
+        harness.engine.send(EngineMsg::Ready);
 
         for _ in 0..100 {
             let startup_rows = std::fs::read_to_string(&harness.metrics_path)
@@ -2164,7 +2858,7 @@ mod tests {
         harness.hotkey.send(HotkeyEdge::Pressed);
         thread::sleep(Duration::from_millis(100));
         assert_eq!(latest(&harness).unwrap().status.state, "idle");
-        assert_eq!(*harness.mic_starts.lock().unwrap(), 0);
+        assert_eq!(harness.mic.starts.load(Ordering::Relaxed), 0);
     }
 
     #[test]

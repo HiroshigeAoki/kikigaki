@@ -5,6 +5,7 @@ cd "$(dirname -- "$0")/.."
 echo "== builtin dictionary generator self-test =="
 if command -v python3 >/dev/null 2>&1; then
   python3 scripts/gen-dict/gen_builtin_dict.py --self-test
+  python3 scripts/gen-dict/gen_builtin_dict.py render --check
 else
   echo "SKIP: python3 is unavailable; builtin dictionary generator self-test not run"
 fi
@@ -12,6 +13,7 @@ fi
 echo "== hotword evaluation tooling self-tests =="
 if command -v python3 >/dev/null 2>&1; then
   python3 scripts/hotword-eval/make_hotwords.py --self-test
+  python3 scripts/hotword-eval/make_hotwords.py render --check
   python3 scripts/hotword-eval/make_bpe_vocab.py --self-test
   python3 scripts/hotword-eval/score.py --self-test
   python3 scripts/hotword-eval/pad-wavs.py --self-test

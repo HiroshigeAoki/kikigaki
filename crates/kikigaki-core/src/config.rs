@@ -69,6 +69,8 @@ pub struct AsrConfig {
     pub num_threads: u32,
     /// Search algorithm used to decode recognizer output.
     pub decoding_method: DecodingMethod,
+    /// Score used to boost hotwords during recognition.
+    pub hotwords_score: f32,
 }
 
 impl Default for AsrConfig {
@@ -76,6 +78,7 @@ impl Default for AsrConfig {
         Self {
             num_threads: 4,
             decoding_method: DecodingMethod::ModifiedBeamSearch,
+            hotwords_score: 3.0,
         }
     }
 }
@@ -328,6 +331,7 @@ impl Config {
         if !(1..=16).contains(&self.asr.num_threads) {
             bail!("asr.num_threads must be in 1..=16");
         }
+        validate_positive("asr.hotwords_score", self.asr.hotwords_score)?;
         validate_threshold("vad.threshold", self.vad.threshold)?;
         validate_threshold("punct.comma_threshold", self.punct.comma_threshold)?;
         validate_threshold("punct.period_threshold", self.punct.period_threshold)?;
@@ -407,6 +411,13 @@ fn validate_threshold(name: &str, value: f32) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_positive(name: &str, value: f32) -> anyhow::Result<()> {
+    if !value.is_finite() || value <= 0.0 {
+        bail!("{name} must be finite and greater than zero");
+    }
+    Ok(())
+}
+
 /// Expands a leading `~` path component to the user's home directory.
 pub fn expand_tilde(path: &Path) -> PathBuf {
     let mut components = path.components();
@@ -474,6 +485,7 @@ mod tests {
         assert!(!actual.builtin_replace_dict);
         assert_eq!(actual.engine, EngineKind::Local);
         assert_eq!(actual.asr.num_threads, 4);
+        assert_eq!(actual.asr.hotwords_score, 3.0);
         assert_eq!(
             actual.asr.decoding_method,
             DecodingMethod::ModifiedBeamSearch
@@ -511,6 +523,47 @@ mod tests {
         assert_eq!(actual.vad.min_silence_ms, 700);
         assert_eq!(actual.vad.min_speech_ms, 250);
         assert_eq!(actual.asr, AsrConfig::default());
+    }
+
+    #[test]
+    fn asr_hotwords_score_deserialization_defaults_when_missing() {
+        let actual: AsrConfig = toml::from_str("num_threads = 2\n").unwrap();
+        assert_eq!(actual.hotwords_score, 3.0);
+    }
+
+    #[test]
+    fn asr_hotwords_score_round_trips_without_validation() {
+        for hotwords_score in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            let expected = AsrConfig {
+                hotwords_score,
+                ..AsrConfig::default()
+            };
+            let actual: AsrConfig = toml::from_str(&toml::to_string(&expected).unwrap()).unwrap();
+            if hotwords_score.is_nan() {
+                assert!(actual.hotwords_score.is_nan());
+            } else {
+                assert_eq!(actual.hotwords_score, hotwords_score);
+            }
+        }
+    }
+
+    #[test]
+    fn validate_hotwords_score_requires_a_finite_positive_value() {
+        let capabilities = Capabilities {
+            punct: true,
+            remote_engine: true,
+        };
+        for hotwords_score in [0.0, f32::INFINITY, f32::NAN, -1.0] {
+            let mut config = Config::default();
+            config.asr.hotwords_score = hotwords_score;
+            let error = config.validate(capabilities).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "asr.hotwords_score must be finite and greater than zero"
+            );
+        }
+
+        assert!(Config::default().validate(capabilities).is_ok());
     }
 
     #[test]

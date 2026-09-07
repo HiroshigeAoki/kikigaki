@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -116,25 +117,31 @@ fn runtime_file_name() -> &'static str {
     }
 }
 
-/// The ONNX Runtime copy Tauri places next to the executable. macOS ships it inside the
-/// hardened-runtime app bundle (`Contents/Frameworks/`); Windows ships it flat next to the exe
-/// (`tauri.windows.conf.json`'s `bundle.resources`). A development-only models-directory
-/// fallback exists for both platforms when neither bundled copy is present.
+/// The ONNX Runtime copy Tauri bundles with the app. macOS ships it inside the
+/// hardened-runtime app bundle (`Contents/Frameworks/`); Windows will ship it flat next to the
+/// exe via a `bundle.resources` entry in `tauri.windows.conf.json` (added by a later task on
+/// this branch). A development-only models-directory fallback exists for both platforms when
+/// neither bundled copy is present.
 ///
-/// On Windows the exe-adjacent copy is tried first (the installed app), then the parent
-/// directory: `sherpa-onnx-sys`'s build script copies the runtime DLLs into `target\<profile>\`
-/// while Cargo test binaries run from `target\<profile>\deps\`, so a test process finds the same
-/// DLL the ASR engine already loaded one level up.
+/// On Windows we try the exe-adjacent copy first (the installed app), then the parent
+/// directory, but only when the exe runs from Cargo's `deps\` directory: `sherpa-onnx-sys`'s
+/// build script copies the runtime DLLs into `target\<profile>\` while Cargo test binaries run
+/// from `target\<profile>\deps\`, so a test process finds the same DLL the ASR engine already
+/// loaded one level up. Gating on the `deps` directory name keeps an installed app from silently
+/// loading a stale DLL from the user-controlled parent of the install directory; it fails with a
+/// clear "not found" instead.
 fn bundled_runtime_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let candidates: Vec<PathBuf> = if cfg!(target_os = "macos") {
         let contents = exe.parent()?.parent()?;
-        vec![contents.join("Frameworks").join("libonnxruntime.dylib")]
+        vec![contents.join("Frameworks").join(runtime_file_name())]
     } else if cfg!(target_os = "windows") {
         let exe_dir = exe.parent()?;
-        let mut found = vec![exe_dir.join("onnxruntime.dll")];
-        if let Some(profile_dir) = exe_dir.parent() {
-            found.push(profile_dir.join("onnxruntime.dll"));
+        let mut found = vec![exe_dir.join(runtime_file_name())];
+        if exe_dir.file_name() == Some(OsStr::new("deps")) {
+            if let Some(profile_dir) = exe_dir.parent() {
+                found.push(profile_dir.join(runtime_file_name()));
+            }
         }
         found
     } else {
@@ -184,14 +191,14 @@ mod tests {
 
     #[test]
     fn runtime_file_name_is_dll_on_windows_dylib_on_macos_so_elsewhere() {
-        let name = runtime_file_name();
-        if cfg!(target_os = "windows") {
-            assert_eq!(name, "onnxruntime.dll");
-        } else if cfg!(target_os = "macos") {
-            assert_eq!(name, "libonnxruntime.dylib");
-        } else {
-            assert_eq!(name, "libonnxruntime.so");
-        }
+        assert_eq!(
+            runtime_file_name(),
+            format!(
+                "{}onnxruntime{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            )
+        );
     }
 
     #[test]

@@ -20,8 +20,8 @@ sha2 = "0.10"
 hex = "0.4"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic"], optional = true }
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 sherpa-onnx = { version = "=1.13.6", default-features = false, features = ["shared"] }
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 sherpa-onnx = { version = "=1.13.6", default-features = false, features = ["static"] }

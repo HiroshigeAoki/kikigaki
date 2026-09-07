@@ -61,11 +61,12 @@ static libraries, but no LICENSE or NOTICE files.
 | libespeak-ng.a | espeak-ng | GPL-3.0-or-later |
 
 Bundled license texts
-----------------------
+---------------------
 
 This NOTICE file and the upstream license texts under licenses/ (see
 licenses/README for the file-by-file mapping) ship inside the built app at
-Contents/Resources/NOTICE and Contents/Resources/licenses/.
+Contents/Resources/NOTICE and Contents/Resources/licenses/ on macOS. On Windows
+they install next to the executable, at $INSTDIR\NOTICE and $INSTDIR\licenses\.
 
 macOS espeak-ng dead-strip note
 --------------------------------
@@ -75,3 +76,14 @@ removed the unused TTS path from the measured macOS arm64 binary: `nm` found no 
 `OfflineTts*` symbols, and `strings` found no `espeak-ng-data` string. This is a platform-specific
 result. The same archive linked on Linux retained espeak-ng code; a Linux or Windows release must
 repeat the license gate and must not assume the macOS result applies.
+
+Windows shared archive provenance
+-----------------------------------
+
+The Windows build links `sherpa-onnx-v1.13.6-win-x64-shared-MT-Release-no-tts-lib.tar.bz2`
+(sha256 323d80e7e83e862bbdf204260c77a8f4e9da71df0ee1ba11d2db6cb12414c34e), a prebuilt shared-library
+archive from the sherpa-onnx v1.13.6 GitHub release. `strings sherpa-onnx-c-api.dll | grep -c
+espeak_` = 0 — this archive variant is built without espeak-ng/piper_phonemize/TTS support, so no
+GPL-licensed code is present, unlike the macOS static archive's dead-stripped-but-present
+libespeak-ng.a. `onnxruntime.dll` is ONNX Runtime 1.27.1 (MIT), the same version the punct path
+dlopens on macOS.

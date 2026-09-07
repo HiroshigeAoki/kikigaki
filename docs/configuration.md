@@ -44,6 +44,10 @@ connect_timeout_ms = 30000
 server_punctuates = true
 ```
 
+`hotkey` の既定値はmacOSで `Alt+Space`、Windowsで `Ctrl+Alt+Space`（Windowsでは `Alt+Space` がシステムメニューを開くため）。
+
+`replace_file` / `metrics_path` / `models_dir` の既定値はOSごとに異なる。一覧は [README](../README.md#ファイルの場所)を参照。
+
 `punct.enabled` は `"auto"` / `true` / `false` を取り、`"auto"` は句読点サポート付きビルドでのみ有効になる。
 
 ## 廃止した設定と不明な項目

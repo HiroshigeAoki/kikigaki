@@ -2,7 +2,7 @@
 
 # kikigaki
 
-日本語特化・完全ローカルのプッシュトゥトーク型音声入力アプリ(macOS)。
+日本語特化・完全ローカルのプッシュトゥトーク型音声入力アプリ(macOS/Windows)。
 
 Fast, private Japanese voice typing. 100% local and open source.
 
@@ -25,19 +25,25 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 初回起動時はオンボーディング画面が開き、マイク権限 → アクセシビリティ権限 → モデルのダウンロードの順に進む。ダウンロードするのはモデルデータのみで約548 MB(展開後は約183 MB)。ONNX Runtimeはアプリに同梱している。リリースは固定の自己署名IDで署名しているため、許可した権限はアップデート後も保持される。
 
+## インストール (Windows)
+
+[Releases](https://github.com/HiroshigeAoki/kikigaki/releases)から `kikigaki-<version>-windows-x64-setup.exe` をダウンロードして実行する。管理者権限は不要で、現在のユーザーのみにインストールされる。署名はしていないため、SmartScreenの警告が出た場合は「詳細情報」→「実行」で起動する。
+
+初回起動時はオンボーディング画面が開き、マイク権限の確認 → モデルのダウンロードの順に進む（Windowsにはアクセシビリティ権限の概念がないため、その確認手順はない）。ホットキーの既定は `Ctrl+Alt+Space`（`Alt+Space` はWindowsのシステムメニューやPowerToys Runと競合するため）。
+
 ## プライバシー
 
 音声認識(HaasまたはReazonSpeech)、発話区間検出(Silero VAD)、句読点付与(mojicast)は、すべて端末上で実行される。既定構成でネットワークを使うのはモデルの初回ダウンロードだけで、音声データや認識結果を外部サーバーへ送信しない。`remote-engine` 構成でも、既定では同一マシン上のローカルプロセス(`ws://127.0.0.1`)に接続する。
 
 ## ファイルの場所
 
-| 項目 | パス |
-| --- | --- |
-| 設定 | `~/.config/kikigaki/config.toml` |
-| 置換辞書 | `~/.config/kikigaki/replace.toml` |
-| モデル | `~/Library/Application Support/kikigaki/models` |
-| ログ | `~/Library/Logs/kikigaki/kikigaki.<date>.log` |
-| レイテンシ計測 | `~/Library/Logs/kikigaki/latency.jsonl` |
+| 項目 | macOS | Windows |
+| --- | --- | --- |
+| 設定 | `~/.config/kikigaki/config.toml` | `%APPDATA%\kikigaki\config.toml` |
+| 置換辞書 | `~/.config/kikigaki/replace.toml` | `%APPDATA%\kikigaki\replace.toml` |
+| モデル | `~/Library/Application Support/kikigaki/models` | `%LOCALAPPDATA%\kikigaki\models` |
+| ログ | `~/Library/Logs/kikigaki/kikigaki.<date>.log` | `%LOCALAPPDATA%\kikigaki\logs\kikigaki.<date>.log` |
+| レイテンシ計測 | `~/Library/Logs/kikigaki/latency.jsonl` | `%LOCALAPPDATA%\kikigaki\logs\latency.jsonl` |
 
 ## 設定
 
@@ -78,7 +84,7 @@ to = "Kubernetes"
 - [x] 置換辞書
 - [x] カタカナ語の既定置換辞書
 - [ ] 認識精度の改善
-- [ ] Windows対応
+- [x] Windows対応
 
 ## 開発
 

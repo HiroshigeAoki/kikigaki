@@ -102,24 +102,45 @@ fn runtime_path(models_dir: &Path) -> PathBuf {
     }
     models_dir
         .join("onnxruntime-1.27.1")
-        .join(if cfg!(target_os = "macos") {
-            "libonnxruntime.dylib"
-        } else {
-            "libonnxruntime.so"
-        })
+        .join(runtime_file_name())
 }
 
-/// The ONNX Runtime copy Tauri places in the app bundle (`Contents/Frameworks/`). A hardened-
-/// runtime app can only dlopen libraries sealed into its own bundle, so when we run from a bundle
-/// this copy wins over the development-only models-directory fallback.
-fn bundled_runtime_path() -> Option<PathBuf> {
-    if !cfg!(target_os = "macos") {
-        return None;
+/// Bare ONNX Runtime shared-library file name for the running OS.
+fn runtime_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
     }
+}
+
+/// The ONNX Runtime copy Tauri places next to the executable. macOS ships it inside the
+/// hardened-runtime app bundle (`Contents/Frameworks/`); Windows ships it flat next to the exe
+/// (`tauri.windows.conf.json`'s `bundle.resources`). A development-only models-directory
+/// fallback exists for both platforms when neither bundled copy is present.
+///
+/// On Windows the exe-adjacent copy is tried first (the installed app), then the parent
+/// directory: `sherpa-onnx-sys`'s build script copies the runtime DLLs into `target\<profile>\`
+/// while Cargo test binaries run from `target\<profile>\deps\`, so a test process finds the same
+/// DLL the ASR engine already loaded one level up.
+fn bundled_runtime_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let contents = exe.parent()?.parent()?;
-    let candidate = contents.join("Frameworks").join("libonnxruntime.dylib");
-    candidate.is_file().then_some(candidate)
+    let candidates: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        let contents = exe.parent()?.parent()?;
+        vec![contents.join("Frameworks").join("libonnxruntime.dylib")]
+    } else if cfg!(target_os = "windows") {
+        let exe_dir = exe.parent()?;
+        let mut found = vec![exe_dir.join("onnxruntime.dll")];
+        if let Some(profile_dir) = exe_dir.parent() {
+            found.push(profile_dir.join("onnxruntime.dll"));
+        }
+        found
+    } else {
+        return None;
+    };
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 fn probabilities_from_logits(
@@ -160,6 +181,18 @@ fn sigmoid(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_file_name_is_dll_on_windows_dylib_on_macos_so_elsewhere() {
+        let name = runtime_file_name();
+        if cfg!(target_os = "windows") {
+            assert_eq!(name, "onnxruntime.dll");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(name, "libonnxruntime.dylib");
+        } else {
+            assert_eq!(name, "libonnxruntime.so");
+        }
+    }
 
     #[test]
     fn logits_require_exact_shape_and_finite_values() {

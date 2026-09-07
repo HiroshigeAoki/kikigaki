@@ -167,13 +167,20 @@ $Dumpbin = $DumpbinCandidates[0]
 # Allowlist derived from the pinned binaries themselves (verified via a string scan of the binaries)
 # plus the observed kikigaki.exe import set - record the *actual* set on first build here and
 # keep this list in sync; do not add an entry "just in case" without observing it first.
+# First release kikigaki.exe (2026-09-08): bcryptprimitives.dll (Rust std),
+# comctl32.dll (tao/muda), dwmapi.dll (tao), shlwapi.dll (tao/Tauri), mmdevapi.dll (cpal WASAPI).
 $Allowlist = @(
     "sherpa-onnx-c-api.dll", "onnxruntime.dll", "onnxruntime_providers_shared.dll",
     "KERNEL32.dll", "ADVAPI32.dll", "SETUPAPI.dll", "dbghelp.dll", "dxgi.dll",
     "api-ms-win-core-*.dll", "api-ms-win-crt-*.dll",
     "ntdll.dll", "USER32.dll", "SHELL32.dll", "ole32.dll", "OLEAUT32.dll", "GDI32.dll",
     "WS2_32.dll", "BCRYPT.dll", "CRYPT32.dll", "SECUR32.dll", "USERENV.dll",
-    "WebView2Loader.dll", "MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"
+    "WebView2Loader.dll", "MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll",
+    "bcryptprimitives.dll",
+    "comctl32.dll",
+    "dwmapi.dll",
+    "shlwapi.dll",
+    "mmdevapi.dll"
 )
 foreach ($target in $BinaryTargets) {
     $Output = Invoke-Native { & $Dumpbin /dependents $target } "dumpbin /dependents $target"

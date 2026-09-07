@@ -43,6 +43,35 @@ if ($Command -eq "test") {
     Invoke-Native { cargo clippy --workspace -- -D warnings } "cargo clippy --workspace"
 
     if ($env:KIKIGAKI_MODELS_DIR) {
+        if ($env:KIKIGAKI_TEST_WAVS_DIR) {
+            $TestWavsDir = $env:KIKIGAKI_TEST_WAVS_DIR
+        } else {
+            $TestWavsDir = Join-Path $env:KIKIGAKI_MODELS_DIR "reazonspeech-ja-en-2025-01-17\test_wavs"
+        }
+        if (-not [System.IO.Path]::IsPathRooted($TestWavsDir)) {
+            throw "win-build test: KIKIGAKI_TEST_WAVS_DIR / KIKIGAKI_MODELS_DIR must be absolute: $TestWavsDir"
+        }
+        foreach ($TestWav in @("t09.wav", "test_ja_1.wav", "test_ja_2.wav")) {
+            $TestWavPath = Join-Path $TestWavsDir $TestWav
+            if (-not (Test-Path -LiteralPath $TestWavPath -PathType Leaf)) {
+                throw "win-build test: test WAV missing: $TestWavPath"
+            }
+        }
+
+        Invoke-Native { cargo test -p kikigaki-engine --all-features --no-run } "cargo test -p kikigaki-engine --all-features --no-run"
+        $ProfileDir = Join-Path $env:CARGO_TARGET_DIR "debug"
+        $DepsDir = Join-Path $ProfileDir "deps"
+        # Test executables run from deps\, where no runtime DLLs are staged by the build script.
+        # System32 ships onnxruntime.dll and is searched ahead of PATH, so the wrong ORT loads.
+        # Copying the DLLs into deps\ makes the executable-adjacent lookup win, matching the
+        # installed app's layout.
+        $OnnxRuntimeDll = Join-Path $ProfileDir "onnxruntime.dll"
+        if (-not (Test-Path -LiteralPath $OnnxRuntimeDll -PathType Leaf)) {
+            throw "win-build test: runtime DLL missing: $OnnxRuntimeDll (SHERPA_ONNX_LIB_DIR misconfigured?)"
+        }
+        Get-ChildItem -LiteralPath $ProfileDir -Filter "*.dll" -File |
+            Copy-Item -Destination $DepsDir -Force
+
         # No --ignored (real_models.rs has no #[ignore] attributes - it self-skips at runtime
         # via KIKIGAKI_MODELS_DIR and reports `ok` either way, so `-- --ignored` would silently
         # select zero tests and this whole block would falsely "pass" - Task 1's Windows-side
@@ -54,7 +83,7 @@ if ($Command -eq "test") {
                 Tee-Object -FilePath $LogPath
         } "cargo test -p kikigaki-engine --all-features"
         if (Select-String -Path $LogPath -Pattern "SKIPPED" -Quiet) {
-            throw "win-build test: KIKIGAKI_MODELS_DIR did not take effect (SKIPPED lines found)"
+            throw "win-build test: real-model tests skipped (see SKIPPED lines in $LogPath)"
         }
     } else {
         Write-Host "win-build: KIKIGAKI_MODELS_DIR unset, skipping real-model tests"

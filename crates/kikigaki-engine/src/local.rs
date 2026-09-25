@@ -17,6 +17,8 @@ use crate::sherpa::{build_recognizer_auto, build_vad};
 const SAMPLE_RATE: usize = 16_000;
 const PREROLL_MS: usize = 1_000;
 const PREROLL_SAMPLES: usize = SAMPLE_RATE * PREROLL_MS / 1_000;
+/// Decode-time silence floor for protecting speech onsets when real preroll is short.
+const ONSET_PAD_SAMPLES: usize = SAMPLE_RATE * 400 / 1_000;
 const HISTORY_MARGIN_SAMPLES: usize = SAMPLE_RATE;
 
 /// One complete VAD speech segment and its start in the detector's sample stream.
@@ -429,23 +431,25 @@ fn drain_and_transcribe(
             .saturating_sub(PREROLL_SAMPLES)
             .max(*last_segment_end)
             .max(history.base());
+        let preroll_samples = segment.start.saturating_sub(want_start);
+        let onset_pad_samples = ONSET_PAD_SAMPLES.saturating_sub(preroll_samples);
         let mut decode_samples = Vec::with_capacity(
-            segment
-                .start
-                .saturating_sub(want_start)
+            onset_pad_samples
+                .saturating_add(preroll_samples)
                 .saturating_add(segment.samples.len()),
         );
+        decode_samples.resize(onset_pad_samples, 0.0);
         if want_start < segment.start {
             history.append_range(want_start, segment.start, &mut decode_samples)?;
         }
-        let preroll_samples = decode_samples.len();
         decode_samples.extend_from_slice(&segment.samples);
         *last_segment_end = segment.start.saturating_add(segment.samples.len());
         let preroll_ms = preroll_samples as f64 / 16.0;
+        let onset_pad_ms = onset_pad_samples as f64 / 16.0;
         let decode_started = Instant::now();
         if let Some(text) = asr.transcribe(&decode_samples) {
             let asr_end_at = Instant::now();
-            tracing::debug!(segment_ms, preroll_ms, %text, "decoded VAD segment");
+            tracing::debug!(segment_ms, preroll_ms, onset_pad_ms, %text, "decoded VAD segment");
             if !text.is_empty() {
                 decoded.push(DecodedSegment {
                     text,
@@ -483,8 +487,8 @@ mod tests {
     use kikigaki_core::models::{ASR_MODEL_ID, VAD_MODEL_ID};
 
     use super::{
-        report_model_load_failure, run_local_worker, run_with_loaders, with_hotword_fallback,
-        Recognizer, Vad, VadSegment,
+        drain_and_transcribe, report_model_load_failure, run_local_worker, run_with_loaders,
+        with_hotword_fallback, AudioHistory, Recognizer, Vad, VadSegment,
     };
 
     #[test]
@@ -685,13 +689,13 @@ mod tests {
     }
 
     #[test]
-    fn preroll_is_clamped_to_history_base() {
-        let history: Vec<f32> = (0..8_192).map(|sample| sample as f32).collect();
+    fn short_preroll_is_zero_padded_to_onset_floor() {
+        let history: Vec<f32> = (1..=8_192).map(|sample| sample as f32).collect();
         let segment_samples = vec![-1.0; 8_000];
         let captured = captured_segments(
             OffsetVad {
                 pending: vec![VadSegment {
-                    start: 4_000,
+                    start: 1_600,
                     samples: segment_samples.clone(),
                 }],
                 wait_for_reset: false,
@@ -702,9 +706,38 @@ mod tests {
             ],
         );
 
-        assert_eq!(captured[0].len(), 4_000 + segment_samples.len());
-        assert_eq!(&captured[0][..4_000], &history[..4_000]);
-        assert_eq!(&captured[0][4_000..], segment_samples);
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].len(), 6_400 + segment_samples.len());
+        assert!(captured[0][..4_800].iter().all(|sample| *sample == 0.0));
+        assert_eq!(&captured[0][4_800..6_400], &history[..1_600]);
+        assert_eq!(&captured[0][6_400..], segment_samples);
+    }
+
+    #[test]
+    fn preroll_is_clamped_to_history_base() {
+        let samples: Vec<f32> = (1..=40_000).map(|sample| sample as f32).collect();
+        let mut history = AudioHistory::new(0.0);
+        history.push(&samples);
+        assert_eq!(history.base(), 8_000);
+
+        let segment_samples = vec![-1.0; 8_000];
+        let mut vad = OffsetVad {
+            pending: vec![VadSegment {
+                start: 12_000,
+                samples: segment_samples.clone(),
+            }],
+            wait_for_reset: false,
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut recognizer = CapturingRecognizer(Arc::clone(&captured));
+        let mut last_segment_end = 0;
+        drain_and_transcribe(&mut vad, &mut recognizer, &history, &mut last_segment_end).unwrap();
+        let captured = captured.lock().unwrap();
+
+        assert_eq!(captured[0].len(), 6_400 + segment_samples.len());
+        assert!(captured[0][..2_400].iter().all(|sample| *sample == 0.0));
+        assert_eq!(&captured[0][2_400..6_400], &samples[8_000..12_000]);
+        assert_eq!(&captured[0][6_400..], segment_samples);
     }
 
     #[test]
@@ -719,7 +752,7 @@ mod tests {
                         samples: vec![-1.0; 4_000],
                     },
                     VadSegment {
-                        start: 16_000,
+                        start: 12_000,
                         samples: second_samples.clone(),
                     },
                 ],
@@ -732,9 +765,10 @@ mod tests {
         );
 
         assert_eq!(captured.len(), 2);
-        assert_eq!(captured[1].len(), 8_000 + second_samples.len());
-        assert_eq!(&captured[1][..8_000], &history[8_000..16_000]);
-        assert_eq!(&captured[1][8_000..], second_samples);
+        assert_eq!(captured[1].len(), 6_400 + second_samples.len());
+        assert!(captured[1][..2_400].iter().all(|sample| *sample == 0.0));
+        assert_eq!(&captured[1][2_400..6_400], &history[8_000..12_000]);
+        assert_eq!(&captured[1][6_400..], second_samples);
     }
 
     #[test]
@@ -758,9 +792,12 @@ mod tests {
         );
 
         assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].len(), 3_200 + segment_samples.len());
-        assert!(captured[0][..3_200].iter().all(|sample| *sample == 2.0));
-        assert_eq!(&captured[0][3_200..], segment_samples);
+        assert_eq!(captured[0].len(), 6_400 + segment_samples.len());
+        assert!(captured[0][..3_200].iter().all(|sample| *sample == 0.0));
+        assert!(captured[0][3_200..6_400]
+            .iter()
+            .all(|sample| *sample == 2.0));
+        assert_eq!(&captured[0][6_400..], segment_samples);
     }
 
     fn run(

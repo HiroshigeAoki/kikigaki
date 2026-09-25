@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::engine::{join_workers, EngineMsg, SinkError, Waker};
 use crate::protocol;
+use crate::punct::nfkc;
 use crate::replace::{ReplaceFile, Rules};
 use crate::text::strip_trailing_period;
 
@@ -23,7 +24,7 @@ impl Punctuator for NoopPunctuator {
     }
 }
 
-/// Ordered replacement, punctuation, and trailing-period processing.
+/// Ordered normalization, replacement, punctuation, and trailing-period processing.
 pub struct Pipeline {
     /// Hot-reloaded replacement dictionary.
     pub replace: ReplaceFile,
@@ -106,14 +107,15 @@ impl Pipeline {
         self.effective_replace_generation = self.replace.generation();
     }
 
-    /// Runs trim, replacement, punctuation, and optional trailing-period removal in order.
+    /// Runs trim, normalization, replacement, punctuation, and trailing-period removal in order.
     pub fn run(&mut self, raw: &str) -> Processed {
         let started = Instant::now();
         let _ = self.replace.rules();
         if self.replace.generation() != self.effective_replace_generation {
             self.rebuild_effective();
         }
-        let replaced = self.effective.apply(raw.trim());
+        let normalized = nfkc(raw.trim());
+        let replaced = self.effective.apply(&normalized);
         let punctuated = if self.punct_enabled {
             match self.punctuator.punctuate(&replaced) {
                 Ok(text) => text,
@@ -422,6 +424,41 @@ mod tests {
     fn keeps_trailing_period_when_disabled() {
         let (_temp, mut pipeline) = pipeline(Box::new(NoopPunctuator), false);
         assert_eq!(pipeline.run("  a。  ").text, "a。");
+    }
+
+    #[test]
+    fn nfkc_runs_when_punctuation_is_disabled() {
+        let (_temp, mut pipeline) = pipeline(Box::new(NoopPunctuator), false);
+        pipeline.punct_enabled = false;
+
+        assert_eq!(pipeline.run("ＡＢＣ①㍉").text, "ABC1ミリ");
+    }
+
+    #[test]
+    fn nfkc_runs_before_enabled_punctuation() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (_temp, mut pipeline) =
+            pipeline(Box::new(RecordingPunctuator(Arc::clone(&seen))), false);
+
+        assert_eq!(pipeline.run("ＡＢＣ").text, "ABC。");
+        assert_eq!(*seen.lock().unwrap(), ["ABC"]);
+    }
+
+    #[test]
+    fn replacement_matches_nfkc_normalized_engine_output() {
+        let (_temp, replace) =
+            replace_file("[[rule]]\nfrom = [\"ABCカタカナ\"]\nto = \"matched\"\n");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            false,
+            false,
+            Arc::new(crate::replace::Rules::default()),
+            false,
+            Arc::new(crate::replace::Rules::default()),
+        );
+
+        assert_eq!(pipeline.run("ＡＢＣｶﾀｶﾅ").text, "matched");
     }
 
     #[test]

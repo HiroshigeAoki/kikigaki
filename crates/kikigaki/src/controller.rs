@@ -1263,7 +1263,10 @@ impl Controller {
                             .take()
                             .expect("waiting switch checked above");
                         self.active_engine = switch.target;
-                        self.engine_switch_install = None;
+                        self.startup = self
+                            .engine_switch_install
+                            .take()
+                            .expect("committing switch has a target startup coordinator");
                         self.configure_postprocess_for_engine(switch.target);
                         self.status = Status::Ok;
                         tracing::info!(
@@ -2524,6 +2527,52 @@ mod tests {
             .required
             .iter()
             .any(|model| model.id == "mojicast-punct"));
+    }
+
+    #[test]
+    fn committed_switch_uses_target_startup_for_model_failure_and_reconnect() {
+        let harness = ready_harness();
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
+
+        apply_engine(&harness, EngineKind::Whisper).unwrap();
+        wait_for_builds(&harness, 2);
+        wait_for_engine_instances(&harness, 2);
+        harness.engine.send(EngineMsg::Ready);
+        harness.client.wake();
+        wait_snapshot(&harness, |snapshot| {
+            snapshot.settings.active_engine == EngineKind::Whisper
+        });
+        let boot_starts_before = harness.startup.starts.load(Ordering::Relaxed);
+
+        harness.engine.send(EngineMsg::Disconnected {
+            reason: "Whisper model failed".into(),
+            failed_model: Some(kikigaki_core::models::WHISPER_MODEL_ID),
+        });
+        let failed = wait_snapshot(&harness, |snapshot| {
+            snapshot.status.message.as_deref() == Some("Whisper model failed")
+        });
+        assert_eq!(failed.status.phase, "failed");
+        assert!(harness.startup.invalidated.lock().unwrap().is_empty());
+        assert_eq!(
+            *harness.switch_startup.invalidated.lock().unwrap(),
+            [kikigaki_core::models::WHISPER_MODEL_ID]
+        );
+
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        assert!(poll(|| harness
+            .switch_startup
+            .starts
+            .load(Ordering::Relaxed)
+            == 2));
+        assert_eq!(
+            harness.startup.starts.load(Ordering::Relaxed),
+            boot_starts_before
+        );
     }
 
     #[test]

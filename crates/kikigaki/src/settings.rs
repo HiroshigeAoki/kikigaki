@@ -12,6 +12,7 @@ pub struct SettingsPatch {
     pub punctuation: Option<PunctSetting>,
     /// JSON uses `builtinReplaceDict`; snapshots and persisted TOML stay snake_case.
     pub builtin_replace_dict: Option<bool>,
+    pub engine: Option<kikigaki_core::config::EngineKind>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -29,6 +30,8 @@ pub struct SettingsSnapshot {
     pub strip_trailing_period: bool,
     pub builtin_replace_dict: bool,
     pub paste_method: kikigaki_core::config::PasteMethod,
+    pub engine: kikigaki_core::config::EngineKind,
+    pub whisper_available: bool,
 }
 
 pub struct SettingsCoordinator {
@@ -57,6 +60,8 @@ impl SettingsCoordinator {
             strip_trailing_period: self.config.strip_trailing_period,
             builtin_replace_dict: self.config.builtin_replace_dict,
             paste_method: self.config.paste_method,
+            engine: self.config.engine,
+            whisper_available: self.capabilities.whisper && cfg!(target_os = "macos"),
         }
     }
 
@@ -110,6 +115,20 @@ impl SettingsCoordinator {
         if let Some(enabled) = patch.builtin_replace_dict {
             document["builtin_replace_dict"] = toml_edit::value(enabled);
             candidate.builtin_replace_dict = enabled;
+        }
+        if let Some(engine) = patch.engine {
+            candidate.engine = engine;
+            candidate
+                .validate(self.capabilities)
+                .map_err(|_error| crate::status::UiError {
+                    code: "unsupported_engine",
+                    message: "この機能はこのビルドでは利用できません".into(),
+                })?;
+            document["engine"] = toml_edit::value(match engine {
+                kikigaki_core::config::EngineKind::Local => "local",
+                kikigaki_core::config::EngineKind::Remote => "remote",
+                kikigaki_core::config::EngineKind::Whisper => "whisper",
+            });
         }
 
         let body = document.to_string();
@@ -260,6 +279,7 @@ mod tests {
                 hotkey: Some("Cmd+Shift+Space".into()),
                 punctuation: None,
                 builtin_replace_dict: None,
+                engine: None,
             })
             .unwrap();
         let on_disk = std::fs::read_to_string(path).unwrap();
@@ -292,6 +312,7 @@ mod tests {
                 hotkey: None,
                 punctuation: None,
                 builtin_replace_dict: Some(true),
+                engine: None,
             })
             .unwrap();
 
@@ -301,6 +322,85 @@ mod tests {
         assert!(on_disk.contains("builtin_replace_dict = true"));
         assert!(snapshot.builtin_replace_dict);
         assert!(coordinator.snapshot().builtin_replace_dict);
+    }
+
+    #[test]
+    fn engine_patch_persists_and_updates_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
+            },
+        )
+        .unwrap();
+
+        let snapshot = coordinator
+            .apply(SettingsPatch {
+                hotkey: None,
+                punctuation: None,
+                builtin_replace_dict: None,
+                engine: Some(kikigaki_core::config::EngineKind::Whisper),
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.engine, kikigaki_core::config::EngineKind::Whisper);
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert!(on_disk.contains("engine = \"whisper\""), "{on_disk}");
+    }
+
+    #[test]
+    fn engine_patch_to_whisper_is_rejected_without_the_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path,
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: false,
+            },
+        )
+        .unwrap();
+
+        let error = coordinator
+            .apply(SettingsPatch {
+                hotkey: None,
+                punctuation: None,
+                builtin_replace_dict: None,
+                engine: Some(kikigaki_core::config::EngineKind::Whisper),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "unsupported_engine");
+        assert_eq!(
+            coordinator.config().engine,
+            kikigaki_core::config::EngineKind::Local
+        );
+    }
+
+    #[test]
+    fn whisper_ui_availability_is_os_gated_independently_of_config_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "engine = \"whisper\"\n").unwrap();
+        let capabilities = Capabilities {
+            punct: true,
+            remote_engine: true,
+            whisper: true,
+        };
+        let coordinator = SettingsCoordinator::load(path, capabilities).unwrap();
+
+        assert!(coordinator.config().validate(capabilities).is_ok());
+        assert_eq!(
+            coordinator.snapshot().whisper_available,
+            cfg!(target_os = "macos")
+        );
     }
 
     #[test]
@@ -324,6 +424,7 @@ mod tests {
                 hotkey: None,
                 punctuation: None,
                 builtin_replace_dict: None,
+                engine: None,
             })
             .unwrap();
 
@@ -352,6 +453,7 @@ mod tests {
                 hotkey: None,
                 punctuation: Some(PunctSetting::OnStrip),
                 builtin_replace_dict: None,
+                engine: None,
             })
             .unwrap();
         assert!(snapshot.punct_enabled && snapshot.strip_trailing_period);
@@ -399,6 +501,7 @@ mod tests {
                 hotkey: Some("Ctrl+Space".into()),
                 punctuation: None,
                 builtin_replace_dict: None,
+                engine: None,
             })
             .unwrap_err();
         assert_eq!(error.code, "external_change");
@@ -426,6 +529,7 @@ mod tests {
                 hotkey: None,
                 punctuation: None,
                 builtin_replace_dict: Some(true),
+                engine: None,
             })
             .unwrap_err();
 
@@ -456,6 +560,7 @@ mod tests {
                 hotkey: Some("Cmd+Space".into()),
                 punctuation: None,
                 builtin_replace_dict: None,
+                engine: None,
             })
             .is_err());
         assert_eq!(coordinator.snapshot().hotkey, "Alt+Space");

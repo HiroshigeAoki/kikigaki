@@ -744,6 +744,7 @@ impl Controller {
             hotkey: Some(chord.clone()),
             punctuation: None,
             builtin_replace_dict: None,
+            engine: None,
         }) {
             Ok(snapshot) => {
                 tracing::info!(chord = %chord, "hotkey re-registered after settings change");
@@ -2038,6 +2039,7 @@ mod tests {
                     hotkey: None,
                     punctuation: None,
                     builtin_replace_dict: Some(enabled),
+                    engine: None,
                 },
                 reply,
             })
@@ -2627,6 +2629,7 @@ mod tests {
                 hotkey: Some(chord.into()),
                 punctuation: None,
                 builtin_replace_dict: None,
+                engine: None,
             },
             reply,
         })
@@ -2656,6 +2659,7 @@ mod tests {
                     hotkey: Some("Alt+A".into()),
                     punctuation: None,
                     builtin_replace_dict: None,
+                    engine: None,
                 },
                 reply: a_tx,
             })
@@ -2668,6 +2672,7 @@ mod tests {
                     hotkey: Some("Alt+B".into()),
                     punctuation: None,
                     builtin_replace_dict: None,
+                    engine: None,
                 },
                 reply: b_tx,
             })
@@ -2844,6 +2849,7 @@ mod tests {
                     hotkey: None,
                     punctuation: Some(PunctSetting::On),
                     builtin_replace_dict: None,
+                    engine: None,
                 },
                 reply,
             })
@@ -2879,6 +2885,7 @@ mod tests {
                     hotkey: None,
                     punctuation: None,
                     builtin_replace_dict: Some(true),
+                    engine: None,
                 },
                 reply,
             })
@@ -2923,6 +2930,7 @@ mod tests {
                     hotkey: None,
                     punctuation: None,
                     builtin_replace_dict: Some(true),
+                    engine: None,
                 },
                 reply,
             })
@@ -2963,6 +2971,7 @@ mod tests {
                     hotkey: None,
                     punctuation: None,
                     builtin_replace_dict: Some(false),
+                    engine: None,
                 },
                 reply,
             })
@@ -3028,6 +3037,7 @@ mod tests {
                         hotkey: None,
                         punctuation: None,
                         builtin_replace_dict: None,
+                        engine: None,
                     },
                     reply,
                 })

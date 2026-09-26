@@ -342,6 +342,7 @@ fn default_snapshot(
             hotkey: settings_snapshot.hotkey.clone(),
             punct_enabled: settings_snapshot.punct_enabled,
             strip_trailing_period: settings_snapshot.strip_trailing_period,
+            engine_punctuates: settings_snapshot.engine_punctuates,
             engine,
         },
         settings: settings_snapshot,

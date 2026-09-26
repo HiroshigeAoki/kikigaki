@@ -58,6 +58,47 @@ fn transcribe_test_ja_1_golden() {
     );
 }
 
+#[cfg(feature = "whisper")]
+#[test]
+fn whisper_transcribes_test_ja_1_without_crashing() {
+    let Some(dir) = std::env::var_os("KIKIGAKI_MODELS_DIR") else {
+        // Soft-skip is right for a developer machine that hasn't cached the models — but Phase
+        // I's acceptance run must not be able to silently pass by having the model simply be
+        // missing. `KIKIGAKI_REQUIRE_REAL_MODELS=1` (any non-empty value) turns this into a hard
+        // failure instead, distinguishing "developer machine without the model, softly skip" from
+        // "acceptance run that must have the model, fail loudly if it's absent." See task I2 for
+        // where this is set.
+        if std::env::var_os("KIKIGAKI_REQUIRE_REAL_MODELS").is_some() {
+            panic!(
+                "KIKIGAKI_MODELS_DIR is unset but KIKIGAKI_REQUIRE_REAL_MODELS=1 — this run must \
+                 have the real Whisper model available, not skip it"
+            );
+        }
+        eprintln!("SKIPPED: models missing (KIKIGAKI_MODELS_DIR unset)");
+        return;
+    };
+    let samples = load_wav_16k("test_ja_1.wav");
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let decode_cancel = kikigaki_engine::whisper_engine::DecodeCancel::new();
+    let mut recognizer = kikigaki_engine::whisper_recognizer::build_whisper_recognizer(
+        &PathBuf::from(dir),
+        false,
+        shutdown,
+        decode_cancel,
+    )
+    .unwrap();
+    let text = recognizer
+        .transcribe(&samples)
+        .expect("recognizer returned no result");
+    assert!(
+        !text.trim().is_empty(),
+        "expected non-empty transcription, got {text:?}"
+    );
+    // Deliberately not asserting exact text here (unlike the Reazon golden test) — Whisper's
+    // exact output is measured via the hotword-eval harness against the 45-wav set (task G1 +
+    // the acceptance rubric), which is the actual bar this feature is held to.
+}
+
 #[test]
 fn production_hotword_path_biases_known_eval_wav() {
     let Some(models_dir) = real_models_dir() else {

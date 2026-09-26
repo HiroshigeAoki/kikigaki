@@ -398,8 +398,18 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
             kikigaki_core::config::EngineKind::Remote => {
                 anyhow::bail!("engine = \"remote\" requires a build with the remote-engine feature")
             }
+            #[cfg(feature = "whisper")]
             kikigaki_core::config::EngineKind::Whisper => {
-                anyhow::bail!("engine = \"whisper\" is not implemented yet")
+                kikigaki_engine::whisper_engine::WhisperEngine::start(
+                    self.local_models_dir.clone(),
+                    self.local_vad_cfg.clone(),
+                    cfg!(feature = "whisper-metal"),
+                )
+                .map(|engine| Box::new(engine) as Box<dyn kikigaki_core::engine::Engine>)
+            }
+            #[cfg(not(feature = "whisper"))]
+            kikigaki_core::config::EngineKind::Whisper => {
+                anyhow::bail!("engine = \"whisper\" requires a build with the whisper feature")
             }
         }
     }

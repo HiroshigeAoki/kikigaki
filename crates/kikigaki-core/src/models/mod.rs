@@ -77,10 +77,15 @@ pub enum Payload {
 /// Feature that requires a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
-    /// Local speech recognition or voice activity detection.
+    /// The ASR transducer only (ReazonSpeech).
     Asr,
+    /// Voice activity detection — needed by `Local` (mid-utterance VAD) and `Whisper` (the
+    /// VAD-only empty-speech gate before the single decode call).
+    Vad,
     /// Local punctuation inference.
     Punct,
+    /// Whisper large-v3-turbo local recognition.
+    Whisper,
 }
 
 /// One independently installed model package.
@@ -145,6 +150,8 @@ const PUNCT_FILES: &[ManifestFile] = &[
 pub const ASR_MODEL_ID: &str = "reazonspeech-ja-en-2025-01-17";
 /// Stable model-package identifier for Silero VAD.
 pub const VAD_MODEL_ID: &str = "silero-vad";
+/// Stable model-package identifier for the Whisper large-v3-turbo transducer.
+pub const WHISPER_MODEL_ID: &str = "whisper-large-v3-turbo-q8_0";
 
 /// Complete pinned model manifest for this build target.
 pub const MODELS: &[Model] = &[
@@ -172,7 +179,20 @@ pub const MODELS: &[Model] = &[
             size: 643_854,
             sha256: "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
         }),
-        required_for: Requirement::Asr,
+        required_for: Requirement::Vad,
+    },
+    Model {
+        id: WHISPER_MODEL_ID,
+        source: Source::HuggingFace {
+            repo: "ggerganov/whisper.cpp",
+            revision: "5359861c739e955e79d9a303bcbc70fb988958b1",
+        },
+        payload: Payload::File(ManifestFile {
+            name: "ggml-large-v3-turbo-q8_0.bin",
+            size: 874_188_075,
+            sha256: "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
+        }),
+        required_for: Requirement::Whisper,
     },
     Model {
         id: "mojicast-punct",
@@ -195,6 +215,8 @@ pub fn required(
         .iter()
         .filter(|model| match model.required_for {
             Requirement::Asr => kind == EngineKind::Local,
+            Requirement::Vad => kind == EngineKind::Local || kind == EngineKind::Whisper,
+            Requirement::Whisper => kind == EngineKind::Whisper,
             Requirement::Punct => caps.punct && punct_effective,
         })
         .collect()
@@ -325,6 +347,43 @@ mod tests {
         assert_eq!(
             local.iter().map(|model| model.id).collect::<Vec<_>>(),
             ["reazonspeech-ja-en-2025-01-17", "silero-vad"]
+        );
+    }
+
+    #[test]
+    fn whisper_engine_requires_the_whisper_model_and_vad() {
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            whisper: true,
+        };
+        let mut whisper_ids = required(EngineKind::Whisper, caps, false)
+            .iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        whisper_ids.sort_unstable();
+        let mut expected = [WHISPER_MODEL_ID, VAD_MODEL_ID];
+        expected.sort_unstable();
+        assert_eq!(whisper_ids, expected);
+
+        // Whisper punctuates on its own — punct_effective is always false for it in practice
+        // (see Config::engine_punctuates), but required() itself doesn't assume that; it just
+        // trusts its caller's punct_effective input, same as every other engine kind.
+        let local = required(EngineKind::Local, caps, false);
+        assert!(!local.iter().any(|model| model.id == WHISPER_MODEL_ID));
+        // Local must still get VAD too — the Asr/Vad split must not change Local's model set.
+        assert!(local.iter().any(|model| model.id == VAD_MODEL_ID));
+    }
+
+    #[test]
+    fn whisper_model_source_url_is_pinned() {
+        let whisper = MODELS
+            .iter()
+            .find(|model| model.id == WHISPER_MODEL_ID)
+            .unwrap();
+        assert_eq!(
+            whisper.source.url("ggml-large-v3-turbo-q8_0.bin"),
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q8_0.bin"
         );
     }
 }

@@ -23,3 +23,6 @@ mod test_support;
 pub mod whisper_engine;
 /// Pure post-decode guards and parameter selection for the Whisper engine.
 pub mod whisper_guard;
+/// whisper-rs-backed recognizer implementation.
+#[cfg(feature = "whisper")]
+pub mod whisper_recognizer;

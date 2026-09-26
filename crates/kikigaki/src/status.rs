@@ -9,6 +9,7 @@ pub struct UiStatus {
     pub hotkey: String,
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
+    pub engine_punctuates: bool,
     pub engine: &'static str,
 }
 

@@ -499,6 +499,10 @@ fn run(
                 .handle(Input::Tick, controller.clock.now()),
         );
         controller.execute_outputs(std::mem::take(&mut outputs));
+        // A final paste can make the session idle in execute_outputs(). Commit a waiting
+        // engine switch in that same turn, before another hotkey press can start an utterance.
+        controller.reconcile_engine_switch(&mut outputs);
+        controller.execute_outputs(std::mem::take(&mut outputs));
         controller.publish_if_changed();
     }
 }
@@ -615,9 +619,7 @@ impl Controller {
                     {
                         self.start_engine_switch(target);
                     }
-                    let mut snapshot = self.settings.snapshot();
-                    snapshot.active_engine = self.active_engine;
-                    snapshot
+                    self.settings_snapshot()
                 });
                 let _ = reply.send(result);
             }
@@ -782,7 +784,7 @@ impl Controller {
         let old = self.settings.config().hotkey.clone();
         let Some(chord) = new_chord else {
             let result = self.reregister_or_warn(&old);
-            let _ = reply.send(result.map(|()| self.settings.snapshot()));
+            let _ = reply.send(result.map(|()| self.settings_snapshot()));
             return;
         };
         if chord == old {
@@ -791,7 +793,7 @@ impl Controller {
             } else {
                 Ok(())
             };
-            let _ = reply.send(result.map(|()| self.settings.snapshot()));
+            let _ = reply.send(result.map(|()| self.settings_snapshot()));
             return;
         }
         if let Err(message) = self.hotkeys.register(&chord) {
@@ -806,12 +808,13 @@ impl Controller {
         match self.settings.apply(SettingsPatch {
             hotkey: Some(chord.clone()),
             punctuation: None,
+            strip_trailing_period: None,
             builtin_replace_dict: None,
             engine: None,
         }) {
-            Ok(snapshot) => {
+            Ok(_) => {
                 tracing::info!(chord = %chord, "hotkey re-registered after settings change");
-                let _ = reply.send(Ok(snapshot));
+                let _ = reply.send(Ok(self.settings_snapshot()));
             }
             Err(error) => {
                 let _ = self.hotkeys.unregister(&chord);
@@ -822,7 +825,13 @@ impl Controller {
     }
 
     fn handle_hotkey_edge(&mut self, edge: HotkeyEdge, outputs: &mut Vec<Output>) {
-        if self.engine_switch.is_some() && matches!(&edge, HotkeyEdge::Pressed) {
+        let blocks_press = self.engine_switch.as_ref().is_some_and(|switch| {
+            matches!(
+                switch.stage,
+                EngineSwitchStage::WaitingForReady | EngineSwitchStage::RollingBack { .. }
+            )
+        });
+        if blocks_press && matches!(&edge, HotkeyEdge::Pressed) {
             self.dirty = true;
             return;
         }
@@ -980,14 +989,18 @@ impl Controller {
                         done_bytes,
                         total_bytes,
                     } => {
-                        self.status =
-                            Status::Installing(progress_message(id, done_bytes, total_bytes));
+                        if matches!(&self.status, Status::Ok | Status::Installing(_)) {
+                            self.status =
+                                Status::Installing(progress_message(id, done_bytes, total_bytes));
+                        }
                     }
                     StartupEvent::Installed(_) => {
                         if let Some(switch) = self.engine_switch.as_mut() {
                             switch.stage = EngineSwitchStage::WaitingForIdle;
                         }
-                        self.status = Status::Ok;
+                        if matches!(&self.status, Status::Installing(_)) {
+                            self.status = Status::Ok;
+                        }
                         break;
                     }
                     StartupEvent::Failed(reason) => {
@@ -1414,7 +1427,9 @@ impl Controller {
                         if let Err(error) = self.mic.start(sink) {
                             self.status =
                                 Status::Warning(format!("Microphone unavailable — {error}"));
-                        } else if !permission_denied {
+                        } else if !permission_denied
+                            && !matches!(&self.status, Status::Installing(_))
+                        {
                             self.status.clear_transient();
                         }
                     }
@@ -1438,7 +1453,9 @@ impl Controller {
                     match self.paster.paste(text, deadline) {
                         Ok(()) => {
                             tracing::info!(outcome = "ok", text_len, "paste completed");
-                            self.status.clear_transient();
+                            if !matches!(&self.status, Status::Installing(_)) {
+                                self.status.clear_transient();
+                            }
                             if let Some((raw, text)) =
                                 self.pending_finals.remove(&self.active_generation)
                             {
@@ -1504,9 +1521,14 @@ impl Controller {
     fn snapshot(&self) -> UiSnapshot {
         #[cfg(test)]
         self.sink.record_snapshot_build();
-        let mut settings = self.settings.snapshot();
-        settings.active_engine = self.active_engine;
-        let phase = if self.engine_switch.is_some() {
+        let settings = self.settings_snapshot();
+        let swap_in_progress = self.engine_switch.as_ref().is_some_and(|switch| {
+            matches!(
+                switch.stage,
+                EngineSwitchStage::WaitingForReady | EngineSwitchStage::RollingBack { .. }
+            )
+        });
+        let phase = if swap_in_progress {
             EnginePhase::Starting
         } else {
             self.supervisor
@@ -1523,6 +1545,7 @@ impl Controller {
                 hotkey: settings.hotkey.clone(),
                 punct_enabled: settings.punct_enabled,
                 strip_trailing_period: settings.strip_trailing_period,
+                engine_punctuates: settings.engine_punctuates,
                 engine: match self.active_engine {
                     EngineKind::Local => "local",
                     EngineKind::Remote => "remote",
@@ -1540,6 +1563,16 @@ impl Controller {
             learned_rules: self.learned.list().to_vec(),
             bootstrap_error: self.bootstrap_error.clone(),
         }
+    }
+
+    fn settings_snapshot(&self) -> crate::settings::SettingsSnapshot {
+        let mut settings = self.settings.snapshot();
+        let mut active_config = self.settings.config().clone();
+        active_config.engine = self.active_engine;
+        settings.active_engine = self.active_engine;
+        settings.punct_enabled = punct_effective(&active_config, self.capabilities);
+        settings.engine_punctuates = active_config.engine_punctuates();
+        settings
     }
 
     fn effective_status(&self) -> Status {
@@ -2443,6 +2476,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: None,
                     punctuation: None,
+                    strip_trailing_period: None,
                     builtin_replace_dict: Some(enabled),
                     engine: None,
                 },
@@ -2461,6 +2495,19 @@ mod tests {
                 },
                 reply,
             })
+    }
+
+    fn apply_strip_trailing_period(harness: &Harness, strip: bool) -> SettingsSnapshot {
+        harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::ApplySettings {
+                patch: SettingsPatch {
+                    strip_trailing_period: Some(strip),
+                    ..SettingsPatch::default()
+                },
+                reply,
+            })
+            .unwrap()
     }
 
     fn controller_barrier(harness: &Harness) {
@@ -2772,25 +2819,173 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_presses_are_rejected_while_the_target_engine_installs() {
-        let harness = ready_harness();
+    fn hotkey_presses_work_on_the_active_engine_while_the_target_installs() {
+        let harness = harness(
+            true,
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         harness
             .switch_startup
             .hold_starts
             .store(true, Ordering::Relaxed);
 
         apply_engine(&harness, EngineKind::Whisper).unwrap();
+        harness
+            .switch_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installing {
+                id: "whisper",
+                done_bytes: 45,
+                total_bytes: 100,
+            });
+        harness.client.wake();
         let pending = wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.engine != snapshot.settings.active_engine
+            snapshot.status.message.as_deref() == Some("Downloading whisper … 45%")
         });
-        assert_eq!(pending.status.phase, "starting");
+        assert_eq!(pending.status.phase, "ready");
+        assert_eq!(pending.settings.active_engine, EngineKind::Local);
+        assert_eq!(pending.settings.engine, EngineKind::Whisper);
+        assert!(pending.settings.punct_enabled);
+        assert!(!pending.settings.engine_punctuates);
         harness.hotkey.send(HotkeyEdge::Pressed);
+        let recording = wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
+        assert_eq!(
+            recording.status.message.as_deref(),
+            Some("Downloading whisper … 45%")
+        );
+        harness.hotkey.send(HotkeyEdge::Released);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
+        harness.engine.send(final_message(1, "旧エンジン"));
+        harness.client.wake();
+        assert!(poll(|| !harness.pastes.attempts.lock().unwrap().is_empty()));
+
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().as_slice(),
+            ["旧エンジン。"]
+        );
+        assert_eq!(harness.mic.starts.load(Ordering::Relaxed), 1);
+        let receivers = harness.engine.command_receivers.lock().unwrap();
+        assert_eq!(
+            receivers[0].lock().unwrap().try_iter().collect::<Vec<_>>(),
+            [
+                EngineCmd::Begin { gen: 1 },
+                EngineCmd::End {
+                    gen: 1,
+                    pad_ms: 500,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn switch_install_progress_does_not_clear_a_paste_warning() {
+        let old = Instant::now() - Duration::from_secs(10);
+        let harness = harness(
+            false,
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            true,
+            Some(old),
+            None,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        harness
+            .switch_startup
+            .hold_starts
+            .store(true, Ordering::Relaxed);
+
+        apply_engine(&harness, EngineKind::Whisper).unwrap();
+        transcribe(&harness, 1, "paste failure");
+        let warning = wait_snapshot(&harness, |snapshot| {
+            snapshot.status.message.as_deref()
+                == Some("Accessibility permission denied — System Settings › Privacy")
+        });
+        assert_eq!(warning.status.phase, "ready");
+
+        harness
+            .switch_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installing {
+                id: "whisper",
+                done_bytes: 45,
+                total_bytes: 100,
+            });
+        harness.client.wake();
+        assert!(poll(|| harness
+            .switch_startup
+            .events
+            .lock()
+            .unwrap()
+            .is_empty()));
         controller_barrier(&harness);
 
-        assert_eq!(latest(&harness).unwrap().status.state, "idle");
-        assert_eq!(harness.mic.starts.load(Ordering::Relaxed), 0);
-        let receivers = harness.engine.command_receivers.lock().unwrap();
-        assert!(receivers[0].lock().unwrap().try_iter().next().is_none());
+        assert_eq!(
+            latest(&harness).unwrap().status.message.as_deref(),
+            Some("Accessibility permission denied — System Settings › Privacy")
+        );
+    }
+
+    #[test]
+    fn switch_install_completion_does_not_clear_a_non_installing_status() {
+        let old = Instant::now() - Duration::from_secs(10);
+        let harness = harness(
+            false,
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            true,
+            Some(old),
+            None,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        harness
+            .switch_startup
+            .hold_starts
+            .store(true, Ordering::Relaxed);
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
+
+        apply_engine(&harness, EngineKind::Whisper).unwrap();
+        transcribe(&harness, 1, "paste failure");
+        wait_snapshot(&harness, |snapshot| {
+            snapshot.status.message.as_deref()
+                == Some("Accessibility permission denied — System Settings › Privacy")
+        });
+
+        harness
+            .switch_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installed(
+                kikigaki_core::startup::InstallReport {
+                    installed: Vec::new(),
+                    reused: Vec::new(),
+                },
+            ));
+        harness.client.wake();
+        wait_for_builds(&harness, 2);
+        controller_barrier(&harness);
+
+        assert_eq!(
+            latest(&harness).unwrap().status.message.as_deref(),
+            Some("Accessibility permission denied — System Settings › Privacy")
+        );
     }
 
     #[test]
@@ -2837,6 +3032,50 @@ mod tests {
                 && harness.switch_startup.events.lock().unwrap().is_empty()
         }));
         assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+
+        harness.hotkey.send(HotkeyEdge::Released);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
+        harness.engine.send(final_message(1, "done"));
+        harness.client.wake();
+        let swapping = wait_snapshot(&harness, |snapshot| {
+            snapshot.status.state == "idle" && snapshot.status.phase == "starting"
+        });
+        assert_eq!(swapping.settings.active_engine, EngineKind::Local);
+        wait_for_builds(&harness, 2);
+    }
+
+    #[test]
+    fn a_switch_whose_install_finishes_while_recording_swaps_after_the_utterance() {
+        let harness = ready_harness();
+        harness
+            .switch_startup
+            .hold_starts
+            .store(true, Ordering::Relaxed);
+        harness
+            .engine
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
+
+        apply_engine(&harness, EngineKind::Whisper).unwrap();
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
+        harness
+            .switch_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installed(
+                kikigaki_core::startup::InstallReport {
+                    installed: Vec::new(),
+                    reused: Vec::new(),
+                },
+            ));
+        harness.client.wake();
+        controller_barrier(&harness);
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(latest(&harness).unwrap().status.state, "recording");
 
         harness.hotkey.send(HotkeyEdge::Released);
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
@@ -2963,7 +3202,10 @@ mod tests {
         harness.hotkey.send(HotkeyEdge::Pressed);
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
 
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
+        let switching = apply_engine(&harness, EngineKind::Whisper).unwrap();
+        assert_eq!(switching.active_engine, EngineKind::Local);
+        assert!(switching.punct_enabled);
+        assert!(!switching.engine_punctuates);
         harness.hotkey.send(HotkeyEdge::Released);
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
         harness.engine.send(final_message(1, "切り替え前"));
@@ -2986,6 +3228,39 @@ mod tests {
             harness.pastes.attempts.lock().unwrap().as_slice(),
             ["切り替え前。", "切り替え後"]
         );
+    }
+
+    #[test]
+    fn whisper_trailing_period_follows_strip_setting_without_local_punctuation() {
+        for (strip, expected) in [(false, "Whisper。"), (true, "Whisper")] {
+            let harness = harness_with_engine_options(
+                false,
+                false,
+                EngineKind::Whisper,
+                VecDeque::new(),
+                BootstrapOutcome::ReadyToStart,
+                Vec::new(),
+                Vec::new(),
+                false,
+                None,
+                None,
+                POLL_INTERVAL,
+            );
+            let ready = wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+            assert!(ready.settings.engine_punctuates);
+            assert!(!ready.settings.punct_enabled);
+
+            let settings = apply_strip_trailing_period(&harness, strip);
+            assert!(settings.engine_punctuates);
+            assert!(!settings.punct_enabled);
+            assert_eq!(settings.strip_trailing_period, strip);
+            transcribe(&harness, 1, "Whisper。");
+
+            assert_eq!(
+                harness.pastes.attempts.lock().unwrap().last().unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -3648,6 +3923,7 @@ mod tests {
             patch: SettingsPatch {
                 hotkey: Some(chord.into()),
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
                 engine: None,
             },
@@ -3678,6 +3954,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: Some("Alt+A".into()),
                     punctuation: None,
+                    strip_trailing_period: None,
                     builtin_replace_dict: None,
                     engine: None,
                 },
@@ -3691,6 +3968,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: Some("Alt+B".into()),
                     punctuation: None,
+                    strip_trailing_period: None,
                     builtin_replace_dict: None,
                     engine: None,
                 },
@@ -3868,6 +4146,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: None,
                     punctuation: Some(PunctSetting::On),
+                    strip_trailing_period: None,
                     builtin_replace_dict: None,
                     engine: None,
                 },
@@ -3904,6 +4183,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: None,
                     punctuation: None,
+                    strip_trailing_period: None,
                     builtin_replace_dict: Some(true),
                     engine: None,
                 },
@@ -3949,6 +4229,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: None,
                     punctuation: None,
+                    strip_trailing_period: None,
                     builtin_replace_dict: Some(true),
                     engine: None,
                 },
@@ -3990,6 +4271,7 @@ mod tests {
                 patch: SettingsPatch {
                     hotkey: None,
                     punctuation: None,
+                    strip_trailing_period: None,
                     builtin_replace_dict: Some(false),
                     engine: None,
                 },
@@ -4056,6 +4338,7 @@ mod tests {
                     patch: SettingsPatch {
                         hotkey: None,
                         punctuation: None,
+                        strip_trailing_period: None,
                         builtin_replace_dict: None,
                         engine: None,
                     },

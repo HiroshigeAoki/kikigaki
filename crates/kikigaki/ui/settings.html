@@ -35,12 +35,14 @@
               <button type="button" data-value="whisper" aria-pressed="false">高性能<small>約0.9GB</small></button>
             </div>
           </div>
-          <div class="row">
-            <div class="l"><b>句読点</b><small>「、」「。」を自動で入れます。チャット欄などでは文末の「。」だけ省けます</small></div>
+          <div class="row" id="punctRow">
+            <div class="l"><b>句読点</b><small id="punctNote">「、」「。」を自動で入れます。チャット欄などでは文末の「。」だけ省けます</small></div>
             <div class="seg" id="punctSeg" role="group" aria-label="句読点">
-              <button type="button" data-value="off" aria-pressed="false">付けない</button>
-              <button type="button" data-value="on" aria-pressed="false">付ける</button>
-              <button type="button" data-value="on_strip" aria-pressed="false">文末の「。」は除く</button>
+              <button type="button" data-punct-mode="local" data-value="off" aria-pressed="false">付けない</button>
+              <button type="button" data-punct-mode="local" data-value="on" aria-pressed="false">付ける</button>
+              <button type="button" data-punct-mode="local" data-value="on_strip" aria-pressed="false">文末の「。」は除く</button>
+              <button type="button" data-punct-mode="engine" data-strip="false" aria-pressed="false" hidden>文末の「。」を残す</button>
+              <button type="button" data-punct-mode="engine" data-strip="true" aria-pressed="false" hidden>文末の「。」を省く</button>
             </div>
           </div>
           <div class="row">

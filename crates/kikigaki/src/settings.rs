@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct SettingsPatch {
     pub hotkey: Option<String>,
     pub punctuation: Option<PunctSetting>,
+    pub strip_trailing_period: Option<bool>,
     /// JSON uses `builtinReplaceDict`; snapshots and persisted TOML stay snake_case.
     pub builtin_replace_dict: Option<bool>,
     pub engine: Option<kikigaki_core::config::EngineKind>,
@@ -32,6 +33,7 @@ pub struct SettingsSnapshot {
     pub paste_method: kikigaki_core::config::PasteMethod,
     pub engine: kikigaki_core::config::EngineKind,
     pub active_engine: kikigaki_core::config::EngineKind,
+    pub engine_punctuates: bool,
     pub whisper_available: bool,
 }
 
@@ -54,6 +56,7 @@ impl SettingsCoordinator {
         })
     }
 
+    /// UI-bound snapshots must use the controller's active-engine-aware `settings_snapshot()`.
     pub fn snapshot(&self) -> SettingsSnapshot {
         SettingsSnapshot {
             hotkey: self.config.hotkey.clone(),
@@ -63,6 +66,7 @@ impl SettingsCoordinator {
             paste_method: self.config.paste_method,
             engine: self.config.engine,
             active_engine: self.config.engine,
+            engine_punctuates: self.config.engine_punctuates(),
             whisper_available: self.capabilities.whisper && cfg!(target_os = "macos"),
         }
     }
@@ -112,6 +116,10 @@ impl SettingsCoordinator {
             } else {
                 PunctEnabled::Off
             };
+            candidate.strip_trailing_period = strip;
+        }
+        if let Some(strip) = patch.strip_trailing_period {
+            document["strip_trailing_period"] = toml_edit::value(strip);
             candidate.strip_trailing_period = strip;
         }
         if let Some(enabled) = patch.builtin_replace_dict {
@@ -220,6 +228,7 @@ mod tests {
 
         assert!(patch.hotkey.is_none());
         assert!(patch.punctuation.is_none());
+        assert!(patch.strip_trailing_period.is_none());
         assert!(patch.builtin_replace_dict.is_none());
         assert!(patch.engine.is_none());
     }
@@ -310,6 +319,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Cmd+Shift+Space".into()),
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
                 engine: None,
             })
@@ -343,6 +353,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: Some(true),
                 engine: None,
             })
@@ -375,6 +386,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
                 engine: Some(kikigaki_core::config::EngineKind::Whisper),
             })
@@ -404,6 +416,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
                 engine: Some(kikigaki_core::config::EngineKind::Whisper),
             })
@@ -455,6 +468,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
                 engine: None,
             })
@@ -484,11 +498,49 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: Some(PunctSetting::OnStrip),
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
                 engine: None,
             })
             .unwrap();
         assert!(snapshot.punct_enabled && snapshot.strip_trailing_period);
+    }
+
+    #[test]
+    fn strip_trailing_period_patch_persists_without_changing_punct_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "strip_trailing_period = true\n[punct]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
+            },
+        )
+        .unwrap();
+
+        let snapshot = coordinator
+            .apply(SettingsPatch {
+                strip_trailing_period: Some(false),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+
+        assert!(!snapshot.punct_enabled);
+        assert!(!snapshot.strip_trailing_period);
+        assert_eq!(coordinator.config().punct.enabled, PunctEnabled::Off);
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert!(
+            on_disk.contains("strip_trailing_period = false"),
+            "{on_disk}"
+        );
+        assert!(on_disk.contains("enabled = false"), "{on_disk}");
     }
 
     #[test]
@@ -532,6 +584,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Ctrl+Space".into()),
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
                 engine: None,
             })
@@ -560,6 +613,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: Some(true),
                 engine: None,
             })
@@ -591,6 +645,7 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Cmd+Space".into()),
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
                 engine: None,
             })

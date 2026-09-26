@@ -82,16 +82,30 @@ function applyStatus(status) {
   }
   document.getElementById('statusMain').textContent = statusMainText(status);
   document.getElementById('statusSub').textContent = status.message || `${status.hotkey} を押している間だけ聞き取ります`;
-  const strip = status.punct_enabled && status.strip_trailing_period ? '（文末の「。」は除く）' : '';
-  document.getElementById('statusHint').textContent = `${status.engine} · 句読点 ${status.punct_enabled ? 'on' : 'off'}${strip}`;
+  let punctuation;
+  if (status.engine_punctuates) {
+    punctuation = `自動（文末の「。」を${status.strip_trailing_period ? '省く' : '残す'}）`;
+  } else {
+    const strip = status.punct_enabled && status.strip_trailing_period ? '（文末の「。」は除く）' : '';
+    punctuation = `${status.punct_enabled ? 'on' : 'off'}${strip}`;
+  }
+  document.getElementById('statusHint').textContent = `${status.engine} · 句読点 ${punctuation}`;
   renderChord(status.hotkey);
 }
 
 function applyPunctSeg(settings) {
   const value = !settings.punct_enabled ? 'off' : settings.strip_trailing_period ? 'on_strip' : 'on';
   for (const button of document.querySelectorAll('#punctSeg button')) {
-    button.setAttribute('aria-pressed', String(button.dataset.value === value));
+    const engineControl = button.dataset.punctMode === 'engine';
+    button.hidden = engineControl !== settings.engine_punctuates;
+    const pressed = engineControl
+      ? button.dataset.strip === String(settings.strip_trailing_period)
+      : button.dataset.value === value;
+    button.setAttribute('aria-pressed', String(pressed));
   }
+  document.getElementById('punctNote').textContent = settings.engine_punctuates
+    ? '高性能では句読点は自動で入ります'
+    : '「、」「。」を自動で入れます。チャット欄などでは文末の「。」だけ省けます';
 }
 
 function applyEngineSeg(settings) {
@@ -524,7 +538,10 @@ for (const button of document.querySelectorAll('#punctSeg button')) {
     const buttons = [...document.querySelectorAll('#punctSeg button')];
     for (const control of buttons) control.disabled = true;
     try {
-      const settings = await invoke('apply_settings', { patch: { punctuation: button.dataset.value } });
+      const patch = button.dataset.punctMode === 'engine'
+        ? { stripTrailingPeriod: button.dataset.strip === 'true' }
+        : { punctuation: button.dataset.value };
+      const settings = await invoke('apply_settings', { patch });
       cacheSettings(settings);
       applyPunctSeg(settings);
     } catch (error) {

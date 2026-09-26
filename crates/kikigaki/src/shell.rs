@@ -325,6 +325,7 @@ fn default_snapshot(
     let engine = match settings.config().engine {
         kikigaki_core::config::EngineKind::Local => "local",
         kikigaki_core::config::EngineKind::Remote => "remote",
+        kikigaki_core::config::EngineKind::Whisper => "whisper",
     };
     let phase = if bootstrap_error.is_some() {
         "failed"
@@ -396,6 +397,9 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
             #[cfg(not(feature = "remote-engine"))]
             kikigaki_core::config::EngineKind::Remote => {
                 anyhow::bail!("engine = \"remote\" requires a build with the remote-engine feature")
+            }
+            kikigaki_core::config::EngineKind::Whisper => {
+                anyhow::bail!("engine = \"whisper\" is not implemented yet")
             }
         }
     }

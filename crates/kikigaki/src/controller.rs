@@ -1164,6 +1164,7 @@ impl Controller {
                 engine: match self.settings.config().engine {
                     EngineKind::Local => "local",
                     EngineKind::Remote => "remote",
+                    EngineKind::Whisper => "whisper",
                 },
             },
             settings,
@@ -1774,6 +1775,7 @@ mod tests {
         let engine_name = match engine_kind {
             EngineKind::Local => "local",
             EngineKind::Remote => "remote",
+            EngineKind::Whisper => "whisper",
         };
         std::fs::write(
             &config_path,

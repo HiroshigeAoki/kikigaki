@@ -49,6 +49,8 @@ pub enum EngineKind {
     Local,
     /// Connect to a hayamimi WebSocket server.
     Remote,
+    /// Run Whisper large-v3-turbo in this process via whisper-rs.
+    Whisper,
 }
 
 /// Method used to insert transcribed text into the frontmost application.
@@ -504,6 +506,18 @@ mod tests {
             .learned_file
             .ends_with(".config/kikigaki/learned.toml"));
         assert!(default_path().ends_with(".config/kikigaki/config.toml"));
+    }
+
+    #[test]
+    fn engine_kind_whisper_round_trips_through_toml() {
+        let cfg = Config {
+            engine: EngineKind::Whisper,
+            ..Config::default()
+        };
+        let actual: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(actual.engine, EngineKind::Whisper);
+        let raw = toml::to_string(&cfg).unwrap();
+        assert!(raw.contains("engine = \"whisper\""), "{raw}");
     }
 
     #[test]

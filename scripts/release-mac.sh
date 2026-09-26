@@ -54,7 +54,7 @@ fi
 # `--bundles app` only: tauri's DMG bundler (a create-dmg fork) drives Finder through AppleScript to
 # lay out the volume window, which times out from a non-GUI session (ssh: "AppleEvent timed out
 # (-1712)"). The DMG is built below with hdiutil instead, which needs no GUI and is deterministic.
-cargo tauri build --bundles app --config "$SIGN_CFG" -- --locked --no-default-features --features punct
+cargo tauri build --bundles app --config "$SIGN_CFG" -- --locked --no-default-features --features punct,whisper-metal
 
 TARGET_DIR=$(cargo metadata --format-version=1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 APP_DIR="$TARGET_DIR/release/bundle/macos"

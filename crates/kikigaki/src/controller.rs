@@ -1070,6 +1070,7 @@ impl Controller {
                 }
                 Output::Cancel { gen } => {
                     if let Some(supervisor) = self.supervisor.as_ref() {
+                        supervisor.cancel(gen);
                         send_command(supervisor, EngineCmd::Cancel { gen });
                     }
                     self.pending_finals.remove(&gen);
@@ -1387,8 +1388,9 @@ mod tests {
 
     struct TestEngine {
         sink: AudioSink,
-        _commands: Receiver<EngineCmd>,
+        _commands: Arc<Mutex<Receiver<EngineCmd>>>,
         events: Receiver<EngineMsg>,
+        state: Arc<FakeEngineState>,
     }
 
     impl Engine for TestEngine {
@@ -1398,6 +1400,10 @@ mod tests {
 
         fn events(&mut self) -> &mut Receiver<EngineMsg> {
             &mut self.events
+        }
+
+        fn cancel(&self, gen: u64) {
+            self.state.canceled.lock().unwrap().push(gen);
         }
 
         fn shutdown(self: Box<Self>) {
@@ -1418,6 +1424,8 @@ mod tests {
         observed_enabled: Mutex<Vec<bool>>,
         plans: Mutex<VecDeque<FakeEngineBuild>>,
         event_senders: Mutex<Vec<SyncSender<EngineMsg>>>,
+        canceled: Mutex<Vec<u64>>,
+        command_receivers: Mutex<Vec<Arc<Mutex<Receiver<EngineCmd>>>>>,
     }
 
     impl FakeEngineState {
@@ -1464,10 +1472,17 @@ mod tests {
                         event_tx.send(EngineMsg::Ready).unwrap();
                     }
                     let (sink, commands) = engine::channel();
+                    let commands = Arc::new(Mutex::new(commands));
+                    self.state
+                        .command_receivers
+                        .lock()
+                        .unwrap()
+                        .push(Arc::clone(&commands));
                     Ok(Box::new(TestEngine {
                         sink,
                         _commands: commands,
                         events,
+                        state: Arc::clone(&self.state),
                     }))
                 }
             }
@@ -1981,6 +1996,34 @@ mod tests {
         assert!(
             poll(|| harness.pastes.attempts.lock().unwrap().len() > attempts),
             "paste was not attempted"
+        );
+    }
+
+    #[test]
+    fn repress_while_finalizing_aborts_and_enqueues_cancel_before_the_next_begin() {
+        let harness = ready_harness();
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
+        harness.hotkey.send(HotkeyEdge::Released);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
+
+        harness.hotkey.send(HotkeyEdge::Pressed);
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
+
+        assert_eq!(*harness.engine.canceled.lock().unwrap(), vec![1]);
+        let receivers = harness.engine.command_receivers.lock().unwrap();
+        let commands: Vec<_> = receivers[0].lock().unwrap().try_iter().collect();
+        assert_eq!(
+            commands,
+            vec![
+                EngineCmd::Begin { gen: 1 },
+                EngineCmd::End {
+                    gen: 1,
+                    pad_ms: 500,
+                },
+                EngineCmd::Cancel { gen: 1 },
+                EngineCmd::Begin { gen: 2 },
+            ]
         );
     }
 

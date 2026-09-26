@@ -4,9 +4,14 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use anyhow::Context;
-use kikigaki_core::engine::{AudioSink, EngineCmd, EngineMsg, EventSender};
+#[cfg(test)]
+use kikigaki_core::engine::run_worker;
+use kikigaki_core::engine::{
+    join_workers, AudioSink, Engine, EngineCmd, EngineMsg, EventSender, Waker,
+};
 
 use crate::framer::Framer;
 use crate::local::{Recognizer, Vad};
@@ -62,6 +67,94 @@ impl DecodeCancel {
 impl Default for DecodeCancel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// In-process Whisper transcription engine.
+pub struct WhisperEngine {
+    sink: AudioSink,
+    events_rx: Receiver<EngineMsg>,
+    events_tx: EventSender,
+    done_rx: Receiver<()>,
+    worker: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    decode_cancel: DecodeCancel,
+}
+
+impl WhisperEngine {
+    #[cfg(test)]
+    fn start_with(
+        vad: Box<dyn Vad + Send>,
+        recognizer: Box<dyn Recognizer + Send>,
+        shutdown: Arc<AtomicBool>,
+        decode_cancel: DecodeCancel,
+    ) -> Self {
+        let (sink, cmds) = kikigaki_core::engine::channel();
+        let (events_tx, events_rx) = kikigaki_core::engine::event_channel(32);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_sink = sink.clone();
+        let worker_events = events_tx.clone();
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_decode_cancel = decode_cancel.clone();
+        let failure_reporter = events_tx.clone();
+        let worker = std::thread::Builder::new()
+            .name("whisper-engine-test".into())
+            .spawn(move || {
+                run_worker(
+                    &failure_reporter,
+                    &done_tx,
+                    std::panic::AssertUnwindSafe(move || {
+                        run_whisper_worker(
+                            cmds,
+                            worker_events,
+                            worker_sink,
+                            vad,
+                            recognizer,
+                            worker_shutdown,
+                            worker_decode_cancel,
+                        )
+                    }),
+                );
+            })
+            .expect("spawn test Whisper engine worker");
+
+        Self {
+            sink,
+            events_rx,
+            events_tx,
+            done_rx,
+            worker: Some(worker),
+            shutdown,
+            decode_cancel,
+        }
+    }
+}
+
+impl Engine for WhisperEngine {
+    fn sink(&self) -> AudioSink {
+        self.sink.clone()
+    }
+
+    fn events(&mut self) -> &mut Receiver<EngineMsg> {
+        &mut self.events_rx
+    }
+
+    fn set_waker(&mut self, waker: Option<Waker>) {
+        self.events_tx.set_waker(waker);
+    }
+
+    fn cancel(&self, gen: u64) {
+        self.decode_cancel.cancel(gen);
+    }
+
+    fn shutdown(mut self: Box<Self>) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = self.sink.send(EngineCmd::Shutdown);
+        join_workers(
+            [(&mut self.worker, "whisper engine worker")],
+            &self.done_rx,
+            "whisper engine",
+        );
     }
 }
 
@@ -164,7 +257,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use kikigaki_core::engine::{self, EngineCmd, EngineMsg};
+    use kikigaki_core::engine::{self, Engine, EngineCmd, EngineMsg};
 
     use super::*;
     use crate::local::{Recognizer, Vad, VadSegment};
@@ -367,6 +460,71 @@ mod tests {
             events_rx.try_recv().is_err(),
             "a canceled decode must not emit a Final for its generation"
         );
+    }
+
+    #[test]
+    fn shutdown_sets_the_abort_flag_before_or_with_the_shutdown_send() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let decode_cancel = DecodeCancel::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let recognizer = AbortAwareRecognizer {
+            shutdown: Arc::clone(&shutdown),
+            decode_cancel: decode_cancel.clone(),
+            entered: entered_tx,
+        };
+        let engine = WhisperEngine::start_with(
+            Box::new(AlwaysSpeechVad),
+            Box::new(recognizer),
+            Arc::clone(&shutdown),
+            decode_cancel,
+        );
+        let sink = engine.sink();
+        sink.send(EngineCmd::Begin { gen: 1 }).unwrap();
+        sink.send(EngineCmd::Audio(vec![0.1; 512])).unwrap();
+        sink.send(EngineCmd::End { gen: 1, pad_ms: 0 }).unwrap();
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker never entered the decode for generation 1");
+        let started = std::time::Instant::now();
+        Box::new(engine).shutdown();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "shutdown must not wait out the full blocking decode"
+        );
+    }
+
+    #[test]
+    fn engine_cancel_aborts_an_in_flight_decode_and_emits_no_final() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let decode_cancel = DecodeCancel::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let recognizer = AbortAwareRecognizer {
+            shutdown: Arc::clone(&shutdown),
+            decode_cancel: decode_cancel.clone(),
+            entered: entered_tx,
+        };
+        let mut engine = WhisperEngine::start_with(
+            Box::new(AlwaysSpeechVad),
+            Box::new(recognizer),
+            shutdown,
+            decode_cancel,
+        );
+        let sink = engine.sink();
+        sink.send(EngineCmd::Begin { gen: 7 }).unwrap();
+        sink.send(EngineCmd::Audio(vec![0.1; 512])).unwrap();
+        sink.send(EngineCmd::End { gen: 7, pad_ms: 0 }).unwrap();
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker never entered the decode for generation 7");
+        engine.cancel(7);
+        let result = engine.events().recv_timeout(Duration::from_millis(500));
+        assert!(
+            result.is_err(),
+            "expected no Final after a canceled decode, got {result:?}"
+        );
+        Box::new(engine).shutdown();
     }
 
     #[test]

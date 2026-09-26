@@ -83,13 +83,27 @@ fn whisper_transcribes_test_ja_1_without_crashing() {
     let mut recognizer = kikigaki_engine::whisper_recognizer::build_whisper_recognizer(
         &PathBuf::from(dir),
         false,
-        shutdown,
+        Arc::clone(&shutdown),
         decode_cancel,
     )
     .unwrap();
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    let abort_started = Instant::now();
+    assert!(
+        recognizer.transcribe(&samples).is_none(),
+        "shutdown should abort transcription"
+    );
+    assert!(
+        abort_started.elapsed() < Duration::from_secs(30),
+        "shutdown abort took {:?}",
+        abort_started.elapsed()
+    );
+
+    shutdown.store(false, std::sync::atomic::Ordering::Relaxed);
     let text = recognizer
         .transcribe(&samples)
         .expect("recognizer returned no result");
+    eprintln!("Whisper transcription: {text:?}");
     assert!(
         !text.trim().is_empty(),
         "expected non-empty transcription, got {text:?}"

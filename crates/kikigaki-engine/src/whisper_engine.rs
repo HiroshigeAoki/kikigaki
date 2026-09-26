@@ -98,6 +98,11 @@ impl DecodeCancel {
         self.decoding_gen.store(gen, Ordering::Relaxed);
     }
 
+    #[cfg(all(test, feature = "whisper"))]
+    pub(crate) fn begin_for_test(&self, gen: u64) {
+        self.begin(gen);
+    }
+
     /// Clears the in-flight generation and returns whether its decode was canceled.
     fn end(&self) -> bool {
         self.decoding_gen.store(NO_GENERATION, Ordering::Relaxed);

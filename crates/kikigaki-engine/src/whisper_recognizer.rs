@@ -1,5 +1,6 @@
 //! whisper-rs-backed [`Recognizer`] implementation.
 
+use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,17 @@ use whisper_rs::{
 use crate::local::Recognizer;
 use crate::whisper_engine::DecodeCancel;
 use crate::whisper_guard::audio_ctx_for;
+
+struct AbortState {
+    shutdown: Arc<AtomicBool>,
+    decode_cancel: DecodeCancel,
+}
+
+unsafe extern "C" fn whisper_abort(user_data: *mut c_void) -> bool {
+    // SAFETY: The caller guarantees that `user_data` points to a live `AbortState`.
+    let abort_state = unsafe { &*user_data.cast::<AbortState>() };
+    abort_state.shutdown.load(Ordering::Relaxed) || abort_state.decode_cancel.should_abort()
+}
 
 /// Loads the pinned Whisper model from its managed model directory.
 pub fn build_whisper_recognizer(
@@ -30,8 +42,7 @@ pub fn build_whisper_recognizer(
 pub struct WhisperRecognizer {
     context: WhisperContext,
     state: Option<WhisperState>,
-    shutdown: Arc<AtomicBool>,
-    decode_cancel: DecodeCancel,
+    abort_state: Box<AbortState>,
 }
 
 impl WhisperRecognizer {
@@ -56,8 +67,10 @@ impl WhisperRecognizer {
         Ok(Self {
             context,
             state: Some(state),
-            shutdown,
-            decode_cancel,
+            abort_state: Box::new(AbortState {
+                shutdown,
+                decode_cancel,
+            }),
         })
     }
 
@@ -91,15 +104,19 @@ impl Recognizer for WhisperRecognizer {
         params.set_print_special(false);
         params.set_print_timestamps(false);
         params.set_single_segment(false);
-        let shutdown = Arc::clone(&self.shutdown);
-        let decode_cancel = self.decode_cancel.clone();
-        params.set_abort_callback_safe(move || {
-            shutdown.load(Ordering::Relaxed) || decode_cancel.should_abort()
-        });
+        let abort_state = std::ptr::from_ref(self.abort_state.as_ref())
+            .cast_mut()
+            .cast::<c_void>();
+        // SAFETY: `abort_state` is owned by `self`, has a stable heap address, and outlives the
+        // synchronous `state.full(params, samples)` call. The callback only reads atomics.
+        unsafe {
+            params.set_abort_callback(Some(whisper_abort));
+            params.set_abort_callback_user_data(abort_state);
+        }
 
         if let Err(error) = self.state.as_mut()?.full(params, samples) {
-            let aborted =
-                self.shutdown.load(Ordering::Relaxed) || self.decode_cancel.should_abort();
+            let aborted = self.abort_state.shutdown.load(Ordering::Relaxed)
+                || self.abort_state.decode_cancel.should_abort();
             if !aborted {
                 tracing::error!(%error, "whisper decode failed (not an abort)");
                 self.state = None;
@@ -113,5 +130,34 @@ impl Recognizer for WhisperRecognizer {
             text.push_str(state.get_segment(index)?.to_str().ok()?);
         }
         Some(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abort_callback_reflects_shutdown_and_decode_cancellation() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let decode_cancel = DecodeCancel::new();
+        let abort_state = AbortState {
+            shutdown: Arc::clone(&shutdown),
+            decode_cancel: decode_cancel.clone(),
+        };
+        let user_data = std::ptr::from_ref(&abort_state).cast_mut().cast();
+
+        // SAFETY: `user_data` points to `abort_state`, which remains alive for every call.
+        unsafe {
+            assert!(!whisper_abort(user_data));
+
+            shutdown.store(true, Ordering::Relaxed);
+            assert!(whisper_abort(user_data));
+
+            shutdown.store(false, Ordering::Relaxed);
+            decode_cancel.begin_for_test(7);
+            decode_cancel.cancel(7);
+            assert!(whisper_abort(user_data));
+        }
     }
 }

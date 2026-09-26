@@ -31,9 +31,8 @@ use crate::whisper_guard::{collapse_immediate_repetition, drop_stock_hallucinati
 pub const WARMUP_SAMPLES: usize = 5_120;
 
 /// Runs one throwaway decode on `WARMUP_SAMPLES` samples of silence and discards the result.
-/// Called by the real loader (task D2's `WhisperEngine::start` wiring) once models are loaded,
-/// before `Ready` is sent — mirrors `local.rs`'s model-load logging pattern
-/// (`local.rs:246`'s `vad_load_ms, asr_load_ms`), just for a warm-up decode instead of a load.
+/// Called by `WhisperEngine::start` once models are loaded and before `Ready` is sent, so the
+/// first user utterance does not pay the one-time decode setup cost.
 pub fn run_warmup(asr: &mut dyn Recognizer) {
     let silence = vec![0.0f32; WARMUP_SAMPLES];
     let _ = asr.transcribe(&silence);
@@ -79,7 +78,7 @@ const NO_GENERATION: u64 = u64::MAX;
 /// The generation token ensures that stale cancellation requests cannot affect a later decode.
 #[derive(Clone)]
 pub struct DecodeCancel {
-    canceled: Arc<AtomicBool>,
+    canceled_gen: Arc<AtomicU64>,
     decoding_gen: Arc<AtomicU64>,
 }
 
@@ -87,14 +86,14 @@ impl DecodeCancel {
     /// Creates an idle per-decode cancellation signal.
     pub fn new() -> Self {
         Self {
-            canceled: Arc::new(AtomicBool::new(false)),
+            canceled_gen: Arc::new(AtomicU64::new(NO_GENERATION)),
             decoding_gen: Arc::new(AtomicU64::new(NO_GENERATION)),
         }
     }
 
     /// Publishes that the worker is about to decode `gen` and clears stale cancellation state.
     fn begin(&self, gen: u64) {
-        self.canceled.store(false, Ordering::Relaxed);
+        self.canceled_gen.store(NO_GENERATION, Ordering::Relaxed);
         self.decoding_gen.store(gen, Ordering::Relaxed);
     }
 
@@ -105,20 +104,26 @@ impl DecodeCancel {
 
     /// Clears the in-flight generation and returns whether its decode was canceled.
     fn end(&self) -> bool {
-        self.decoding_gen.store(NO_GENERATION, Ordering::Relaxed);
-        self.canceled.swap(false, Ordering::Relaxed)
+        let decoding_gen = self.decoding_gen.swap(NO_GENERATION, Ordering::Relaxed);
+        let canceled_gen = self.canceled_gen.swap(NO_GENERATION, Ordering::Relaxed);
+        decoding_gen != NO_GENERATION && canceled_gen == decoding_gen
     }
 
     /// Requests cancellation if `gen` is the generation currently being decoded.
     pub fn cancel(&self, gen: u64) {
         if self.decoding_gen.load(Ordering::Relaxed) == gen {
-            self.canceled.store(true, Ordering::Relaxed);
+            self.record_cancellation(gen);
         }
+    }
+
+    fn record_cancellation(&self, gen: u64) {
+        self.canceled_gen.store(gen, Ordering::Relaxed);
     }
 
     /// Returns whether the current decode has been asked to stop.
     pub fn should_abort(&self) -> bool {
-        self.canceled.load(Ordering::Relaxed)
+        let decoding_gen = self.decoding_gen.load(Ordering::Relaxed);
+        decoding_gen != NO_GENERATION && self.canceled_gen.load(Ordering::Relaxed) == decoding_gen
     }
 }
 
@@ -272,13 +277,13 @@ where
     let vad = make_vad().map_err(|error| model_load_error(VAD_MODEL_ID, error))?;
     let vad_load_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let mut asr = make_asr().map_err(|error| model_load_error(WHISPER_MODEL_ID, error))?;
-    let model_load_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let whisper_load_ms = started.elapsed().as_secs_f64() * 1_000.0 - vad_load_ms;
     let warmup_started = Instant::now();
     run_warmup(asr.as_mut());
     let warmup_ms = warmup_started.elapsed().as_secs_f64() * 1_000.0;
     tracing::info!(
-        model_load_ms,
         vad_load_ms,
+        whisper_load_ms,
         warmup_ms,
         "whisper engine models loaded"
     );
@@ -861,6 +866,24 @@ mod tests {
         let decode_cancel = DecodeCancel::new();
         decode_cancel.begin(1);
         decode_cancel.cancel(2);
+        assert!(!decode_cancel.should_abort());
+        assert!(!decode_cancel.end());
+    }
+
+    #[test]
+    fn late_cancel_for_finished_generation_does_not_abort_next_decode() {
+        let decode_cancel = DecodeCancel::new();
+        decode_cancel.begin(1);
+        assert_eq!(
+            decode_cancel.decoding_gen.load(Ordering::Relaxed),
+            1,
+            "cancel observed generation 1 before being preempted"
+        );
+
+        assert!(!decode_cancel.end());
+        decode_cancel.begin(2);
+        decode_cancel.record_cancellation(1);
+
         assert!(!decode_cancel.should_abort());
         assert!(!decode_cancel.end());
     }

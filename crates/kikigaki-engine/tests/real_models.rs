@@ -62,12 +62,8 @@ fn transcribe_test_ja_1_golden() {
 #[test]
 fn whisper_transcribes_test_ja_1_without_crashing() {
     let Some(dir) = std::env::var_os("KIKIGAKI_MODELS_DIR") else {
-        // Soft-skip is right for a developer machine that hasn't cached the models — but Phase
-        // I's acceptance run must not be able to silently pass by having the model simply be
-        // missing. `KIKIGAKI_REQUIRE_REAL_MODELS=1` (any non-empty value) turns this into a hard
-        // failure instead, distinguishing "developer machine without the model, softly skip" from
-        // "acceptance run that must have the model, fail loudly if it's absent." See task I2 for
-        // where this is set.
+        // Soft-skip on developer machines without cached models. Required real-model runs set
+        // `KIKIGAKI_REQUIRE_REAL_MODELS=1` (any non-empty value) to turn this into a hard failure.
         if std::env::var_os("KIKIGAKI_REQUIRE_REAL_MODELS").is_some() {
             panic!(
                 "KIKIGAKI_MODELS_DIR is unset but KIKIGAKI_REQUIRE_REAL_MODELS=1 — this run must \
@@ -108,9 +104,8 @@ fn whisper_transcribes_test_ja_1_without_crashing() {
         !text.trim().is_empty(),
         "expected non-empty transcription, got {text:?}"
     );
-    // Deliberately not asserting exact text here (unlike the Reazon golden test) — Whisper's
-    // exact output is measured via the hotword-eval harness against the 45-wav set (task G1 +
-    // the acceptance rubric), which is the actual bar this feature is held to.
+    // Deliberately not asserting exact text here (unlike the Reazon golden test): the
+    // hotword-eval harness measures Whisper's output against the full 45-wav evaluation set.
 }
 
 #[test]

@@ -2,8 +2,8 @@
 //! No dependency on whisper-rs: these are ordinary string/duration functions, unit-tested
 //! without a model or the `whisper` feature.
 
-/// Returns the `audio_ctx` value to pass to whisper.cpp for a clip of this duration, per the
-/// design's PoC finding that `audio_ctx=750` silently truncates tails past ~12-15 s.
+/// Returns the `audio_ctx` value to pass to whisper.cpp for a clip of this duration. The reduced
+/// context speeds up short clips but can silently truncate the tail of clips longer than ~12-15 s.
 ///
 /// `None` means "full context" (no audio_ctx override).
 pub fn audio_ctx_for(duration_ms: u64) -> Option<i32> {
@@ -31,8 +31,8 @@ pub fn drop_stock_hallucination(text: &str) -> &str {
     }
 }
 
-/// Collapses an exact immediate repetition of the whole decoded text (observed once during the
-/// PoC's live Mac try-out: "one take produced the sentence twice").
+/// Collapses an exact immediate repetition of the whole decoded text, a failure mode observed
+/// during manual Whisper testing on macOS.
 pub fn collapse_immediate_repetition(text: &str) -> &str {
     let trimmed = text.trim();
     if trimmed.is_empty() {

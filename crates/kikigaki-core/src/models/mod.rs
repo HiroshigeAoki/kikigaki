@@ -292,6 +292,7 @@ mod tests {
             Capabilities {
                 punct: false,
                 remote_engine: true,
+                whisper: false,
             },
             false
         )
@@ -301,6 +302,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
             true,
         );
@@ -316,6 +318,7 @@ mod tests {
             Capabilities {
                 punct: false,
                 remote_engine: true,
+                whisper: false,
             },
             false,
         );

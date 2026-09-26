@@ -268,6 +268,8 @@ pub struct Capabilities {
     pub punct: bool,
     /// Whether the remote WebSocket engine is available.
     pub remote_engine: bool,
+    /// Whether the Whisper engine (whisper-rs) is compiled into this build.
+    pub whisper: bool,
 }
 
 impl Default for Config {
@@ -360,6 +362,9 @@ impl Config {
         }
         if self.engine == EngineKind::Remote && !caps.remote_engine {
             bail!("engine = \"remote\" requires a build with the remote-engine feature");
+        }
+        if self.engine == EngineKind::Whisper && !caps.whisper {
+            bail!("engine = \"whisper\" requires a build with the whisper feature");
         }
         if self.remote.spawn_sidecar {
             let (host, _) = sidecar_endpoint(&self.remote.ws_url)?;
@@ -566,6 +571,7 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         };
         for hotwords_score in [0.0, f32::INFINITY, f32::NAN, -1.0] {
             let mut config = Config::default();
@@ -624,6 +630,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -632,6 +639,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -640,6 +648,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         let cfg = Config {
@@ -650,6 +659,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -658,12 +668,14 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         assert!(Config::default()
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
+                whisper: false,
             })
             .is_ok());
     }
@@ -676,6 +688,7 @@ mod tests {
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
+                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("punct"));
@@ -683,6 +696,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_ok());
     }
@@ -697,6 +711,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: false,
+                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("remote-engine"));
@@ -704,6 +719,30 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_whisper_engine_without_the_feature_when_capabilities_say_so() {
+        let cfg = Config {
+            engine: EngineKind::Whisper,
+            ..Config::default()
+        };
+        let error = cfg
+            .validate(Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: false,
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("whisper"));
+        assert!(cfg
+            .validate(Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
             })
             .is_ok());
     }
@@ -716,6 +755,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("loopback"));
@@ -730,6 +770,7 @@ mod tests {
                 cfg.validate(Capabilities {
                     punct: true,
                     remote_engine: true,
+                    whisper: false,
                 })
                 .is_ok(),
                 "{url}"
@@ -742,6 +783,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_ok());
     }
@@ -752,15 +794,18 @@ mod tests {
         assert!(cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         }));
         assert!(!cfg.punct.effective(Capabilities {
             punct: false,
             remote_engine: true,
+            whisper: false,
         }));
         cfg.punct.enabled = PunctEnabled::Off;
         assert!(!cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         }));
 
         cfg.punct.enabled = PunctEnabled::On;
@@ -771,6 +816,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             }
         ));
         cfg.remote.server_punctuates = false;
@@ -779,6 +825,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             }
         ));
     }

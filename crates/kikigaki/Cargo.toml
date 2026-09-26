@@ -17,6 +17,7 @@ default = ["punct"]
 punct = ["kikigaki-engine/punct"]
 devtools = ["tauri/devtools"]
 remote-engine = ["kikigaki-core/remote-engine"]
+whisper = []
 
 [dependencies]
 kikigaki-core = { path = "../kikigaki-core" }

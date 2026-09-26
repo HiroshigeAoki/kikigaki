@@ -158,6 +158,7 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         };
 
         assert!(StartupPlan::from_config(&config, caps).required.is_empty());
@@ -186,6 +187,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         );
         let (tx, rx) = mpsc::sync_channel(1);

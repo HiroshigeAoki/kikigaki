@@ -1788,6 +1788,7 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         };
         let settings = SettingsCoordinator::load(config_path, capabilities).unwrap();
         let (client, rx, hotkey, hotkey_rx) = client_channels();

@@ -251,6 +251,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -281,6 +282,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -311,6 +313,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -340,6 +343,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -367,6 +371,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -384,6 +389,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -408,6 +414,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -439,6 +446,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();

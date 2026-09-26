@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use kikigaki_core::config::{Capabilities, Config, PunctEnabled};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
     pub hotkey: Option<String>,
@@ -31,6 +31,7 @@ pub struct SettingsSnapshot {
     pub builtin_replace_dict: bool,
     pub paste_method: kikigaki_core::config::PasteMethod,
     pub engine: kikigaki_core::config::EngineKind,
+    pub active_engine: kikigaki_core::config::EngineKind,
     pub whisper_available: bool,
 }
 
@@ -61,6 +62,7 @@ impl SettingsCoordinator {
             builtin_replace_dict: self.config.builtin_replace_dict,
             paste_method: self.config.paste_method,
             engine: self.config.engine,
+            active_engine: self.config.engine,
             whisper_available: self.capabilities.whisper && cfg!(target_os = "macos"),
         }
     }
@@ -199,7 +201,7 @@ pub fn parse_chord(chord: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kikigaki_core::config::Capabilities;
+    use kikigaki_core::config::{Capabilities, EngineKind};
 
     #[test]
     fn builtin_replace_dict_patch_uses_camel_case_json_wire_key() {
@@ -210,6 +212,36 @@ mod tests {
         let snake_case: SettingsPatch =
             serde_json::from_str(r#"{"builtin_replace_dict": true}"#).unwrap();
         assert_eq!(snake_case.builtin_replace_dict, None);
+    }
+
+    #[test]
+    fn settings_patch_default_changes_nothing() {
+        let patch = SettingsPatch::default();
+
+        assert!(patch.hotkey.is_none());
+        assert!(patch.punctuation.is_none());
+        assert!(patch.builtin_replace_dict.is_none());
+        assert!(patch.engine.is_none());
+    }
+
+    #[test]
+    fn coordinator_snapshot_initializes_active_engine_from_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "engine = \"local\"\n").unwrap();
+        let coordinator = SettingsCoordinator::load(
+            path,
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
+            },
+        )
+        .unwrap();
+
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.engine, EngineKind::Local);
+        assert_eq!(snapshot.active_engine, EngineKind::Local);
     }
 
     #[test]

@@ -201,7 +201,7 @@ fn start_controller(
     }
     let startup_plan = kikigaki_core::startup::StartupPlan::from_config(&cfg, capabilities);
     let engine_factory = Arc::new(TauriEngineFactory {
-        engine_kind: cfg.engine,
+        engine_kind: Mutex::new(cfg.engine),
         local_models_dir: cfg.models_dir.clone(),
         local_asr_cfg: cfg.asr.clone(),
         local_vad_cfg: cfg.vad.clone(),
@@ -249,6 +249,7 @@ fn start_controller(
         Box::new(crate::mic::Mic::new()),
         postprocess_factory,
         startup_port,
+        Box::new(|plan| Box::new(crate::startup::StartupCoordinatorPort::new(plan))),
         Box::new(crate::controller::RealClock),
     );
     let controller_death = spawn_controller_death_monitor(handle.clone(), exited_rx);
@@ -353,7 +354,7 @@ fn default_snapshot(
 }
 
 struct TauriEngineFactory {
-    engine_kind: kikigaki_core::config::EngineKind,
+    engine_kind: Mutex<kikigaki_core::config::EngineKind>,
     local_models_dir: std::path::PathBuf,
     local_asr_cfg: kikigaki_core::config::AsrConfig,
     local_vad_cfg: kikigaki_core::config::VadConfig,
@@ -365,7 +366,8 @@ struct TauriEngineFactory {
 
 impl crate::controller::EngineFactory for TauriEngineFactory {
     fn build(&self) -> anyhow::Result<Box<dyn kikigaki_core::engine::Engine>> {
-        match self.engine_kind {
+        let kind = *self.engine_kind.lock().unwrap();
+        match kind {
             kikigaki_core::config::EngineKind::Local => {
                 let enabled = self.hotwords_enabled.load(Ordering::Relaxed);
                 let hotwords_score = kikigaki_engine::hotwords::resolve_hotword_arg(
@@ -416,6 +418,10 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
 
     fn set_hotwords_enabled(&self, enabled: bool) {
         self.hotwords_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_engine_kind(&self, kind: kikigaki_core::config::EngineKind) {
+        *self.engine_kind.lock().unwrap() = kind;
     }
 }
 

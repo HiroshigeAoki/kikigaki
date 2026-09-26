@@ -1,0 +1,380 @@
+//! Utterance-mode worker for the Whisper engine: no mid-utterance decoding, one decode per
+//! utterance at `End`, VAD used only as an empty-speech guard.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+
+use anyhow::Context;
+use kikigaki_core::engine::{AudioSink, EngineCmd, EngineMsg, EventSender};
+
+use crate::framer::Framer;
+use crate::local::{Recognizer, Vad};
+use crate::whisper_guard::{collapse_immediate_repetition, drop_stock_hallucination};
+
+/// Sentinel meaning "not currently decoding" for `DecodeCancel::decoding_gen`.
+const NO_GENERATION: u64 = u64::MAX;
+
+/// Per-decode cancellation signal shared between the worker and the engine controller.
+///
+/// This signal is reset before every decode and affects only the utterance currently in flight.
+/// The generation token ensures that stale cancellation requests cannot affect a later decode.
+#[derive(Clone)]
+pub struct DecodeCancel {
+    canceled: Arc<AtomicBool>,
+    decoding_gen: Arc<AtomicU64>,
+}
+
+impl DecodeCancel {
+    /// Creates an idle per-decode cancellation signal.
+    pub fn new() -> Self {
+        Self {
+            canceled: Arc::new(AtomicBool::new(false)),
+            decoding_gen: Arc::new(AtomicU64::new(NO_GENERATION)),
+        }
+    }
+
+    /// Publishes that the worker is about to decode `gen` and clears stale cancellation state.
+    fn begin(&self, gen: u64) {
+        self.canceled.store(false, Ordering::Relaxed);
+        self.decoding_gen.store(gen, Ordering::Relaxed);
+    }
+
+    /// Clears the in-flight generation and returns whether its decode was canceled.
+    fn end(&self) -> bool {
+        self.decoding_gen.store(NO_GENERATION, Ordering::Relaxed);
+        self.canceled.swap(false, Ordering::Relaxed)
+    }
+
+    /// Requests cancellation if `gen` is the generation currently being decoded.
+    pub fn cancel(&self, gen: u64) {
+        if self.decoding_gen.load(Ordering::Relaxed) == gen {
+            self.canceled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns whether the current decode has been asked to stop.
+    pub fn should_abort(&self) -> bool {
+        self.canceled.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for DecodeCancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Runs the ordered Whisper utterance-mode decode loop until shutdown or channel closure.
+pub fn run_whisper_worker(
+    cmds: Receiver<EngineCmd>,
+    events: EventSender,
+    sink: AudioSink,
+    mut vad: Box<dyn Vad>,
+    mut asr: Box<dyn Recognizer>,
+    shutdown: Arc<AtomicBool>,
+    decode_cancel: DecodeCancel,
+) -> anyhow::Result<()> {
+    let mut framer = Framer::new(512);
+    let mut buffer: Vec<f32> = Vec::new();
+    let mut current: Option<u64> = None;
+
+    while let Ok(command) = cmds.recv() {
+        match command {
+            EngineCmd::Begin { gen } => {
+                current = Some(gen);
+                buffer.clear();
+                framer.reset();
+                vad.reset()?;
+            }
+            EngineCmd::Audio(samples) if current.is_some() => {
+                buffer.extend_from_slice(&samples);
+                framer.push(&samples, |frame| vad.accept(frame));
+            }
+            EngineCmd::Audio(_) => {
+                tracing::trace!("dropping whisper-engine audio without an active generation");
+            }
+            EngineCmd::End { gen, pad_ms } if current == Some(gen) => {
+                let pad_samples = usize::try_from(pad_ms.saturating_mul(16))
+                    .context("silence pad sample count exceeds address space")?;
+                let silence = vec![0.0; pad_samples];
+                framer.push(&silence, |frame| vad.accept(frame));
+                framer.flush_zero_padded(|frame| vad.accept(frame));
+                vad.flush();
+                let has_speech = !vad.drain()?.is_empty();
+
+                let started_at = std::time::Instant::now();
+                let (text, aborted) = if has_speech {
+                    decode_cancel.begin(gen);
+                    let decoded = asr.transcribe(&buffer);
+                    let canceled = decode_cancel.end();
+                    let aborted = canceled || shutdown.load(Ordering::Relaxed);
+                    let text = if aborted {
+                        String::new()
+                    } else {
+                        let decoded = decoded.unwrap_or_default();
+                        let decoded = drop_stock_hallucination(&decoded);
+                        collapse_immediate_repetition(decoded).to_owned()
+                    };
+                    (text, aborted)
+                } else {
+                    (String::new(), false)
+                };
+
+                current = None;
+                buffer.clear();
+                if aborted {
+                    tracing::debug!(
+                        gen,
+                        "whisper decode aborted (cancel or shutdown); suppressing stale Final"
+                    );
+                    continue;
+                }
+
+                let engine_latency_ms = started_at.elapsed().as_secs_f64() * 1_000.0;
+                let dropped_chunks = sink.take_dropped();
+                events.send(EngineMsg::Final {
+                    gen,
+                    text,
+                    engine_latency_ms: Some(engine_latency_ms),
+                    vad_close_at: std::time::Instant::now(),
+                    asr_end_at: std::time::Instant::now(),
+                    dropped_chunks,
+                })?;
+            }
+            EngineCmd::End { .. } => {
+                tracing::debug!("ignoring stale whisper-engine end command");
+            }
+            EngineCmd::Cancel { .. } => {
+                current = None;
+                buffer.clear();
+                framer.reset();
+                vad.reset()?;
+                let _ = sink.take_dropped();
+            }
+            EngineCmd::Shutdown => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use kikigaki_core::engine::{self, EngineCmd, EngineMsg};
+
+    use super::*;
+    use crate::local::{Recognizer, Vad, VadSegment};
+
+    struct AlwaysSpeechVad;
+
+    impl Vad for AlwaysSpeechVad {
+        fn accept(&mut self, _frame: &[f32]) {}
+
+        fn flush(&mut self) {}
+
+        fn reset(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn drain(&mut self) -> anyhow::Result<Vec<VadSegment>> {
+            Ok(vec![VadSegment {
+                start: 0,
+                samples: vec![0.0; 512],
+            }])
+        }
+    }
+
+    struct SilentVad;
+
+    impl Vad for SilentVad {
+        fn accept(&mut self, _frame: &[f32]) {}
+
+        fn flush(&mut self) {}
+
+        fn reset(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn drain(&mut self) -> anyhow::Result<Vec<VadSegment>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct CapturingRecognizer(Arc<Mutex<Vec<Vec<f32>>>>);
+
+    impl Recognizer for CapturingRecognizer {
+        fn transcribe(&mut self, samples: &[f32]) -> Option<String> {
+            self.0.lock().unwrap().push(samples.to_vec());
+            Some("decoded".into())
+        }
+    }
+
+    /// Simulates whisper.cpp's abort callback after signaling that the decode is in flight.
+    struct AbortAwareRecognizer {
+        shutdown: Arc<AtomicBool>,
+        decode_cancel: DecodeCancel,
+        entered: std::sync::mpsc::SyncSender<()>,
+    }
+
+    impl Recognizer for AbortAwareRecognizer {
+        fn transcribe(&mut self, _samples: &[f32]) -> Option<String> {
+            self.entered.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                if self.shutdown.load(Ordering::Relaxed) || self.decode_cancel.should_abort() {
+                    return None;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("abort was never observed");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn run(
+        vad: Box<dyn Vad>,
+        asr: Box<dyn Recognizer>,
+        commands: impl IntoIterator<Item = EngineCmd>,
+    ) -> std::sync::mpsc::Receiver<EngineMsg> {
+        let (sink, cmds) = engine::channel();
+        for command in commands {
+            sink.send(command).unwrap();
+        }
+        sink.send(EngineCmd::Shutdown).unwrap();
+        let (events_tx, events_rx) = engine::event_channel(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let decode_cancel = DecodeCancel::new();
+        run_whisper_worker(cmds, events_tx, sink, vad, asr, shutdown, decode_cancel).unwrap();
+        events_rx
+    }
+
+    #[test]
+    fn one_decode_call_receives_the_whole_utterance() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let events = run(
+            Box::new(AlwaysSpeechVad),
+            Box::new(CapturingRecognizer(Arc::clone(&captured))),
+            [
+                EngineCmd::Begin { gen: 1 },
+                EngineCmd::Audio(vec![0.1; 512]),
+                EngineCmd::Audio(vec![0.2; 512]),
+                EngineCmd::End { gen: 1, pad_ms: 0 },
+            ],
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "expected exactly one decode call, got {}",
+            captured.len()
+        );
+        assert_eq!(captured[0].len(), 1024);
+        match events.recv().unwrap() {
+            EngineMsg::Final { gen, text, .. } => {
+                assert_eq!(gen, 1);
+                assert_eq!(text, "decoded");
+            }
+            other => panic!("expected Final, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn silent_utterance_skips_the_recognizer_and_emits_empty_final() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let events = run(
+            Box::new(SilentVad),
+            Box::new(CapturingRecognizer(Arc::clone(&captured))),
+            [
+                EngineCmd::Begin { gen: 1 },
+                EngineCmd::Audio(vec![0.0; 512]),
+                EngineCmd::End { gen: 1, pad_ms: 0 },
+            ],
+        );
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "recognizer must not be called on silence"
+        );
+        match events.recv().unwrap() {
+            EngineMsg::Final { text, .. } => assert_eq!(text, ""),
+            other => panic!("expected Final, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_then_begin_keeps_only_the_second_utterance() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let events = run(
+            Box::new(AlwaysSpeechVad),
+            Box::new(CapturingRecognizer(Arc::clone(&captured))),
+            [
+                EngineCmd::Begin { gen: 1 },
+                EngineCmd::Audio(vec![0.1; 512]),
+                EngineCmd::Cancel { gen: 1 },
+                EngineCmd::Begin { gen: 2 },
+                EngineCmd::Audio(vec![0.2; 512]),
+                EngineCmd::End { gen: 2, pad_ms: 0 },
+            ],
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], vec![0.2; 512]);
+        match events.recv().unwrap() {
+            EngineMsg::Final { gen, .. } => assert_eq!(gen, 2),
+            other => panic!("expected Final, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_decode_canceled_mid_flight_emits_no_final_for_that_generation() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let decode_cancel = DecodeCancel::new();
+        let (sink, cmds) = engine::channel();
+        sink.send(EngineCmd::Begin { gen: 1 }).unwrap();
+        sink.send(EngineCmd::Audio(vec![0.1; 512])).unwrap();
+        sink.send(EngineCmd::End { gen: 1, pad_ms: 0 }).unwrap();
+        sink.send(EngineCmd::Shutdown).unwrap();
+        let (events_tx, events_rx) = engine::event_channel(8);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let recognizer = AbortAwareRecognizer {
+            shutdown: Arc::clone(&shutdown),
+            decode_cancel: decode_cancel.clone(),
+            entered: entered_tx,
+        };
+        let canceler = decode_cancel.clone();
+        let worker = std::thread::spawn(move || {
+            run_whisper_worker(
+                cmds,
+                events_tx,
+                sink,
+                Box::new(AlwaysSpeechVad),
+                Box::new(recognizer),
+                shutdown,
+                decode_cancel,
+            )
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker never entered the decode for generation 1");
+        canceler.cancel(1);
+        worker.join().unwrap().unwrap();
+        assert!(
+            events_rx.try_recv().is_err(),
+            "a canceled decode must not emit a Final for its generation"
+        );
+    }
+
+    #[test]
+    fn cancel_for_a_different_generation_does_not_suppress_this_decode() {
+        let decode_cancel = DecodeCancel::new();
+        decode_cancel.begin(1);
+        decode_cancel.cancel(2);
+        assert!(!decode_cancel.should_abort());
+        assert!(!decode_cancel.end());
+    }
+}

@@ -773,7 +773,10 @@ impl Controller {
             self.reconcile_pending = false;
             return;
         }
-        if self.settings.config().engine == EngineKind::Remote {
+        if matches!(
+            self.settings.config().engine,
+            EngineKind::Remote | EngineKind::Whisper
+        ) {
             self.hotwords_applied = self.hotwords_desired;
             self.reconcile_pending = false;
             return;
@@ -1803,7 +1806,7 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: false,
+            whisper: true,
         };
         let settings = SettingsCoordinator::load(config_path, capabilities).unwrap();
         let (client, rx, hotkey, hotkey_rx) = client_channels();
@@ -2364,6 +2367,81 @@ mod tests {
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
             "Kubernetes"
         );
+    }
+
+    #[test]
+    fn whisper_keeps_postprocess_punctuation_disabled() {
+        let harness = harness_with_engine_options(
+            true,
+            false,
+            EngineKind::Whisper,
+            VecDeque::new(),
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+
+        transcribe(&harness, 1, "こんにちは");
+
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "こんにちは"
+        );
+    }
+
+    #[test]
+    fn whisper_applies_builtin_replacement_dictionary() {
+        let harness = harness_with_engine_options(
+            false,
+            false,
+            EngineKind::Whisper,
+            VecDeque::new(),
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+
+        apply_builtin(&harness, true);
+        transcribe(&harness, 1, "クバネティス");
+
+        assert_eq!(
+            harness.pastes.attempts.lock().unwrap().last().unwrap(),
+            "Kubernetes"
+        );
+    }
+
+    #[test]
+    fn whisper_builtin_toggle_does_not_restart_engine() {
+        let harness = harness_with_engine_options(
+            false,
+            false,
+            EngineKind::Whisper,
+            VecDeque::new(),
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
+        );
+        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        let builds_before = harness.engine.builds.load(Ordering::Relaxed);
+
+        apply_builtin(&harness, true);
+        thread::sleep(Duration::from_millis(60));
+
+        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), builds_before);
     }
 
     #[test]

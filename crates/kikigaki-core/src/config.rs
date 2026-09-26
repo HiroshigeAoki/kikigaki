@@ -379,6 +379,16 @@ impl Config {
         Ok(())
     }
 
+    /// Returns whether the selected engine already punctuates its own output, making local
+    /// punctuation redundant (and, for Whisper, actively wrong to layer on top of).
+    pub fn engine_punctuates(&self) -> bool {
+        match self.engine {
+            EngineKind::Remote => self.remote.server_punctuates,
+            EngineKind::Whisper => true,
+            EngineKind::Local => false,
+        }
+    }
+
     fn expand_paths(&mut self) {
         self.replace_file = expand_tilde(&self.replace_file);
         self.metrics_path = expand_tilde(&self.metrics_path);
@@ -390,12 +400,8 @@ impl Config {
 }
 
 /// Returns whether this process should run punctuation for the selected engine.
-///
-/// A remote server that already punctuates its output suppresses local punctuation even when
-/// punctuation support is otherwise enabled.
 pub fn punct_effective(config: &Config, caps: Capabilities) -> bool {
-    config.punct.effective(caps)
-        && !(config.engine == EngineKind::Remote && config.remote.server_punctuates)
+    config.punct.effective(caps) && !config.engine_punctuates()
 }
 
 const LEGACY_REMOTE_KEYS: &[&str] = &[
@@ -828,6 +834,23 @@ mod tests {
                 whisper: false,
             }
         ));
+    }
+
+    #[test]
+    fn whisper_engine_always_suppresses_local_punctuation() {
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            whisper: true,
+        };
+        let mut cfg = Config {
+            engine: EngineKind::Whisper,
+            ..Config::default()
+        };
+        cfg.punct.enabled = PunctEnabled::On;
+        assert!(!punct_effective(&cfg, caps));
+        cfg.punct.enabled = PunctEnabled::Off;
+        assert!(!punct_effective(&cfg, caps));
     }
 
     #[test]

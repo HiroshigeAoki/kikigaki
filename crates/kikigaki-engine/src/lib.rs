@@ -19,3 +19,5 @@ pub mod punct;
 pub mod sherpa;
 #[cfg(test)]
 mod test_support;
+/// Pure post-decode guards and parameter selection for the Whisper engine.
+pub mod whisper_guard;

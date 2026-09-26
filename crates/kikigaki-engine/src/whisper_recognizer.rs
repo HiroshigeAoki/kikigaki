@@ -13,6 +13,19 @@ use crate::local::Recognizer;
 use crate::whisper_engine::DecodeCancel;
 use crate::whisper_guard::audio_ctx_for;
 
+/// Loads the pinned Whisper model from its managed model directory.
+pub fn build_whisper_recognizer(
+    models_dir: &Path,
+    use_gpu: bool,
+    shutdown: Arc<AtomicBool>,
+    decode_cancel: DecodeCancel,
+) -> anyhow::Result<WhisperRecognizer> {
+    let path =
+        kikigaki_core::models::model_dir(models_dir, kikigaki_core::models::WHISPER_MODEL_ID)
+            .join("ggml-large-v3-turbo-q8_0.bin");
+    WhisperRecognizer::load(&path, use_gpu, shutdown, decode_cancel)
+}
+
 /// A reusable whisper.cpp context and decode state.
 pub struct WhisperRecognizer {
     context: WhisperContext,

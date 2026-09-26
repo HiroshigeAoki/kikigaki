@@ -5,15 +5,23 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+#[cfg(any(test, feature = "whisper"))]
+use std::time::Instant;
 
 use anyhow::Context;
-#[cfg(test)]
+#[cfg(any(test, feature = "whisper"))]
 use kikigaki_core::engine::run_worker;
 use kikigaki_core::engine::{
     join_workers, AudioSink, Engine, EngineCmd, EngineMsg, EventSender, Waker,
 };
+#[cfg(any(test, feature = "whisper"))]
+use kikigaki_core::models::{VAD_MODEL_ID, WHISPER_MODEL_ID};
 
 use crate::framer::Framer;
+#[cfg(any(test, feature = "whisper"))]
+use crate::local::model_load_error;
+#[cfg(feature = "whisper")]
+use crate::local::report_model_load_failure;
 use crate::local::{Recognizer, Vad};
 use crate::whisper_guard::{collapse_immediate_repetition, drop_stock_hallucination};
 
@@ -96,6 +104,72 @@ pub struct WhisperEngine {
 }
 
 impl WhisperEngine {
+    /// Starts a worker thread that loads the VAD and Whisper models, warms up Whisper, and emits
+    /// `Ready` when initialization finishes.
+    #[cfg(feature = "whisper")]
+    pub fn start(
+        models_dir: std::path::PathBuf,
+        vad: kikigaki_core::config::VadConfig,
+        use_gpu: bool,
+    ) -> anyhow::Result<Self> {
+        let (sink, cmds) = kikigaki_core::engine::channel();
+        let (events_tx, events_rx) = kikigaki_core::engine::event_channel(32);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let decode_cancel = DecodeCancel::new();
+        let worker_sink = sink.clone();
+        let worker_events = events_tx.clone();
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_decode_cancel = decode_cancel.clone();
+        let failure_reporter = events_tx.clone();
+        let tracing_dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let worker = std::thread::Builder::new()
+            .name("whisper-engine".into())
+            .spawn(move || {
+                tracing::dispatcher::with_default(&tracing_dispatch, || {
+                    let vad_models_dir = models_dir.clone();
+                    let vad_config = vad.clone();
+                    let recognizer_shutdown = Arc::clone(&worker_shutdown);
+                    let recognizer_decode_cancel = worker_decode_cancel.clone();
+                    let failure_events = worker_events.clone();
+                    run_worker(&failure_reporter, &done_tx, || {
+                        let result = run_whisper_with_loaders(
+                            cmds,
+                            worker_events,
+                            worker_sink,
+                            worker_shutdown,
+                            worker_decode_cancel,
+                            move || {
+                                crate::sherpa::build_vad(&vad_models_dir, &vad_config)
+                                    .map(|detector| Box::new(detector) as Box<dyn Vad>)
+                            },
+                            move || {
+                                crate::whisper_recognizer::build_whisper_recognizer(
+                                    &models_dir,
+                                    use_gpu,
+                                    recognizer_shutdown,
+                                    recognizer_decode_cancel,
+                                )
+                                .map(|recognizer| Box::new(recognizer) as Box<dyn Recognizer>)
+                            },
+                        );
+                        report_model_load_failure(&failure_events, result)
+                    });
+                });
+            })
+            .context("spawn Whisper engine worker")?;
+
+        Ok(Self {
+            sink,
+            events_rx,
+            events_tx,
+            done_rx,
+            worker: Some(worker),
+            shutdown,
+            decode_cancel,
+        })
+    }
+
     #[cfg(test)]
     fn start_with(
         vad: Box<dyn Vad + Send>,
@@ -142,6 +216,40 @@ impl WhisperEngine {
             decode_cancel,
         }
     }
+}
+
+#[cfg(any(test, feature = "whisper"))]
+fn run_whisper_with_loaders<V, A>(
+    cmds: Receiver<EngineCmd>,
+    events: EventSender,
+    sink: AudioSink,
+    shutdown: Arc<AtomicBool>,
+    decode_cancel: DecodeCancel,
+    make_vad: V,
+    make_asr: A,
+) -> anyhow::Result<()>
+where
+    V: FnOnce() -> anyhow::Result<Box<dyn Vad>>,
+    A: FnOnce() -> anyhow::Result<Box<dyn Recognizer>>,
+{
+    let started = Instant::now();
+    let vad = make_vad().map_err(|error| model_load_error(VAD_MODEL_ID, error))?;
+    let vad_load_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let mut asr = make_asr().map_err(|error| model_load_error(WHISPER_MODEL_ID, error))?;
+    let model_load_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let warmup_started = Instant::now();
+    run_warmup(asr.as_mut());
+    let warmup_ms = warmup_started.elapsed().as_secs_f64() * 1_000.0;
+    tracing::info!(
+        model_load_ms,
+        vad_load_ms,
+        warmup_ms,
+        "whisper engine models loaded"
+    );
+    events
+        .send(EngineMsg::Ready)
+        .context("send whisper-engine ready")?;
+    run_whisper_worker(cmds, events, sink, vad, asr, shutdown, decode_cancel)
 }
 
 impl Engine for WhisperEngine {
@@ -268,10 +376,12 @@ pub fn run_whisper_worker(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use kikigaki_core::engine::{self, Engine, EngineCmd, EngineMsg};
+    use kikigaki_core::models::{VAD_MODEL_ID, WHISPER_MODEL_ID};
 
     use super::*;
     use crate::local::{Recognizer, Vad, VadSegment};
@@ -387,6 +497,111 @@ mod tests {
             captured[0].iter().all(|&sample| sample == 0.0),
             "warm-up buffer must be silence"
         );
+    }
+
+    fn loader_failure(
+        make_vad: impl FnMut() -> anyhow::Result<Box<dyn Vad>>,
+        make_asr: impl FnMut() -> anyhow::Result<Box<dyn Recognizer>>,
+    ) -> (String, Option<&'static str>) {
+        let (sink, cmds) = engine::channel();
+        let (events_tx, events_rx) = engine::event_channel(8);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker_events = events_tx.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let decode_cancel = DecodeCancel::new();
+        kikigaki_core::engine::run_worker(
+            &events_tx,
+            &done_tx,
+            std::panic::AssertUnwindSafe(|| {
+                let result = run_whisper_with_loaders(
+                    cmds,
+                    worker_events,
+                    sink,
+                    shutdown,
+                    decode_cancel,
+                    make_vad,
+                    make_asr,
+                );
+                crate::local::report_model_load_failure(&events_tx, result)
+            }),
+        );
+        done_rx.recv().unwrap();
+        events_rx
+            .try_iter()
+            .find_map(|message| match message {
+                EngineMsg::Disconnected {
+                    reason,
+                    failed_model,
+                } => Some((reason, failed_model)),
+                _ => None,
+            })
+            .expect("worker should emit a disconnect reason")
+    }
+
+    #[test]
+    fn vad_load_failure_reports_the_vad_model_id_not_whisper() {
+        let failure = loader_failure(
+            || anyhow::bail!("bad Whisper VAD"),
+            || {
+                Ok(Box::new(CapturingRecognizer(Arc::new(Mutex::new(
+                    Vec::new(),
+                )))))
+            },
+        );
+
+        assert!(failure.0.contains("bad Whisper VAD"), "{failure:?}");
+        assert_eq!(failure.1, Some(VAD_MODEL_ID));
+    }
+
+    #[test]
+    fn recognizer_load_failure_reports_the_whisper_model_id() {
+        let failure = loader_failure(
+            || Ok(Box::new(AlwaysSpeechVad)),
+            || anyhow::bail!("bad Whisper recognizer"),
+        );
+
+        assert!(failure.0.contains("bad Whisper recognizer"), "{failure:?}");
+        assert_eq!(failure.1, Some(WHISPER_MODEL_ID));
+    }
+
+    #[test]
+    fn ready_is_sent_only_after_warmup_ran() {
+        struct CountingRecognizer(Arc<AtomicUsize>);
+        impl Recognizer for CountingRecognizer {
+            fn transcribe(&mut self, _samples: &[f32]) -> Option<String> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recognizer_calls = Arc::clone(&calls);
+        let (sink, cmds) = engine::channel();
+        sink.send(EngineCmd::Shutdown).unwrap();
+        let (events_tx, events_rx) = engine::event_channel(8);
+        let calls_when_ready_was_sent = Arc::new(AtomicUsize::new(usize::MAX));
+        events_tx.set_waker(Some(Arc::new({
+            let calls = Arc::clone(&calls);
+            let calls_when_ready_was_sent = Arc::clone(&calls_when_ready_was_sent);
+            move || {
+                calls_when_ready_was_sent.store(calls.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        })));
+
+        run_whisper_with_loaders(
+            cmds,
+            events_tx,
+            sink,
+            Arc::new(AtomicBool::new(false)),
+            DecodeCancel::new(),
+            || Ok(Box::new(AlwaysSpeechVad)),
+            move || Ok(Box::new(CountingRecognizer(recognizer_calls))),
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(calls_when_ready_was_sent.load(Ordering::Relaxed), 1);
+        assert!(matches!(events_rx.recv().unwrap(), EngineMsg::Ready));
     }
 
     #[test]

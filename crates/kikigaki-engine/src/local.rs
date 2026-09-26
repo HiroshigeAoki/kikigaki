@@ -253,7 +253,7 @@ where
 }
 
 #[derive(Debug)]
-struct ModelLoadError {
+pub(crate) struct ModelLoadError {
     id: &'static str,
     error: anyhow::Error,
 }
@@ -266,11 +266,11 @@ impl std::fmt::Display for ModelLoadError {
 
 impl std::error::Error for ModelLoadError {}
 
-fn model_load_error(id: &'static str, error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn model_load_error(id: &'static str, error: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(ModelLoadError { id, error })
 }
 
-fn report_model_load_failure(
+pub(crate) fn report_model_load_failure(
     events: &EventSender,
     result: anyhow::Result<()>,
 ) -> anyhow::Result<()> {

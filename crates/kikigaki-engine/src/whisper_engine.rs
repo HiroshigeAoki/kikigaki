@@ -17,6 +17,20 @@ use crate::framer::Framer;
 use crate::local::{Recognizer, Vad};
 use crate::whisper_guard::{collapse_immediate_repetition, drop_stock_hallucination};
 
+/// 320ms of silence at 16kHz — the fixed warm-up decode buffer. Chosen to be short (fast) while
+/// still exercising a full whisper.cpp `state.full` call, so the first *real* press doesn't pay
+/// first-decode kernel/compile cost (Metal shader compilation, CPU codepath JIT-ish warm caches).
+pub const WARMUP_SAMPLES: usize = 5_120;
+
+/// Runs one throwaway decode on `WARMUP_SAMPLES` samples of silence and discards the result.
+/// Called by the real loader (task D2's `WhisperEngine::start` wiring) once models are loaded,
+/// before `Ready` is sent — mirrors `local.rs`'s model-load logging pattern
+/// (`local.rs:246`'s `vad_load_ms, asr_load_ms`), just for a warm-up decode instead of a load.
+pub fn run_warmup(asr: &mut dyn Recognizer) {
+    let silence = vec![0.0f32; WARMUP_SAMPLES];
+    let _ = asr.transcribe(&silence);
+}
+
 /// Sentinel meaning "not currently decoding" for `DecodeCancel::decoding_gen`.
 const NO_GENERATION: u64 = u64::MAX;
 
@@ -253,7 +267,7 @@ pub fn run_whisper_worker(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -344,6 +358,35 @@ mod tests {
         let decode_cancel = DecodeCancel::new();
         run_whisper_worker(cmds, events_tx, sink, vad, asr, shutdown, decode_cancel).unwrap();
         events_rx
+    }
+
+    #[test]
+    fn warmup_decodes_a_fixed_silent_buffer_and_discards_the_result() {
+        struct CountingRecognizer(Arc<AtomicUsize>, Arc<Mutex<Vec<Vec<f32>>>>);
+        impl Recognizer for CountingRecognizer {
+            fn transcribe(&mut self, samples: &[f32]) -> Option<String> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                self.1.lock().unwrap().push(samples.to_vec());
+                Some("should be discarded".into())
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut recognizer = CountingRecognizer(Arc::clone(&calls), Arc::clone(&captured));
+
+        run_warmup(&mut recognizer);
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "expected exactly one warm-up decode call"
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured[0].len(), WARMUP_SAMPLES);
+        assert!(
+            captured[0].iter().all(|&sample| sample == 0.0),
+            "warm-up buffer must be silence"
+        );
     }
 
     #[test]

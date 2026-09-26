@@ -28,6 +28,13 @@
 
         <section class="group">
           <h2>文字起こし</h2>
+          <div class="row" id="engineRow" hidden>
+            <div class="l"><b>認識エンジン</b><small id="engineNote">初回選択時に約0.9GBのダウンロードが必要です</small></div>
+            <div class="seg" id="engineSeg" role="group" aria-label="認識エンジン">
+              <button type="button" data-value="local" aria-pressed="false">標準</button>
+              <button type="button" data-value="whisper" aria-pressed="false">高性能<small>約0.9GB</small></button>
+            </div>
+          </div>
           <div class="row">
             <div class="l"><b>句読点</b><small>「、」「。」を自動で入れます。チャット欄などでは文末の「。」だけ省けます</small></div>
             <div class="seg" id="punctSeg" role="group" aria-label="句読点">

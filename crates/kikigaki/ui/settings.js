@@ -94,6 +94,15 @@ function applyPunctSeg(settings) {
   }
 }
 
+function applyEngineSeg(settings) {
+  document.getElementById('engineRow').hidden = !settings.whisper_available;
+  const switching = settings.engine !== settings.active_engine;
+  for (const button of document.querySelectorAll('#engineSeg button')) {
+    button.setAttribute('aria-pressed', String(button.dataset.value === settings.engine));
+    button.disabled = switching;
+  }
+}
+
 function applyBuiltinReplaceDict(settings) {
   const control = document.getElementById('builtinReplaceDictSwitch');
   control.setAttribute('aria-checked', String(settings.builtin_replace_dict));
@@ -378,6 +387,7 @@ function showOnboarding(state) {
 function applySnapshot(snapshot) {
   currentSnapshot = snapshot;
   applyStatus(snapshot.status);
+  applyEngineSeg(snapshot.settings);
   applyPunctSeg(snapshot.settings);
   applyBuiltinReplaceDict(snapshot.settings);
   applyAutostart(snapshot.autostart);
@@ -489,6 +499,24 @@ hotkeyButton.addEventListener('keydown', async (event) => {
 hotkeyButton.addEventListener('blur', () => {
   void cancelHotkeyCapture();
 });
+
+for (const button of document.querySelectorAll('#engineSeg button')) {
+  button.addEventListener('click', async () => {
+    if (button.disabled) return;
+    const buttons = [...document.querySelectorAll('#engineSeg button')];
+    for (const control of buttons) control.disabled = true;
+    try {
+      const settings = await invoke('apply_settings', { patch: { engine: button.dataset.value } });
+      cacheSettings(settings);
+      applyEngineSeg(settings);
+    } catch (error) {
+      if (currentSnapshot) applyEngineSeg(currentSnapshot.settings);
+      showInlineError(document.getElementById('engineSeg'), error);
+    } finally {
+      if (currentSnapshot) applyEngineSeg(currentSnapshot.settings);
+    }
+  });
+}
 
 for (const button of document.querySelectorAll('#punctSeg button')) {
   button.addEventListener('click', async () => {

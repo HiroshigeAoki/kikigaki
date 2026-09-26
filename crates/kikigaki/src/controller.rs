@@ -2869,10 +2869,15 @@ mod tests {
         assert!(!pending.settings.engine_punctuates);
         harness.hotkey.send(HotkeyEdge::Pressed);
         let recording = wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        assert_eq!(
-            recording.status.message.as_deref(),
-            Some("Downloading whisper … 45%")
-        );
+        // StartMic consults the real macOS microphone permission even under test;
+        // an unprivileged test process legitimately gets the permission warning
+        // there instead of the download-progress message.
+        if !super::microphone_permission_denied() {
+            assert_eq!(
+                recording.status.message.as_deref(),
+                Some("Downloading whisper … 45%")
+            );
+        }
         harness.hotkey.send(HotkeyEdge::Released);
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
         harness.engine.send(final_message(1, "旧エンジン"));

@@ -307,8 +307,8 @@ def parse_metadata(value: object, path: Path) -> RunMetadata:
         value = {k: v for k, v in value.items() if k not in OPTIONAL_HEADER_KEYS}
     record = _expect_exact_keys(value, HEADER_KEYS, path, 1, "metadata header")
     condition = record["condition"]
-    if condition not in {"B", "D"}:
-        raise ScoringError(f"{path}:1: metadata condition must be 'B' or 'D'")
+    if condition not in {"B", "D", "W"}:
+        raise ScoringError(f"{path}:1: metadata condition must be 'B', 'D', or 'W'")
     num_threads = record["num_threads"]
     hashes = record["manifest_sha256"]
     if not isinstance(num_threads, int) or isinstance(num_threads, bool) or num_threads <= 0:
@@ -321,9 +321,11 @@ def parse_metadata(value: object, path: Path) -> RunMetadata:
     digest = record["hotwords_file_sha256"]
     line_count = record["hotwords_line_count"]
     score = record["hotwords_score"]
-    if condition == "B":
+    if condition in {"B", "W"}:
         if digest is not None or line_count is not None or score is not None:
-            raise ScoringError(f"{path}:1: baseline hotword metadata must be null")
+            raise ScoringError(
+                f"{path}:1: baseline/whisper hotword metadata must be null"
+            )
     else:
         if not isinstance(digest, str):
             raise ScoringError(f"{path}:1: D hotwords_file_sha256 must be a string")
@@ -697,6 +699,39 @@ def validate_and_score(args: argparse.Namespace) -> int:
 
 
 class SelfTests(unittest.TestCase):
+    def test_whisper_metadata_without_hotwords_is_accepted(self) -> None:
+        metadata = parse_metadata(
+            {
+                "condition": "W",
+                "hotwords_file_sha256": None,
+                "hotwords_line_count": None,
+                "hotwords_score": None,
+                "num_threads": 1,
+                "manifest_sha256": ["manifest-hash"],
+                "git_head": "012345",
+                "model_dir": "whisper-model",
+            },
+            Path("whisper.jsonl"),
+        )
+
+        self.assertEqual(metadata.condition, "W")
+
+    def test_whisper_metadata_with_hotword_values_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ScoringError, "hotword metadata must be null"):
+            parse_metadata(
+                {
+                    "condition": "W",
+                    "hotwords_file_sha256": None,
+                    "hotwords_line_count": None,
+                    "hotwords_score": 1.5,
+                    "num_threads": 1,
+                    "manifest_sha256": ["manifest-hash"],
+                    "git_head": "012345",
+                    "model_dir": "whisper-model",
+                },
+                Path("whisper.jsonl"),
+            )
+
     def test_mapper_prefers_a_synthetic_overlapping_prefix(self) -> None:
         mapper = DictionaryMapper(
             [

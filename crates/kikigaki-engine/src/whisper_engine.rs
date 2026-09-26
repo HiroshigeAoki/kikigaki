@@ -39,6 +39,37 @@ pub fn run_warmup(asr: &mut dyn Recognizer) {
     let _ = asr.transcribe(&silence);
 }
 
+/// Applies the shipped hallucination and immediate-repetition guards to one decode result.
+pub fn apply_output_guards(decoded: Option<String>) -> String {
+    let decoded = decoded.unwrap_or_default();
+    let decoded = drop_stock_hallucination(&decoded);
+    collapse_immediate_repetition(decoded).to_owned()
+}
+
+/// Transcribes a complete offline utterance using the same VAD-empty skip and output guards as
+/// the shipped worker path.
+pub fn transcribe_utterance(
+    vad: &mut dyn Vad,
+    asr: &mut dyn Recognizer,
+    samples: &[f32],
+) -> String {
+    let mut framer = Framer::new(512);
+    framer.push(samples, |frame| vad.accept(frame));
+    framer.flush_zero_padded(|frame| vad.accept(frame));
+    vad.flush();
+    let has_speech = match vad.drain() {
+        Ok(segments) => !segments.is_empty(),
+        Err(error) => {
+            tracing::warn!(%error, "vad drain failed; treating as no speech");
+            false
+        }
+    };
+    if !has_speech {
+        return String::new();
+    }
+    apply_output_guards(asr.transcribe(samples))
+}
+
 /// Sentinel meaning "not currently decoding" for `DecodeCancel::decoding_gen`.
 const NO_GENERATION: u64 = u64::MAX;
 
@@ -327,9 +358,7 @@ pub fn run_whisper_worker(
                     let text = if aborted {
                         String::new()
                     } else {
-                        let decoded = decoded.unwrap_or_default();
-                        let decoded = drop_stock_hallucination(&decoded);
-                        collapse_immediate_repetition(decoded).to_owned()
+                        apply_output_guards(decoded)
                     };
                     (text, aborted)
                 } else {
@@ -654,6 +683,43 @@ mod tests {
             EngineMsg::Final { text, .. } => assert_eq!(text, ""),
             other => panic!("expected Final, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transcribe_utterance_skips_decode_when_vad_finds_no_speech() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vad = SilentVad;
+        let mut recognizer = CapturingRecognizer(Arc::clone(&captured));
+
+        let text = transcribe_utterance(&mut vad, &mut recognizer, &[0.0; 700]);
+
+        assert_eq!(text, "");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "recognizer must not be called on silence"
+        );
+    }
+
+    #[test]
+    fn transcribe_utterance_decodes_once_and_applies_output_guards() {
+        struct RepeatingRecognizer(Arc<Mutex<Vec<Vec<f32>>>>);
+
+        impl Recognizer for RepeatingRecognizer {
+            fn transcribe(&mut self, samples: &[f32]) -> Option<String> {
+                self.0.lock().unwrap().push(samples.to_vec());
+                Some("テストテスト".into())
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let samples = vec![0.25; 700];
+        let mut vad = AlwaysSpeechVad;
+        let mut recognizer = RepeatingRecognizer(Arc::clone(&captured));
+
+        let text = transcribe_utterance(&mut vad, &mut recognizer, &samples);
+
+        assert_eq!(text, "テスト");
+        assert_eq!(*captured.lock().unwrap(), vec![samples]);
     }
 
     #[test]

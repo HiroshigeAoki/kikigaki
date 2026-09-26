@@ -19,7 +19,8 @@ pub struct Config {
     pub strip_trailing_period: bool,
     /// Silence appended after hotkey release, in milliseconds.
     pub silence_pad_ms: u64,
-    /// Maximum wait for a final transcription, in milliseconds.
+    /// Maximum wait for a final transcription, in milliseconds. Whisper extends this by half the
+    /// recorded utterance duration to accommodate whole-utterance decoding.
     pub final_timeout_ms: u64,
     /// Enable the built-in katakana→English replacement dictionary tier. Default false (opt-in).
     pub builtin_replace_dict: bool,

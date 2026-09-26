@@ -835,7 +835,12 @@ impl Controller {
             self.dirty = true;
             return;
         }
-        let Some(input) = hotkey_input(edge, self.window_focused, self.capturing_hotkey) else {
+        let Some(input) = hotkey_input(
+            edge,
+            self.window_focused,
+            self.capturing_hotkey,
+            self.active_engine,
+        ) else {
             return;
         };
         self.dirty = true;
@@ -1624,11 +1629,18 @@ impl Controller {
     }
 }
 
-fn hotkey_input(edge: HotkeyEdge, window_focused: bool, capturing_hotkey: bool) -> Option<Input> {
+fn hotkey_input(
+    edge: HotkeyEdge,
+    window_focused: bool,
+    capturing_hotkey: bool,
+    active_engine: EngineKind,
+) -> Option<Input> {
     match edge {
         HotkeyEdge::Pressed if window_focused || capturing_hotkey => None,
         HotkeyEdge::Pressed => Some(Input::Pressed),
-        HotkeyEdge::Released => Some(Input::Released),
+        HotkeyEdge::Released => Some(Input::Released {
+            engine: active_engine,
+        }),
     }
 }
 
@@ -3849,11 +3861,11 @@ mod tests {
         });
         let now = Instant::now();
         session.handle(Input::Engine(Event::Ready { sr: SAMPLE_RATE }), now);
-        let pressed = hotkey_input(HotkeyEdge::Pressed, false, false).unwrap();
+        let pressed = hotkey_input(HotkeyEdge::Pressed, false, false, EngineKind::Local).unwrap();
         session.handle(pressed, now);
         assert_eq!(session.state(), State::Recording);
 
-        let released = hotkey_input(HotkeyEdge::Released, false, true).unwrap();
+        let released = hotkey_input(HotkeyEdge::Released, false, true, EngineKind::Local).unwrap();
         session.handle(released, now + Duration::from_millis(1));
         assert_eq!(session.state(), State::Finalizing);
         session.handle(

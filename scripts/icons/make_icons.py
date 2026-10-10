@@ -147,14 +147,7 @@ def render(destination):
     ])
     # Pillow 12.3 omits the 16px 1x entry; add standard icp4 and rebuild the TOC.
     path = destination / icns
-    data = path.read_bytes()
-    entries = []
-    offset = 8
-    while offset < len(data):
-        tag, length = struct.unpack_from(">4sI", data, offset)
-        if tag != b"TOC ":
-            entries.append((tag, data[offset + 8:offset + length]))
-        offset += length
+    entries = icns_entries(path.read_bytes())
     small = io.BytesIO()
     resize_rgba(master, (16, 16)).save(small, format="PNG", optimize=False, compress_level=9)
     entries.append((b"icp4", small.getvalue()))
@@ -164,6 +157,28 @@ def render(destination):
                        for tag, payload in entries)
     path.write_bytes(struct.pack(">4sI", b"icns", len(chunks) + 8) + chunks)
     return [*outputs, icns]
+
+
+def icns_entries(data):
+    entries = []
+    offset = 8
+    while offset < len(data):
+        tag, length = struct.unpack_from(">4sI", data, offset)
+        if tag != b"TOC ":
+            entries.append((tag, data[offset + 8:offset + length]))
+        offset += length
+    return entries
+
+
+def pixels(path):
+    """Decoded pixels, so --check ignores encoder (zlib) byte differences across machines."""
+    def decode(blob):
+        with Image.open(io.BytesIO(blob)) as image:
+            return image.mode, image.size, image.tobytes()
+    data = path.read_bytes()
+    if path.suffix == ".icns":
+        return [(tag, decode(payload)) for tag, payload in icns_entries(data)]
+    return decode(data)
 
 
 def main():
@@ -179,16 +194,17 @@ def main():
         with tempfile.TemporaryDirectory(prefix="kikigaki-icons-") as directory:
             destination = Path(directory)
             stale = []
-            for name in render(destination):
+            names = render(destination)
+            for name in names:
                 committed = ROOT / name
                 if not committed.exists():
                     stale.append(f"missing: {name}")
-                elif committed.read_bytes() != (destination / name).read_bytes():
+                elif pixels(committed) != pixels(destination / name):
                     stale.append(f"stale: {name}")
             if stale:
                 print("\n".join(stale))
                 return 1
-        print("Icon assets are current (12 files).")
+        print(f"Icon assets are current ({len(names)} files).")
     else:
         print(f"Wrote {len(render(ROOT))} icon assets.")
     return 0

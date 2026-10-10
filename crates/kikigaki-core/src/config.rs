@@ -13,6 +13,10 @@ pub struct Config {
     pub engine: EngineKind,
     /// Push-to-talk global hotkey.
     pub hotkey: String,
+    /// Enable the long dictation key.
+    pub long_key: bool,
+    /// Global hotkey for long dictation.
+    pub long_hotkey: String,
     /// Method used to insert transcribed text.
     pub paste_method: PasteMethod,
     /// Whether one trailing Japanese or ASCII period is removed.
@@ -275,6 +279,8 @@ pub struct Capabilities {
     pub remote_engine: bool,
     /// Whether the Whisper engine (whisper-rs) is compiled into this build.
     pub whisper: bool,
+    /// Whether the long dictation key is supported on this platform.
+    pub long_key: bool,
 }
 
 impl Default for Config {
@@ -283,6 +289,8 @@ impl Default for Config {
         Self {
             engine: EngineKind::Local,
             hotkey: "Alt+Space".into(),
+            long_key: false,
+            long_hotkey: "Alt+Shift+Space".into(),
             paste_method: PasteMethod::Clipboard,
             strip_trailing_period: true,
             silence_pad_ms: 500,
@@ -333,12 +341,27 @@ impl Config {
                 return Err(error).with_context(|| format!("parse config {}", path.display()));
             }
         };
+        let table: toml::Table = toml::from_str(&contents)
+            .with_context(|| format!("parse config {}", path.display()))?;
+        if config.engine == EngineKind::Whisper {
+            config.engine = EngineKind::Local;
+            if !table.contains_key("long_key") {
+                config.long_key = true;
+            }
+        }
         config.expand_paths();
         Ok(config)
     }
 
     /// Validates configuration values against supported ranges and capabilities.
     pub fn validate(&self, caps: Capabilities) -> anyhow::Result<()> {
+        if self
+            .long_hotkey
+            .trim()
+            .eq_ignore_ascii_case(self.hotkey.trim())
+        {
+            bail!("long_hotkey must differ from hotkey");
+        }
         if !(1..=16).contains(&self.asr.num_threads) {
             bail!("asr.num_threads must be in 1..=16");
         }
@@ -384,6 +407,11 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Returns whether the long key is enabled and supported.
+    pub fn long_key_effective(&self, caps: Capabilities) -> bool {
+        self.long_key && caps.long_key
     }
 
     /// Returns whether the selected engine already punctuates its own output, making local
@@ -498,6 +526,69 @@ mod tests {
     }
 
     #[test]
+    fn long_key_defaults_off_with_alt_shift_space() {
+        let cfg = Config::default();
+        assert!(!cfg.long_key);
+        assert_eq!(cfg.long_hotkey, "Alt+Shift+Space");
+    }
+
+    #[test]
+    fn legacy_whisper_without_long_key_migrates_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = "engine = \"whisper\"\n";
+        let path = write(&temp, raw);
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.engine, EngineKind::Local);
+        assert!(cfg.long_key);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn legacy_whisper_with_long_key_false_stays_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(&temp, "engine = \"whisper\"\nlong_key = false\n");
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.engine, EngineKind::Local);
+        assert!(!cfg.long_key);
+    }
+
+    #[test]
+    fn validate_rejects_long_hotkey_equal_to_hotkey() {
+        let cfg = Config {
+            long_hotkey: "  alt+SPACE  ".into(),
+            ..Config::default()
+        };
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            whisper: true,
+            long_key: true,
+        };
+        assert!(cfg
+            .validate(caps)
+            .unwrap_err()
+            .to_string()
+            .contains("long_hotkey"));
+    }
+
+    #[test]
+    fn long_key_effective_requires_capability() {
+        let mut cfg = Config::default();
+        for enabled in [false, true] {
+            cfg.long_key = enabled;
+            for available in [false, true] {
+                let caps = Capabilities {
+                    punct: true,
+                    remote_engine: true,
+                    whisper: !available,
+                    long_key: available,
+                };
+                assert_eq!(cfg.long_key_effective(caps), enabled && available);
+            }
+        }
+    }
+
+    #[test]
     fn default_round_trips_through_toml() {
         let expected = Config::default();
         assert!(!expected.builtin_replace_dict);
@@ -605,6 +696,7 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
+            long_key: false,
             whisper: false,
         };
         for hotwords_score in [0.0, f32::INFINITY, f32::NAN, -1.0] {
@@ -664,6 +756,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_err());
@@ -673,6 +766,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_err());
@@ -682,6 +776,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_err());
@@ -693,6 +788,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_err());
@@ -702,6 +798,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_err());
@@ -709,6 +806,7 @@ mod tests {
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_ok());
@@ -722,6 +820,7 @@ mod tests {
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .unwrap_err();
@@ -730,6 +829,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_ok());
@@ -745,6 +845,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: false,
+                long_key: false,
                 whisper: false,
             })
             .unwrap_err();
@@ -753,6 +854,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_ok());
@@ -768,6 +870,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .unwrap_err();
@@ -776,6 +879,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: true,
             })
             .is_ok());
@@ -789,6 +893,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .unwrap_err();
@@ -804,6 +909,7 @@ mod tests {
                 cfg.validate(Capabilities {
                     punct: true,
                     remote_engine: true,
+                    long_key: false,
                     whisper: false,
                 })
                 .is_ok(),
@@ -817,6 +923,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             })
             .is_ok());
@@ -828,17 +935,20 @@ mod tests {
         assert!(cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
+            long_key: false,
             whisper: false,
         }));
         assert!(!cfg.punct.effective(Capabilities {
             punct: false,
             remote_engine: true,
+            long_key: false,
             whisper: false,
         }));
         cfg.punct.enabled = PunctEnabled::Off;
         assert!(!cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
+            long_key: false,
             whisper: false,
         }));
 
@@ -850,6 +960,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             }
         ));
@@ -859,6 +970,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             }
         ));
@@ -869,6 +981,7 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
+            long_key: false,
             whisper: true,
         };
         let mut cfg = Config {

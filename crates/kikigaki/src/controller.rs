@@ -744,6 +744,8 @@ impl Controller {
         }
         let _ = self.hotkeys.unregister(&old);
         match self.settings.apply(SettingsPatch {
+            long_key: None,
+            long_hotkey: None,
             hotkey: Some(chord.clone()),
             punctuation: None,
             strip_trailing_period: None,
@@ -2192,9 +2194,20 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
+            long_key: false,
             whisper: true,
         };
-        let settings = SettingsCoordinator::load(config_path, capabilities).unwrap();
+        let mut settings = SettingsCoordinator::load(config_path, capabilities).unwrap();
+        // Disk Whisper settings migrate to Local; exercise the intermediate engine switch
+        // through its supported patch path instead.
+        if engine_kind == EngineKind::Whisper {
+            settings
+                .apply(SettingsPatch {
+                    engine: Some(engine_kind),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
+        }
         let (client, rx, hotkey, hotkey_rx) = client_channels();
         let tx = client.tx.clone();
         let snapshots = SinkState::default();
@@ -2437,6 +2450,8 @@ mod tests {
             .client
             .send_and_wait(|reply| ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
+                    long_key: None,
+                    long_hotkey: None,
                     hotkey: None,
                     punctuation: None,
                     strip_trailing_period: None,
@@ -3890,6 +3905,8 @@ mod tests {
     fn apply_hotkey(client: &ControllerClient, chord: &str) -> Result<SettingsSnapshot, UiError> {
         client.send_and_wait(|reply| ControllerCmd::ApplySettings {
             patch: SettingsPatch {
+                long_key: None,
+                long_hotkey: None,
                 hotkey: Some(chord.into()),
                 punctuation: None,
                 strip_trailing_period: None,
@@ -3922,6 +3939,8 @@ mod tests {
             .tx
             .send(ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
+                    long_key: None,
+                    long_hotkey: None,
                     hotkey: Some("Alt+A".into()),
                     punctuation: None,
                     strip_trailing_period: None,
@@ -3937,6 +3956,8 @@ mod tests {
             .tx
             .send(ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
+                    long_key: None,
+                    long_hotkey: None,
                     hotkey: Some("Alt+B".into()),
                     punctuation: None,
                     strip_trailing_period: None,
@@ -4120,6 +4141,8 @@ mod tests {
             .client
             .send_and_wait(|reply| ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
+                    long_key: None,
+                    long_hotkey: None,
                     hotkey: None,
                     punctuation: None,
                     strip_trailing_period: None,
@@ -4167,6 +4190,8 @@ mod tests {
             .client
             .send_and_wait(|reply| ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
+                    long_key: None,
+                    long_hotkey: None,
                     hotkey: None,
                     punctuation: None,
                     strip_trailing_period: None,
@@ -4237,6 +4262,8 @@ mod tests {
                 .tx
                 .try_send(ControllerCmd::ApplySettings {
                     patch: SettingsPatch {
+                        long_key: None,
+                        long_hotkey: None,
                         hotkey: None,
                         punctuation: None,
                         strip_trailing_period: None,

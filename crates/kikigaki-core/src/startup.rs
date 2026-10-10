@@ -172,6 +172,7 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
+            long_key: false,
             whisper: false,
         };
 
@@ -197,6 +198,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: true,
             },
             false,
@@ -226,6 +228,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                long_key: false,
                 whisper: false,
             },
         );

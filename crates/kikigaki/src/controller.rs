@@ -53,9 +53,11 @@ pub enum ControllerCmd {
         reply: ReplyTx<()>,
     },
     BeginHotkeyCapture {
+        key: HotkeyKey,
         reply: ReplyTx<()>,
     },
     EndHotkeyCapture {
+        key: HotkeyKey,
         new_chord: Option<String>,
         reply: ReplyTx<crate::settings::SettingsSnapshot>,
     },
@@ -214,6 +216,13 @@ fn controller_gone() -> UiError {
     UiError {
         code: "controller_gone",
         message: "内部エラーが発生しました".into(),
+    }
+}
+
+fn long_key_off() -> UiError {
+    UiError {
+        code: "long_key_off",
+        message: "長文キーが無効です".into(),
     }
 }
 
@@ -528,6 +537,7 @@ struct Owner {
     engine: EngineKind,
 }
 
+const LONG_HOTKEY_INVALID_NOTICE: &str = "長文キーのホットキーが無効 — 再設定してください";
 const LONG_PREPARING_NOTICE: &str = "長文エンジン準備中のため標準で認識しました";
 const LONG_STOPPED_NOTICE: &str = "長文エンジンが停止中のため標準で認識しました";
 const LONG_FAILED_NOTICE: &str = "長文エンジンが停止しました — 設定から再試行できます";
@@ -663,7 +673,13 @@ impl Controller {
                 };
                 let _ = reply.send(result);
             }
-            ControllerCmd::BeginHotkeyCapture { reply } => {
+            ControllerCmd::BeginHotkeyCapture { key, reply } => {
+                if key == HotkeyKey::Long
+                    && !self.settings.config().long_key_effective(self.capabilities)
+                {
+                    let _ = reply.send(Err(long_key_off()));
+                    return;
+                }
                 if self.session.state() != State::Idle {
                     let _ = reply.send(Err(UiError {
                         code: "not_idle",
@@ -671,12 +687,18 @@ impl Controller {
                     }));
                     return;
                 }
-                match self.hotkeys.unregister(HotkeyKey::Standard) {
+                let result = self
+                    .hotkeys
+                    .unregister(HotkeyKey::Standard)
+                    .and_then(|()| self.hotkeys.unregister(HotkeyKey::Long));
+                match result {
                     Ok(()) => {
+                        self.long_hotkey_registered = false;
                         self.capturing_hotkey = true;
                         let _ = reply.send(Ok(()));
                     }
                     Err(message) => {
+                        let _ = self.restore_capture_hotkeys();
                         let _ = reply.send(Err(UiError {
                             code: "register_failed",
                             message,
@@ -684,8 +706,12 @@ impl Controller {
                     }
                 }
             }
-            ControllerCmd::EndHotkeyCapture { new_chord, reply } => {
-                self.end_hotkey_capture(new_chord, reply);
+            ControllerCmd::EndHotkeyCapture {
+                key,
+                new_chord,
+                reply,
+            } => {
+                self.end_hotkey_capture(key, new_chord, reply);
             }
             ControllerCmd::SetWindowFocused(focused) => self.window_focused = focused,
             ControllerCmd::RescanOnboarding => {
@@ -723,64 +749,153 @@ impl Controller {
         }
     }
 
-    fn reregister_or_warn(&mut self, chord: &str) -> Result<(), UiError> {
-        self.hotkeys
-            .register(HotkeyKey::Standard, chord)
-            .map_err(|message| {
-                self.status = Status::Warning("ホットキーが無効 — 再設定してください".into());
-                UiError {
-                    code: "register_failed",
-                    message,
+    fn reregister_or_warn(&mut self, key: HotkeyKey, chord: &str) -> Result<(), UiError> {
+        let result = self.hotkeys.register(key, chord);
+        if key == HotkeyKey::Long {
+            self.long_hotkey_registered = result.is_ok();
+            if result.is_ok() {
+                self.clear_long_hotkey_notice();
+            }
+        }
+        result.map_err(|message| {
+            match key {
+                HotkeyKey::Standard => {
+                    self.status = Status::Warning("ホットキーが無効 — 再設定してください".into());
                 }
-            })
+                HotkeyKey::Long => {
+                    self.long_notice = Some(LONG_HOTKEY_INVALID_NOTICE.into());
+                    self.long_notice_under_fallback = None;
+                }
+            }
+            UiError {
+                code: "register_failed",
+                message,
+            }
+        })
+    }
+
+    fn clear_long_hotkey_notice(&mut self) {
+        if self.long_notice.as_deref() == Some(LONG_HOTKEY_INVALID_NOTICE) {
+            self.long_notice = None;
+        }
+        if self.long_notice_under_fallback.as_deref() == Some(LONG_HOTKEY_INVALID_NOTICE) {
+            self.long_notice_under_fallback = None;
+        }
+    }
+
+    fn capture_restores_long(&self) -> bool {
+        self.settings.config().long_key_effective(self.capabilities) && !self.long_disable_pending
+    }
+
+    fn restore_capture_hotkeys(&mut self) -> Result<(), UiError> {
+        let standard = self.settings.config().hotkey.clone();
+        let long = self.settings.config().long_hotkey.clone();
+        let standard_result = self.reregister_or_warn(HotkeyKey::Standard, &standard);
+        // Attempt both restores even if Standard failed, so each key gets its own warning.
+        let long_result = if self.capture_restores_long() {
+            self.reregister_or_warn(HotkeyKey::Long, &long)
+        } else {
+            self.long_hotkey_registered = false;
+            Ok(())
+        };
+        standard_result.and(long_result)
     }
 
     fn end_hotkey_capture(
         &mut self,
+        key: HotkeyKey,
         new_chord: Option<String>,
         reply: ReplyTx<crate::settings::SettingsSnapshot>,
     ) {
         let was_capturing = self.capturing_hotkey;
         self.capturing_hotkey = false;
-        let old = self.settings.config().hotkey.clone();
+        if key == HotkeyKey::Long && !self.settings.config().long_key_effective(self.capabilities) {
+            if was_capturing {
+                let _ = self.restore_capture_hotkeys();
+            }
+            let _ = reply.send(Err(long_key_off()));
+            return;
+        }
+        let (old, other_key, other_chord) = match key {
+            HotkeyKey::Standard => (
+                self.settings.config().hotkey.clone(),
+                HotkeyKey::Long,
+                self.settings.config().long_hotkey.clone(),
+            ),
+            HotkeyKey::Long => (
+                self.settings.config().long_hotkey.clone(),
+                HotkeyKey::Standard,
+                self.settings.config().hotkey.clone(),
+            ),
+        };
         let Some(chord) = new_chord else {
-            let result = self.reregister_or_warn(&old);
+            let result = self.restore_capture_hotkeys();
             let _ = reply.send(result.map(|()| self.settings_snapshot()));
             return;
         };
+        // Match Config::validate, even when the other key is disabled.
+        if chord.trim().eq_ignore_ascii_case(other_chord.trim()) {
+            let _ = self.restore_capture_hotkeys();
+            let _ = reply.send(Err(UiError {
+                code: "hotkey_conflict",
+                message: "もう一方のキーと同じ組み合わせは使えません".into(),
+            }));
+            return;
+        }
         if chord == old {
             let result = if was_capturing {
-                self.reregister_or_warn(&old)
+                self.restore_capture_hotkeys()
             } else {
                 Ok(())
             };
             let _ = reply.send(result.map(|()| self.settings_snapshot()));
             return;
         }
-        if let Err(message) = self.hotkeys.register(HotkeyKey::Standard, &chord) {
-            let _ = self.reregister_or_warn(&old);
-            let _ = reply.send(Err(UiError {
-                code: "register_failed",
-                message,
-            }));
+        let registration = if key == HotkeyKey::Standard || self.capture_restores_long() {
+            self.hotkeys
+                .register(key, &chord)
+                .map_err(|message| UiError {
+                    code: "register_failed",
+                    message,
+                })
+        } else {
+            Ok(())
+        };
+        if let Err(error) = registration {
+            let _ = self.restore_capture_hotkeys();
+            let _ = reply.send(Err(error));
             return;
         }
-        match self.settings.apply(SettingsPatch {
-            long_key: None,
-            long_hotkey: None,
-            hotkey: Some(chord.clone()),
-            punctuation: None,
-            strip_trailing_period: None,
-            builtin_replace_dict: None,
-            transcript_log: None,
-        }) {
+        if key == HotkeyKey::Long {
+            self.long_hotkey_registered = self.capture_restores_long();
+            if self.long_hotkey_registered {
+                self.clear_long_hotkey_notice();
+            }
+        }
+        if other_key == HotkeyKey::Standard || self.capture_restores_long() {
+            if let Err(error) = self.reregister_or_warn(other_key, &other_chord) {
+                let _ = self.restore_capture_hotkeys();
+                let _ = reply.send(Err(error));
+                return;
+            }
+        }
+        let patch = match key {
+            HotkeyKey::Standard => SettingsPatch {
+                hotkey: Some(chord.clone()),
+                ..SettingsPatch::default()
+            },
+            HotkeyKey::Long => SettingsPatch {
+                long_hotkey: Some(chord.clone()),
+                ..SettingsPatch::default()
+            },
+        };
+        match self.settings.apply(patch) {
             Ok(_) => {
-                tracing::info!(chord = %chord, "hotkey re-registered after settings change");
+                tracing::info!(?key, chord = %chord, "hotkey re-registered after settings change");
                 let _ = reply.send(Ok(self.settings_snapshot()));
             }
             Err(error) => {
-                let _ = self.hotkeys.unregister(HotkeyKey::Standard);
-                let _ = self.reregister_or_warn(&old);
+                let _ = self.restore_capture_hotkeys();
                 let _ = reply.send(Err(error));
             }
         }
@@ -5623,6 +5738,7 @@ mod tests {
         let error = harness
             .client
             .send_and_wait(|reply| ControllerCmd::EndHotkeyCapture {
+                key: HotkeyKey::Standard,
                 new_chord: Some("Cmd+Z".into()),
                 reply,
             })
@@ -5898,6 +6014,250 @@ mod tests {
         );
     }
 
+    fn capture_harness(enabled: bool, capable: bool) -> LifecycleHarness {
+        let mut h = LifecycleHarness::new(enabled, capable);
+        h.controller.session.handle(
+            Input::Engine(Event::Ready { sr: SAMPLE_RATE }),
+            Instant::now(),
+        );
+        h
+    }
+
+    fn begin_capture(h: &mut LifecycleHarness, key: HotkeyKey) -> Result<(), UiError> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        h.controller
+            .handle_command(ControllerCmd::BeginHotkeyCapture { key, reply });
+        rx.try_recv().unwrap()
+    }
+
+    fn end_capture(
+        h: &mut LifecycleHarness,
+        key: HotkeyKey,
+        new_chord: Option<&str>,
+    ) -> Result<SettingsSnapshot, UiError> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        h.controller
+            .handle_command(ControllerCmd::EndHotkeyCapture {
+                key,
+                new_chord: new_chord.map(str::to_owned),
+                reply,
+            });
+        rx.try_recv().unwrap()
+    }
+
+    fn assert_both_restored(h: &LifecycleHarness) {
+        assert_eq!(
+            *h.hotkeys.registered.lock().unwrap(),
+            [
+                (HotkeyKey::Standard, "Alt+Space".into()),
+                (HotkeyKey::Long, "Alt+Shift+Space".into()),
+            ]
+        );
+        assert!(h.controller.long_hotkey_registered);
+        assert!(!h.controller.capturing_hotkey);
+    }
+
+    #[test]
+    fn capture_unregisters_and_restores_both_chords() {
+        for key in [HotkeyKey::Standard, HotkeyKey::Long] {
+            for chord in [
+                None,
+                Some(if key == HotkeyKey::Standard {
+                    "Alt+Space"
+                } else {
+                    "Alt+Shift+Space"
+                }),
+            ] {
+                let mut h = capture_harness(true, true);
+                begin_capture(&mut h, key).unwrap();
+                assert_eq!(
+                    *h.hotkeys.unregistered.lock().unwrap(),
+                    [HotkeyKey::Standard, HotkeyKey::Long]
+                );
+                assert!(h.controller.capturing_hotkey);
+                assert!(!h.controller.long_hotkey_registered);
+                end_capture(&mut h, key, chord).unwrap();
+                assert_both_restored(&h);
+            }
+        }
+    }
+
+    #[test]
+    fn capture_long_persists_long_hotkey_only() {
+        let mut h = capture_harness(true, true);
+        begin_capture(&mut h, HotkeyKey::Long).unwrap();
+        let snapshot = end_capture(&mut h, HotkeyKey::Long, Some("Cmd+Z")).unwrap();
+        assert_eq!(snapshot.hotkey, "Alt+Space");
+        assert_eq!(snapshot.long_hotkey, "Cmd+Z");
+        assert!(snapshot.long_key);
+        let reloaded = Config::load(Some(&h._temp.path().join("config.toml"))).unwrap();
+        assert_eq!(reloaded.hotkey, "Alt+Space");
+        assert_eq!(reloaded.long_hotkey, "Cmd+Z");
+        assert!(reloaded.long_key);
+        assert_eq!(
+            *h.hotkeys.registered.lock().unwrap(),
+            [
+                (HotkeyKey::Long, "Cmd+Z".into()),
+                (HotkeyKey::Standard, "Alt+Space".into()),
+            ]
+        );
+        assert!(h.controller.long_hotkey_registered);
+    }
+
+    #[test]
+    fn capture_conflict_rejected_before_registration() {
+        for (key, chord) in [
+            (HotkeyKey::Long, "  alt+SPACE  "),
+            (HotkeyKey::Standard, "  alt+SHIFT+space  "),
+        ] {
+            let mut h = capture_harness(true, true);
+            begin_capture(&mut h, key).unwrap();
+            let error = end_capture(&mut h, key, Some(chord)).unwrap_err();
+            assert_eq!(error.code, "hotkey_conflict");
+            assert_eq!(error.message, "もう一方のキーと同じ組み合わせは使えません");
+            assert_both_restored(&h);
+            assert_eq!(h.controller.settings.config().hotkey, "Alt+Space");
+            assert_eq!(
+                h.controller.settings.config().long_hotkey,
+                "Alt+Shift+Space"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_long_rejected_when_long_key_off() {
+        for (enabled, capable) in [(false, true), (true, false)] {
+            let mut h = capture_harness(enabled, capable);
+            let error = begin_capture(&mut h, HotkeyKey::Long).unwrap_err();
+            assert_eq!(error.code, "long_key_off");
+            assert!(!h.controller.capturing_hotkey);
+            assert!(h.hotkeys.unregistered.lock().unwrap().is_empty());
+            assert_eq!(
+                end_capture(&mut h, HotkeyKey::Long, Some("Cmd+Z"))
+                    .unwrap_err()
+                    .code,
+                "long_key_off"
+            );
+            assert!(h.hotkeys.registered.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn capture_persist_failure_restores_both() {
+        for key in [HotkeyKey::Standard, HotkeyKey::Long] {
+            let mut h = capture_harness(true, true);
+            begin_capture(&mut h, key).unwrap();
+            std::fs::write(h._temp.path().join("config.toml"), "# external edit\n").unwrap();
+            let error = end_capture(&mut h, key, Some("Cmd+Z")).unwrap_err();
+            assert_eq!(error.code, "external_change");
+            let calls = h.hotkeys.registered.lock().unwrap().clone();
+            assert!(calls.contains(&(key, "Cmd+Z".into())));
+            assert_eq!(
+                &calls[calls.len() - 2..],
+                [
+                    (HotkeyKey::Standard, "Alt+Space".into()),
+                    (HotkeyKey::Long, "Alt+Shift+Space".into()),
+                ]
+            );
+            assert!(h.controller.long_hotkey_registered);
+            assert!(!h.controller.capturing_hotkey);
+            assert_eq!(h.controller.settings.config().hotkey, "Alt+Space");
+            assert_eq!(
+                h.controller.settings.config().long_hotkey,
+                "Alt+Shift+Space"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_standard_conflicting_with_long_hotkey_rejected_even_when_long_off() {
+        let mut h = capture_harness(false, true);
+        begin_capture(&mut h, HotkeyKey::Standard).unwrap();
+        let error =
+            end_capture(&mut h, HotkeyKey::Standard, Some("  alt+SHIFT+space  ")).unwrap_err();
+        assert_eq!(error.code, "hotkey_conflict");
+        assert_eq!(error.message, "もう一方のキーと同じ組み合わせは使えません");
+        assert_eq!(
+            *h.hotkeys.registered.lock().unwrap(),
+            [(HotkeyKey::Standard, "Alt+Space".into())]
+        );
+        assert!(!h.controller.long_hotkey_registered);
+    }
+
+    #[test]
+    fn capture_restore_obeys_current_long_enablement_and_pending_disable() {
+        for (enabled, pending) in [(false, false), (true, true)] {
+            let mut h = capture_harness(true, true);
+            begin_capture(&mut h, HotkeyKey::Standard).unwrap();
+            h.controller
+                .settings
+                .apply(SettingsPatch {
+                    long_key: Some(enabled),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
+            h.controller.long_disable_pending = pending;
+            end_capture(&mut h, HotkeyKey::Standard, None).unwrap();
+            assert_eq!(
+                *h.hotkeys.registered.lock().unwrap(),
+                [(HotkeyKey::Standard, "Alt+Space".into())]
+            );
+            assert!(!h.controller.long_hotkey_registered);
+        }
+    }
+
+    #[test]
+    fn capture_registration_failure_restores_both_and_warns_on_each_restore_failure() {
+        for key in [HotkeyKey::Standard, HotkeyKey::Long] {
+            for fail_restores in [false, true] {
+                let mut h = capture_harness(true, true);
+                begin_capture(&mut h, key).unwrap();
+                h.hotkeys.plan.lock().unwrap().extend([
+                    Err("new failed".into()),
+                    if fail_restores {
+                        Err("standard restore failed".into())
+                    } else {
+                        Ok(())
+                    },
+                    if fail_restores {
+                        Err("long restore failed".into())
+                    } else {
+                        Ok(())
+                    },
+                ]);
+                let error = end_capture(&mut h, key, Some("Cmd+Z")).unwrap_err();
+                assert_eq!(error.code, "register_failed");
+                assert_eq!(error.message, "new failed");
+                let calls = h.hotkeys.registered.lock().unwrap().clone();
+                assert_eq!(calls[0], (key, "Cmd+Z".into()));
+                assert_eq!(
+                    &calls[1..],
+                    [
+                        (HotkeyKey::Standard, "Alt+Space".into()),
+                        (HotkeyKey::Long, "Alt+Shift+Space".into()),
+                    ]
+                );
+                assert_eq!(h.controller.long_hotkey_registered, !fail_restores);
+                if fail_restores {
+                    assert_eq!(
+                        h.controller.status.message(),
+                        Some("ホットキーが無効 — 再設定してください")
+                    );
+                    assert_eq!(
+                        h.controller.long_notice.as_deref(),
+                        Some("長文キーのホットキーが無効 — 再設定してください")
+                    );
+                    assert_eq!(
+                        h.controller.snapshot().status.message.as_deref(),
+                        h.controller.long_notice.as_deref()
+                    );
+                } else {
+                    assert!(h.controller.long_notice.is_none());
+                }
+            }
+        }
+    }
+
     #[test]
     fn hotkey_rollback_on_register_failure_including_old_chord_reregister_failure() {
         let harness = harness(
@@ -5912,11 +6272,15 @@ mod tests {
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         harness
             .client
-            .send_and_wait(|reply| ControllerCmd::BeginHotkeyCapture { reply })
+            .send_and_wait(|reply| ControllerCmd::BeginHotkeyCapture {
+                key: HotkeyKey::Standard,
+                reply,
+            })
             .unwrap();
         let error = harness
             .client
             .send_and_wait(|reply| ControllerCmd::EndHotkeyCapture {
+                key: HotkeyKey::Standard,
                 new_chord: Some("Cmd+Z".into()),
                 reply,
             })
@@ -5933,6 +6297,7 @@ mod tests {
         harness
             .client
             .send_and_wait(|reply| ControllerCmd::EndHotkeyCapture {
+                key: HotkeyKey::Standard,
                 new_chord: Some("Alt+Space".into()),
                 reply,
             })
@@ -5946,11 +6311,15 @@ mod tests {
         let harness = ready_harness();
         harness
             .client
-            .send_and_wait(|reply| ControllerCmd::BeginHotkeyCapture { reply })
+            .send_and_wait(|reply| ControllerCmd::BeginHotkeyCapture {
+                key: HotkeyKey::Standard,
+                reply,
+            })
             .unwrap();
         harness
             .client
             .send_and_wait(|reply| ControllerCmd::EndHotkeyCapture {
+                key: HotkeyKey::Standard,
                 new_chord: Some("Alt+Space".into()),
                 reply,
             })
@@ -5958,7 +6327,7 @@ mod tests {
 
         assert_eq!(
             *harness.hotkeys.unregistered.lock().unwrap(),
-            [HotkeyKey::Standard]
+            [HotkeyKey::Standard, HotkeyKey::Long]
         );
         assert_eq!(
             *harness.hotkeys.registered.lock().unwrap(),
@@ -6057,7 +6426,10 @@ mod tests {
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
         let error = harness
             .client
-            .send_and_wait(|reply| ControllerCmd::BeginHotkeyCapture { reply })
+            .send_and_wait(|reply| ControllerCmd::BeginHotkeyCapture {
+                key: HotkeyKey::Standard,
+                reply,
+            })
             .unwrap_err();
         assert_eq!(error.code, "not_idle");
     }

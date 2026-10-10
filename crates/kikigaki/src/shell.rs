@@ -864,20 +864,23 @@ async fn apply_settings(
 #[tauri::command]
 async fn begin_hotkey_capture(
     state: tauri::State<'_, Arc<ShellState>>,
+    key: HotkeyKey,
 ) -> Result<(), crate::status::UiError> {
     state
         .client
-        .send_and_wait(|reply| crate::controller::ControllerCmd::BeginHotkeyCapture { reply })
+        .send_and_wait(|reply| crate::controller::ControllerCmd::BeginHotkeyCapture { key, reply })
 }
 
 #[tauri::command]
 async fn end_hotkey_capture(
     state: tauri::State<'_, Arc<ShellState>>,
+    key: HotkeyKey,
     new_chord: Option<String>,
 ) -> Result<crate::settings::SettingsSnapshot, crate::status::UiError> {
     state
         .client
         .send_and_wait(|reply| crate::controller::ControllerCmd::EndHotkeyCapture {
+            key,
             new_chord,
             reply,
         })

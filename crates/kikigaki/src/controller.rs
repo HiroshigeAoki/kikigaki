@@ -536,6 +536,12 @@ struct LongEngine {
     state: LongState,
     origin: LongOrigin,
     installed: bool,
+    install_terminal: bool,
+}
+
+struct RetiringInstall {
+    port: Box<dyn StartupPort>,
+    terminal: bool,
 }
 
 struct Controller {
@@ -554,7 +560,7 @@ struct Controller {
     long_hotkey_registered: bool,
     long_notice: Option<String>,
     retiring: Vec<std::thread::JoinHandle<()>>,
-    retiring_installs: Vec<Box<dyn StartupPort>>,
+    retiring_installs: Vec<RetiringInstall>,
     standard_engine: EngineKind,
     capabilities: Capabilities,
     models_dir: PathBuf,
@@ -916,7 +922,16 @@ impl Controller {
             EngineSupervisor::new(Box::new(move || factory.build(EngineKind::Whisper)))
                 .with_waker(Arc::clone(&self.waker))
                 .with_deferred_teardown();
-        let install = (self.long_install_factory)(plan);
+        // Reuse the live download: starting another worker would contend for its model lock.
+        // Leave queued events for the new instance, including its request origin.
+        let (install, adopted) = match self
+            .retiring_installs
+            .iter()
+            .rposition(|install| !install.terminal)
+        {
+            Some(index) => (self.retiring_installs.swap_remove(index).port, true),
+            None => ((self.long_install_factory)(plan), false),
+        };
         self.long = Some(LongEngine {
             supervisor: Some(supervisor),
             install: Some(install),
@@ -927,11 +942,15 @@ impl Controller {
             },
             origin,
             installed: false,
+            install_terminal: false,
         });
         if self.long_hotkey_registered {
             self.long_notice = None;
         }
         self.dirty = true;
+        if adopted {
+            return;
+        }
         match self
             .long
             .as_mut()
@@ -968,13 +987,18 @@ impl Controller {
                 self.retire_long(supervisor);
             }
             if let Some(install) = long.install.take() {
-                self.retiring_installs.push(install);
+                self.retiring_installs.push(RetiringInstall {
+                    port: install,
+                    terminal: long.install_terminal,
+                });
             }
         }
     }
 
     fn fail_long_install(&mut self, reason: String) {
-        let origin = self.long.as_ref().expect("long installer exists").origin;
+        let long = self.long.as_mut().expect("long installer exists");
+        long.install_terminal = true;
+        let origin = long.origin;
         self.long_notice = Some(reason.clone());
         if origin == LongOrigin::Settings {
             if let Err(error) = self.settings.apply(SettingsPatch {
@@ -1059,6 +1083,19 @@ impl Controller {
             // Task 6 adds the owner check here; long edges are still dropped in this task.
             self.disable_long();
         }
+        self.retiring_installs.retain_mut(|install| {
+            while !install.terminal {
+                match install.port.try_recv() {
+                    Some(StartupEvent::Installed(_) | StartupEvent::Failed(_)) => {
+                        install.terminal = true;
+                    }
+                    Some(StartupEvent::Installing { .. }) => {}
+                    None => break,
+                }
+            }
+            // Keep unfinished workers for adoption and shutdown, without blocking this turn.
+            !install.terminal || !install.port.join(Duration::ZERO)
+        });
         if !self.long_desired || !self.long_start_latched {
             return;
         }
@@ -1128,6 +1165,7 @@ impl Controller {
                 StartupEvent::Installed(_) => {
                     let long = self.long.as_mut().unwrap();
                     long.installed = true;
+                    long.install_terminal = true;
                     long.state = LongState::Loading;
                     break;
                 }
@@ -1614,7 +1652,10 @@ impl Controller {
         self.postprocess.take();
         self.supervisor.take();
         for install in &mut self.retiring_installs {
-            if !install.join(deadline.saturating_duration_since(Instant::now())) {
+            if !install
+                .port
+                .join(deadline.saturating_duration_since(Instant::now()))
+            {
                 tracing::warn!("long install worker did not join before shutdown deadline");
             }
         }
@@ -2101,6 +2142,8 @@ mod tests {
         events: Mutex<VecDeque<StartupEvent>>,
         plans: Mutex<Vec<StartupPlan>>,
         hold_starts: AtomicBool,
+        enforce_install_lock: AtomicBool,
+        install_lock_held: AtomicBool,
         rescans: AtomicUsize,
         starts: AtomicUsize,
         join_budgets: Mutex<Vec<Duration>>,
@@ -2110,11 +2153,18 @@ mod tests {
         rescans: VecDeque<Option<OnboardingState>>,
         required: Vec<&'static kikigaki_core::models::Model>,
         state: Arc<StartupState>,
+        owns_install_lock: bool,
     }
 
     impl StartupPort for FakeStartup {
         fn start(&mut self) -> anyhow::Result<bool> {
             self.state.starts.fetch_add(1, Ordering::Relaxed);
+            if self.state.enforce_install_lock.load(Ordering::Relaxed) {
+                if self.state.install_lock_held.swap(true, Ordering::Relaxed) {
+                    anyhow::bail!("another install in progress for whisper");
+                }
+                self.owns_install_lock = true;
+            }
             if !self.state.hold_starts.load(Ordering::Relaxed) {
                 self.state
                     .events
@@ -2131,7 +2181,17 @@ mod tests {
         }
 
         fn try_recv(&mut self) -> Option<kikigaki_core::startup::StartupEvent> {
-            self.state.events.lock().unwrap().pop_front()
+            let event = self.state.events.lock().unwrap().pop_front();
+            if self.owns_install_lock
+                && matches!(
+                    event,
+                    Some(StartupEvent::Installed(_) | StartupEvent::Failed(_))
+                )
+            {
+                self.state.install_lock_held.store(false, Ordering::Relaxed);
+                self.owns_install_lock = false;
+            }
+            event
         }
 
         fn required(&self) -> &[&'static kikigaki_core::models::Model] {
@@ -2432,6 +2492,7 @@ mod tests {
                     &kikigaki_core::models::MODELS[1],
                 ],
                 state: Arc::clone(&startup),
+                owns_install_lock: false,
             }),
             Box::new(move |plan| {
                 long_startup_for_factory
@@ -2443,6 +2504,7 @@ mod tests {
                     rescans: VecDeque::new(),
                     required: plan.required,
                     state: Arc::clone(&long_startup_for_factory),
+                    owns_install_lock: false,
                 })
             }),
             Box::new(FakeClock(clock)),
@@ -2524,6 +2586,7 @@ mod tests {
                     rescans: VecDeque::new(),
                     required: Vec::new(),
                     state: Arc::clone(&startup),
+                    owns_install_lock: false,
                 }),
                 long_install_factory: Box::new(move |plan| {
                     long_factory_state.plans.lock().unwrap().push(plan.clone());
@@ -2531,6 +2594,7 @@ mod tests {
                         rescans: VecDeque::new(),
                         required: plan.required,
                         state: Arc::clone(&long_factory_state),
+                        owns_install_lock: false,
                     })
                 }),
                 long: None,
@@ -3033,6 +3097,150 @@ mod tests {
             h.engine(EngineKind::Local).builds.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[test]
+    fn reenable_during_inflight_install_adopts_the_running_installer() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.long_startup
+            .enforce_install_lock
+            .store(true, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.apply(false).unwrap();
+        h.turn();
+        h.apply(true).unwrap();
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installed(
+                kikigaki_core::startup::InstallReport {
+                    installed: Vec::new(),
+                    reused: Vec::new(),
+                },
+            ));
+        h.turn();
+        h.await_retirement();
+        h.turn();
+        assert!(h.controller.settings.config().long_key);
+        assert_eq!(h.long_startup.plans.lock().unwrap().len(), 1);
+        assert_eq!(h.long_startup.starts.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
+        assert_eq!(
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn reenable_after_install_finished_creates_a_fresh_installer() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.long_startup
+            .enforce_install_lock
+            .store(true, Ordering::Relaxed);
+        h.ready_long();
+        h.apply(false).unwrap();
+        h.turn();
+        h.apply(true).unwrap();
+        h.turn();
+        h.await_retirement();
+        h.turn();
+        assert_eq!(h.long_startup.plans.lock().unwrap().len(), 2);
+        assert_eq!(h.long_startup.starts.load(Ordering::Relaxed), 2);
+        assert!(h.controller.settings.config().long_key);
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
+    }
+
+    #[test]
+    fn adopted_install_failure_uses_the_new_settings_origin() {
+        let mut h = LifecycleHarness::new(true, true);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.boot(false);
+        assert_eq!(h.controller.long.as_ref().unwrap().origin, LongOrigin::Boot);
+        h.apply(false).unwrap();
+        h.turn();
+        // A queued terminal event belongs to the new request when adopted.
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Failed("download failed".into()));
+        h.apply(true).unwrap();
+        h.turn();
+        assert_eq!(h.long_startup.plans.lock().unwrap().len(), 1);
+        assert!(!h.controller.settings.config().long_key);
+        assert!(h.controller.long.is_none());
+        assert_eq!(h.controller.long_notice.as_deref(), Some("download failed"));
+    }
+
+    #[test]
+    fn retired_install_is_pruned_after_it_finishes_while_disabled() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.apply(false).unwrap();
+        h.turn();
+        assert_eq!(h.controller.retiring_installs.len(), 1);
+        h.long_startup.events.lock().unwrap().extend([
+            StartupEvent::Installing {
+                id: "whisper",
+                done_bytes: 100,
+                total_bytes: 100,
+            },
+            StartupEvent::Installed(kikigaki_core::startup::InstallReport {
+                installed: Vec::new(),
+                reused: Vec::new(),
+            }),
+        ]);
+        h.turn();
+        assert!(h.controller.retiring_installs.is_empty());
+        assert!(!h.controller.settings.config().long_key);
+        h.long_startup.hold_starts.store(false, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.turn();
+        h.await_retirement();
+        h.turn();
+        assert_eq!(h.long_startup.plans.lock().unwrap().len(), 2);
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
+    }
+
+    #[test]
+    fn retired_failed_install_is_pruned_and_never_adopted() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Failed("download failed".into()));
+        // Retire the failed port without running reconciliation first.
+        h.controller.handle_long_events();
+        h.long_startup.hold_starts.store(false, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.turn();
+        h.await_retirement();
+        h.turn();
+        assert_eq!(h.long_startup.plans.lock().unwrap().len(), 2);
+        assert!(h.controller.retiring_installs.is_empty());
+        assert!(h.controller.settings.config().long_key);
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
     }
 
     #[test]

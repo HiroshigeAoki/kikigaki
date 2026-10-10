@@ -32,7 +32,11 @@ impl StartupPlan {
         Self {
             engine: config.engine,
             models_dir: config.models_dir.clone(),
-            required: required(config.engine, caps, punct_effective(config, caps)),
+            required: required(
+                config.engine,
+                caps,
+                punct_effective(config, caps, config.engine),
+            ),
         }
     }
 

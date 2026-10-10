@@ -462,8 +462,7 @@ impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
                 kikigaki_core::postprocess::Pipeline::new(
                     replace,
                     punctuator,
-                    false,
-                    false,
+                    kikigaki_core::postprocess::PostprocessSettings::default(),
                     Arc::clone(&self.builtin),
                     builtin_enabled,
                     learned,

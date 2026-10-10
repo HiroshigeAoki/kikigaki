@@ -416,8 +416,8 @@ impl Config {
 
     /// Returns whether the selected engine already punctuates its own output, making local
     /// punctuation redundant (and, for Whisper, actively wrong to layer on top of).
-    pub fn engine_punctuates(&self) -> bool {
-        match self.engine {
+    pub fn engine_punctuates(&self, engine: EngineKind) -> bool {
+        match engine {
             EngineKind::Remote => self.remote.server_punctuates,
             EngineKind::Whisper => true,
             EngineKind::Local => false,
@@ -436,8 +436,22 @@ impl Config {
 }
 
 /// Returns whether this process should run punctuation for the selected engine.
-pub fn punct_effective(config: &Config, caps: Capabilities) -> bool {
-    config.punct.effective(caps) && !config.engine_punctuates()
+pub fn punct_effective(config: &Config, caps: Capabilities, engine: EngineKind) -> bool {
+    config.punct.effective(caps) && !config.engine_punctuates(engine)
+}
+
+/// Resolves text processing choices independently of the configured engine.
+pub fn postprocess_settings(
+    config: &Config,
+    caps: Capabilities,
+    engine: EngineKind,
+) -> crate::postprocess::PostprocessSettings {
+    crate::postprocess::PostprocessSettings {
+        punct_enabled: punct_effective(config, caps, engine),
+        strip_trailing_period: config.strip_trailing_period,
+        strip_engine_punct: engine == EngineKind::Whisper
+            && config.punct.enabled == PunctEnabled::Off,
+    }
 }
 
 const LEGACY_REMOTE_KEYS: &[&str] = &[
@@ -518,6 +532,47 @@ pub fn sidecar_endpoint(ws_url: &str) -> anyhow::Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postprocess_settings_per_engine_matches_d6() {
+        use crate::postprocess::PostprocessSettings;
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            whisper: true,
+            long_key: true,
+        };
+        for (choice, strip) in [
+            (PunctEnabled::Off, false),
+            (PunctEnabled::On, false),
+            (PunctEnabled::On, true),
+        ] {
+            let mut cfg = Config {
+                strip_trailing_period: strip,
+                ..Config::default()
+            };
+            cfg.punct.enabled = choice;
+            for engine in [EngineKind::Local, EngineKind::Whisper, EngineKind::Remote] {
+                let whisper = engine == EngineKind::Whisper;
+                assert_eq!(
+                    postprocess_settings(&cfg, caps, engine),
+                    PostprocessSettings {
+                        punct_enabled: engine == EngineKind::Local && choice != PunctEnabled::Off,
+                        strip_trailing_period: strip,
+                        strip_engine_punct: whisper && choice == PunctEnabled::Off,
+                    }
+                );
+            }
+            cfg.remote.server_punctuates = false;
+            assert_eq!(
+                postprocess_settings(&cfg, caps, EngineKind::Remote).punct_enabled,
+                choice != PunctEnabled::Off
+            );
+        }
+        let cfg = Config::default();
+        assert!(!postprocess_settings(&cfg, caps, EngineKind::Whisper).strip_engine_punct);
+        assert!(postprocess_settings(&cfg, caps, EngineKind::Local).punct_enabled);
+    }
 
     fn write(temp: &tempfile::TempDir, body: &str) -> PathBuf {
         let path = temp.path().join("config.toml");
@@ -962,7 +1017,8 @@ mod tests {
                 remote_engine: true,
                 long_key: false,
                 whisper: false,
-            }
+            },
+            cfg.engine
         ));
         cfg.remote.server_punctuates = false;
         assert!(punct_effective(
@@ -972,7 +1028,8 @@ mod tests {
                 remote_engine: true,
                 long_key: false,
                 whisper: false,
-            }
+            },
+            cfg.engine
         ));
     }
 
@@ -989,9 +1046,9 @@ mod tests {
             ..Config::default()
         };
         cfg.punct.enabled = PunctEnabled::On;
-        assert!(!punct_effective(&cfg, caps));
+        assert!(!punct_effective(&cfg, caps, cfg.engine));
         cfg.punct.enabled = PunctEnabled::Off;
-        assert!(!punct_effective(&cfg, caps));
+        assert!(!punct_effective(&cfg, caps, cfg.engine));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::engine::{join_workers, EngineMsg, SinkError, Waker};
 use crate::protocol;
 use crate::punct::nfkc;
 use crate::replace::{ReplaceFile, Rules};
-use crate::text::strip_trailing_period;
+use crate::text::{strip_touten_kuten, strip_trailing_period};
 
 /// Adds punctuation to transcription text.
 pub trait Punctuator: Send {
@@ -24,6 +24,17 @@ impl Punctuator for NoopPunctuator {
     }
 }
 
+/// Runtime text processing choices for one engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PostprocessSettings {
+    /// Whether to run the local punctuator.
+    pub punct_enabled: bool,
+    /// Whether to remove one trailing Japanese or ASCII period.
+    pub strip_trailing_period: bool,
+    /// Whether to remove Japanese commas and periods from engine output.
+    pub strip_engine_punct: bool,
+}
+
 /// Ordered normalization, replacement, punctuation, and trailing-period processing.
 pub struct Pipeline {
     /// Hot-reloaded replacement dictionary.
@@ -34,6 +45,8 @@ pub struct Pipeline {
     pub punct_enabled: bool,
     /// Whether to remove one trailing Japanese or ASCII period.
     pub strip_trailing_period: bool,
+    /// Whether to remove Japanese commas and periods from engine output.
+    pub strip_engine_punct: bool,
     builtin: Arc<Rules>,
     builtin_enabled: bool,
     learned: Arc<Rules>,
@@ -55,8 +68,7 @@ impl Pipeline {
     pub fn new(
         replace: ReplaceFile,
         punctuator: Box<dyn Punctuator>,
-        punct_enabled: bool,
-        strip_trailing_period: bool,
+        settings: PostprocessSettings,
         builtin: Arc<Rules>,
         builtin_enabled: bool,
         learned: Arc<Rules>,
@@ -65,8 +77,9 @@ impl Pipeline {
         let mut pipeline = Self {
             replace,
             punctuator,
-            punct_enabled,
-            strip_trailing_period,
+            punct_enabled: settings.punct_enabled,
+            strip_trailing_period: settings.strip_trailing_period,
+            strip_engine_punct: settings.strip_engine_punct,
             builtin,
             builtin_enabled,
             learned,
@@ -116,6 +129,11 @@ impl Pipeline {
         }
         let normalized = nfkc(raw.trim());
         let replaced = self.effective.apply(&normalized);
+        let replaced = if self.strip_engine_punct {
+            strip_touten_kuten(&replaced)
+        } else {
+            replaced
+        };
         let punctuated = if self.punct_enabled {
             match self.punctuator.punctuate(&replaced) {
                 Ok(text) => text,
@@ -161,14 +179,8 @@ pub struct ProcessedFinal {
 }
 
 enum Work {
-    Final {
-        gen: u64,
-        msg: EngineMsg,
-    },
-    Configure {
-        punct_enabled: bool,
-        strip_trailing_period: bool,
-    },
+    Final { gen: u64, msg: EngineMsg },
+    Configure(PostprocessSettings),
     ReloadRules(Arc<Rules>),
     SetBuiltinEnabled(bool),
     Shutdown,
@@ -233,12 +245,10 @@ impl PostprocessWorker {
                         Work::Final { .. } => {
                             tracing::warn!("post-processing worker received a non-final event");
                         }
-                        Work::Configure {
-                            punct_enabled,
-                            strip_trailing_period,
-                        } => {
-                            pipeline.punct_enabled = punct_enabled;
-                            pipeline.strip_trailing_period = strip_trailing_period;
+                        Work::Configure(settings) => {
+                            pipeline.punct_enabled = settings.punct_enabled;
+                            pipeline.strip_trailing_period = settings.strip_trailing_period;
+                            pipeline.strip_engine_punct = settings.strip_engine_punct;
                         }
                         Work::ReloadRules(rules) => pipeline.set_learned(rules),
                         Work::SetBuiltinEnabled(enabled) => {
@@ -268,18 +278,11 @@ impl PostprocessWorker {
     }
 
     /// Applies runtime punctuation settings before subsequently queued finals.
-    pub fn configure(
-        &self,
-        punct_enabled: bool,
-        strip_trailing_period: bool,
-    ) -> Result<(), SinkError> {
+    pub fn configure(&self, settings: PostprocessSettings) -> Result<(), SinkError> {
         self.tx
             .as_ref()
             .ok_or(SinkError::Closed)?
-            .send(Work::Configure {
-                punct_enabled,
-                strip_trailing_period,
-            })
+            .send(Work::Configure(settings))
             .map_err(|_| SinkError::Closed)
     }
 
@@ -382,8 +385,11 @@ mod tests {
             Pipeline::new(
                 replace,
                 punctuator,
-                true,
-                strip,
+                PostprocessSettings {
+                    punct_enabled: true,
+                    strip_trailing_period: strip,
+                    strip_engine_punct: false,
+                },
                 Arc::new(crate::replace::Rules::default()),
                 false,
                 Arc::new(crate::replace::Rules::default()),
@@ -411,6 +417,53 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         panic!("post-processing result not received")
+    }
+
+    #[test]
+    fn pipeline_strips_engine_punct_after_nfkc() {
+        let (_temp, replace) = replace_file("[[rule]]\nfrom = [\"ABC\"]\nto = \"置換、語。\"\n");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(NoopPunctuator),
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: true,
+            },
+            Arc::new(Rules::default()),
+            false,
+            Arc::new(Rules::default()),
+        );
+        assert_eq!(pipeline.run("ＡＢＣ､｡，．").text, "置換語,.");
+    }
+
+    #[test]
+    fn queued_configures_apply_to_following_finals_only() {
+        let (_temp, pipeline) = pipeline(
+            Box::new(RecordingPunctuator(Arc::new(Mutex::new(Vec::new())))),
+            false,
+        );
+        let worker = PostprocessWorker::spawn(pipeline);
+        worker
+            .configure(PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: true,
+            })
+            .unwrap();
+        worker.submit(1, final_msg(1, "一、二。")).unwrap();
+        worker
+            .configure(PostprocessSettings {
+                punct_enabled: true,
+                strip_trailing_period: true,
+                strip_engine_punct: false,
+            })
+            .unwrap();
+        worker.submit(2, final_msg(2, "三、四")).unwrap();
+        let first = recv(&worker);
+        let second = recv(&worker);
+        assert_eq!((first.gen, first.text.as_str()), (1, "一二"));
+        assert_eq!((second.gen, second.text.as_str()), (2, "三、四"));
     }
 
     #[test]
@@ -451,8 +504,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::Rules::default()),
             false,
             Arc::new(crate::replace::Rules::default()),
@@ -473,8 +529,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::builtin_rules().unwrap()),
             true,
             Arc::new(crate::replace::Rules::default()),
@@ -489,8 +548,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::builtin_rules().unwrap()),
             false,
             Arc::new(crate::replace::Rules::default()),
@@ -506,8 +568,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::builtin_rules().unwrap()),
             true,
             Arc::new(crate::replace::Rules::default()),
@@ -536,8 +601,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             builtin,
             true,
             learned,
@@ -562,8 +630,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::builtin_rules().unwrap()),
             true,
             Arc::new(crate::replace::Rules::default()),
@@ -586,8 +657,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::builtin_rules().unwrap()),
             false,
             Arc::new(crate::replace::Rules::default()),
@@ -619,8 +693,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             builtin,
             true,
             Arc::new(crate::replace::Rules::default()),
@@ -640,8 +717,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(RecordingPunctuator(Arc::clone(&seen))),
-            true,
-            true,
+            PostprocessSettings {
+                punct_enabled: true,
+                strip_trailing_period: true,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::Rules::default()),
             false,
             Arc::new(crate::replace::Rules::default()),
@@ -702,11 +782,17 @@ mod tests {
         worker.submit(1, final_msg(1, "one")).unwrap();
         assert_eq!(recv(&worker).text, "one。");
 
-        worker.configure(false, false).unwrap();
+        worker.configure(PostprocessSettings::default()).unwrap();
         worker.submit(2, final_msg(2, "two")).unwrap();
         assert_eq!(recv(&worker).text, "two");
 
-        worker.configure(true, true).unwrap();
+        worker
+            .configure(PostprocessSettings {
+                punct_enabled: true,
+                strip_trailing_period: true,
+                strip_engine_punct: false,
+            })
+            .unwrap();
         worker.submit(3, final_msg(3, "three")).unwrap();
         assert_eq!(recv(&worker).text, "three");
     }
@@ -726,8 +812,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            true,
-            false,
+            PostprocessSettings {
+                punct_enabled: true,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::Rules::default()),
             false,
             learned,
@@ -766,8 +855,11 @@ mod tests {
         let pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             Arc::new(crate::replace::builtin_rules().unwrap()),
             false,
             Arc::new(crate::replace::Rules::default()),
@@ -834,8 +926,11 @@ mod tests {
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(NoopPunctuator),
-            false,
-            false,
+            PostprocessSettings {
+                punct_enabled: false,
+                strip_trailing_period: false,
+                strip_engine_punct: false,
+            },
             builtin,
             true,
             Arc::new(crate::replace::Rules::default()),

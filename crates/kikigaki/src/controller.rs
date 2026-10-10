@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
-use kikigaki_core::config::{punct_effective, Capabilities, Config, EngineKind};
+use kikigaki_core::config::{
+    postprocess_settings, punct_effective, Capabilities, Config, EngineKind,
+};
 use kikigaki_core::engine::{Engine, EngineCmd, EngineMsg, EnginePhase, EngineSupervisor, Waker};
 use kikigaki_core::metrics;
 use kikigaki_core::postprocess::{to_protocol_final, PostprocessWorker};
@@ -585,11 +587,13 @@ impl Controller {
                     self.reconcile_pending = self.hotwords_desired != self.hotwords_applied;
                     let mut postprocess_config = self.settings.config().clone();
                     postprocess_config.engine = self.active_engine;
-                    let postprocess_punct = punct_effective(&postprocess_config, self.capabilities);
+                    let postprocess_settings = postprocess_settings(
+                        &postprocess_config,
+                        self.capabilities,
+                        self.active_engine,
+                    );
                     if let Some(worker) = self.postprocess.as_ref() {
-                        if let Err(error) =
-                            worker.configure(postprocess_punct, snapshot.strip_trailing_period)
-                        {
+                        if let Err(error) = worker.configure(postprocess_settings) {
                             tracing::warn!(%error, "configure post-processing");
                         }
                         if let Err(error) =
@@ -853,7 +857,7 @@ impl Controller {
             target,
             self.models_dir.clone(),
             self.capabilities,
-            punct_effective(&target_config, self.capabilities),
+            punct_effective(&target_config, self.capabilities, target),
         );
         let install = (self.engine_switch_startup_factory)(plan);
         self.engine_switch = Some(EngineSwitch {
@@ -909,10 +913,9 @@ impl Controller {
         let mut config = self.settings.config().clone();
         config.engine = engine;
         if let Some(worker) = self.postprocess.as_ref() {
-            if let Err(error) = worker.configure(
-                punct_effective(&config, self.capabilities),
-                config.strip_trailing_period,
-            ) {
+            if let Err(error) =
+                worker.configure(postprocess_settings(&config, self.capabilities, engine))
+            {
                 tracing::warn!(%error, ?engine, "configure post-processing for engine");
             }
         }
@@ -1122,10 +1125,11 @@ impl Controller {
                                 // builtin_replace_dict was already applied via
                                 // postprocess_factory.build() above; only punct settings need
                                 // a follow-up configure() since build() hardcodes those off.
-                                if let Err(error) = worker.configure(
-                                    settings.punct_enabled,
-                                    settings.strip_trailing_period,
-                                ) {
+                                if let Err(error) = worker.configure(postprocess_settings(
+                                    self.settings.config(),
+                                    self.capabilities,
+                                    self.active_engine,
+                                )) {
                                     tracing::warn!(%error, "configure new post-processing worker");
                                 }
                                 self.postprocess = Some(worker);
@@ -1528,8 +1532,9 @@ impl Controller {
         let mut active_config = self.settings.config().clone();
         active_config.engine = self.active_engine;
         settings.active_engine = self.active_engine;
-        settings.punct_enabled = punct_effective(&active_config, self.capabilities);
-        settings.engine_punctuates = active_config.engine_punctuates();
+        settings.punct_enabled =
+            punct_effective(&active_config, self.capabilities, self.active_engine);
+        settings.engine_punctuates = active_config.engine_punctuates(self.active_engine);
         settings
     }
 
@@ -1955,8 +1960,7 @@ mod tests {
                 Pipeline::new(
                     ReplaceFile::new(self.replace_file.clone()),
                     Box::new(PeriodPunctuator(Arc::clone(&self.punctuator))),
-                    false,
-                    false,
+                    kikigaki_core::postprocess::PostprocessSettings::default(),
                     Arc::clone(&self.builtin),
                     builtin_enabled,
                     learned,
@@ -3218,7 +3222,7 @@ mod tests {
     fn whisper_trailing_period_follows_strip_setting_without_local_punctuation() {
         for (strip, expected) in [(false, "Whisper。"), (true, "Whisper")] {
             let harness = harness_with_engine_options(
-                false,
+                true,
                 false,
                 EngineKind::Whisper,
                 VecDeque::new(),

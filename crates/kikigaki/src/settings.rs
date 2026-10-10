@@ -70,7 +70,11 @@ impl SettingsCoordinator {
         SettingsSnapshot {
             hotkey: self.config.hotkey.clone(),
             long_available: self.capabilities.long_key,
-            punct_enabled: kikigaki_core::config::punct_effective(&self.config, self.capabilities),
+            punct_enabled: kikigaki_core::config::punct_effective(
+                &self.config,
+                self.capabilities,
+                self.config.engine,
+            ),
             strip_trailing_period: self.config.strip_trailing_period,
             builtin_replace_dict: self.config.builtin_replace_dict,
             transcript_log: self.config.transcript_log,
@@ -78,7 +82,7 @@ impl SettingsCoordinator {
             paste_method: self.config.paste_method,
             engine: self.config.engine,
             active_engine: self.config.engine,
-            engine_punctuates: self.config.engine_punctuates(),
+            engine_punctuates: self.config.engine_punctuates(self.config.engine),
             whisper_available: self.capabilities.whisper && cfg!(target_os = "macos"),
         }
     }

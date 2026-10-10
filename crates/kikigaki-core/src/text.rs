@@ -1,3 +1,8 @@
+/// Removes Japanese commas and periods while preserving all other characters.
+pub fn strip_touten_kuten(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '、' | '。')).collect()
+}
+
 /// Removes one trailing Japanese or ASCII period.
 pub fn strip_trailing_period(s: &str) -> String {
     s.strip_suffix('。')
@@ -9,6 +14,15 @@ pub fn strip_trailing_period(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_touten_kuten_removes_only_touten_kuten() {
+        assert_eq!(
+            strip_touten_kuten("、こんにちは。a,b.c!？「」"),
+            "こんにちはa,b.c!？「」"
+        );
+        assert_eq!(strip_touten_kuten(""), "");
+    }
 
     #[test]
     fn strips_single_trailing_kuten() {

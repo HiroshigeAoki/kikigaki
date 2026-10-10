@@ -241,6 +241,8 @@ pub enum EnginePhase {
 pub struct EngineSupervisor {
     factory: EngineFactory,
     current: Option<Box<dyn Engine>>,
+    closed: Option<Box<dyn Engine>>,
+    deferred_teardown: bool,
     phase: EnginePhase,
     disconnected_seen: bool,
     waker: Option<Waker>,
@@ -252,6 +254,8 @@ impl EngineSupervisor {
         Self {
             factory,
             current: None,
+            closed: None,
+            deferred_teardown: false,
             phase: EnginePhase::Starting,
             disconnected_seen: false,
             waker: None,
@@ -264,8 +268,23 @@ impl EngineSupervisor {
         self
     }
 
+    /// Keeps an engine whose event channel closed until the caller can retire it off-thread.
+    /// Callers must retire this supervisor on `Disconnected`, before polling it again.
+    pub fn with_deferred_teardown(mut self) -> Self {
+        self.deferred_teardown = true;
+        self
+    }
+
+    /// Transfers the closed engine without running its shutdown on the polling thread.
+    pub fn take_closed_engine(&mut self) -> Option<Box<dyn Engine>> {
+        self.closed.take()
+    }
+
     /// Constructs the initial engine and leaves it in the startup phase until `Ready` arrives.
     pub fn start(&mut self) -> anyhow::Result<()> {
+        if let Some(engine) = self.closed.take() {
+            engine.shutdown();
+        }
         if let Some(engine) = self.current.take() {
             engine.shutdown();
         }
@@ -306,6 +325,9 @@ impl EngineSupervisor {
     /// Used when a dependency that must accompany the engine (for example the post-processing
     /// pipeline) fails after `start` already spawned the engine worker.
     pub fn shutdown(&mut self) {
+        if let Some(engine) = self.closed.take() {
+            engine.shutdown();
+        }
         if let Some(engine) = self.current.take() {
             engine.shutdown();
         }
@@ -349,7 +371,11 @@ impl EngineSupervisor {
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
                 if let Some(engine) = self.current.take() {
-                    engine.shutdown();
+                    if self.deferred_teardown {
+                        self.closed = Some(engine);
+                    } else {
+                        engine.shutdown();
+                    }
                 }
                 self.phase = EnginePhase::Failed;
                 if self.disconnected_seen {
@@ -368,6 +394,9 @@ impl EngineSupervisor {
 
 impl Drop for EngineSupervisor {
     fn drop(&mut self) {
+        if let Some(engine) = self.closed.take() {
+            engine.shutdown();
+        }
         if let Some(engine) = self.current.take() {
             engine.shutdown();
         }
@@ -436,6 +465,33 @@ mod tests {
 
     use super::*;
     use crate::engine::fake::FakeEngine;
+
+    #[test]
+    fn deferred_teardown_supervisor_hands_out_closed_engine() {
+        let mut fake = FakeEngine::new();
+        let shutdown = fake.shutdown_flag();
+        fake.close_events();
+        let engine = Arc::new(std::sync::Mutex::new(Some(fake)));
+        let mut supervisor = EngineSupervisor::new(Box::new(move || {
+            Ok(Box::new(engine.lock().unwrap().take().unwrap()))
+        }))
+        .with_deferred_teardown();
+        supervisor.start().unwrap();
+        assert!(matches!(
+            supervisor.try_recv(),
+            Some(EngineMsg::Disconnected { .. })
+        ));
+        assert_eq!(supervisor.phase(), EnginePhase::Failed);
+        assert!(!shutdown.load(Ordering::Relaxed));
+        assert!(supervisor.sink().is_none());
+        assert!(supervisor.try_recv().is_none());
+        let closed = supervisor.take_closed_engine().unwrap();
+        assert!(supervisor.take_closed_engine().is_none());
+        drop(supervisor);
+        assert!(!shutdown.load(Ordering::Relaxed));
+        closed.shutdown();
+        assert!(shutdown.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn audio_on_full_drops_counts_and_warns_once() {

@@ -221,9 +221,20 @@ fn start_controller(
     } else {
         tracing::info!(chord = %cfg.hotkey, "initial hotkey registered");
     }
+    let long_hotkey_registered = cfg.long_key_effective(capabilities).then(|| {
+        match hotkeys.register(HotkeyKey::Long, &cfg.long_hotkey) {
+            Ok(()) => {
+                tracing::info!(chord = %cfg.long_hotkey, "initial long hotkey registered");
+                true
+            }
+            Err(error) => {
+                tracing::error!(hotkey = %cfg.long_hotkey, %error, "failed to register the initial long hotkey");
+                false
+            }
+        }
+    });
     let startup_plan = kikigaki_core::startup::StartupPlan::from_config(&cfg, capabilities);
     let engine_factory = Arc::new(TauriEngineFactory {
-        engine_kind: Mutex::new(cfg.engine),
         local_models_dir: cfg.models_dir.clone(),
         local_asr_cfg: cfg.asr.clone(),
         local_vad_cfg: cfg.vad.clone(),
@@ -246,6 +257,8 @@ fn start_controller(
         builtin,
     });
     let startup_port = Box::new(crate::startup::StartupCoordinatorPort::new(startup_plan));
+    let long_install_factory: crate::controller::StartupPortFactory =
+        Box::new(|plan| Box::new(crate::startup::StartupCoordinatorPort::new(plan)));
     let models_dir = cfg.models_dir.clone();
     let ports = state
         .controller_ports
@@ -260,6 +273,7 @@ fn start_controller(
             models_dir,
             bootstrap,
             process_started_at: state.process_started_at,
+            long_hotkey_registered,
         },
         ports.cmd_rx,
         ports.hotkey_rx,
@@ -271,7 +285,7 @@ fn start_controller(
         Box::new(crate::mic::Mic::new()),
         postprocess_factory,
         startup_port,
-        Box::new(|plan| Box::new(crate::startup::StartupCoordinatorPort::new(plan))),
+        long_install_factory,
         Box::new(crate::controller::RealClock),
     );
     let controller_death = spawn_controller_death_monitor(handle.clone(), exited_rx);
@@ -345,11 +359,6 @@ fn default_snapshot(
     bootstrap_error: Option<crate::status::BootstrapError>,
 ) -> crate::status::UiSnapshot {
     let settings_snapshot = settings.snapshot();
-    let engine = match settings.config().engine {
-        kikigaki_core::config::EngineKind::Local => "local",
-        kikigaki_core::config::EngineKind::Remote => "remote",
-        kikigaki_core::config::EngineKind::Whisper => "whisper",
-    };
     let phase = if bootstrap_error.is_some() {
         "failed"
     } else {
@@ -364,8 +373,7 @@ fn default_snapshot(
             hotkey: settings_snapshot.hotkey.clone(),
             punct_enabled: settings_snapshot.punct_enabled,
             strip_trailing_period: settings_snapshot.strip_trailing_period,
-            engine_punctuates: settings_snapshot.engine_punctuates,
-            engine,
+            long_hotkey: None,
         },
         settings: settings_snapshot,
         autostart: autostart_state(app),
@@ -376,7 +384,6 @@ fn default_snapshot(
 }
 
 struct TauriEngineFactory {
-    engine_kind: Mutex<kikigaki_core::config::EngineKind>,
     local_models_dir: std::path::PathBuf,
     local_asr_cfg: kikigaki_core::config::AsrConfig,
     local_vad_cfg: kikigaki_core::config::VadConfig,
@@ -442,10 +449,6 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
 
     fn set_hotwords_enabled(&self, enabled: bool) {
         self.hotwords_enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    fn set_engine_kind(&self, kind: kikigaki_core::config::EngineKind) {
-        *self.engine_kind.lock().unwrap() = kind;
     }
 }
 

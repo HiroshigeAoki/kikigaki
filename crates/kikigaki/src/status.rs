@@ -9,8 +9,16 @@ pub struct UiStatus {
     pub hotkey: String,
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
-    pub engine_punctuates: bool,
-    pub engine: &'static str,
+    pub long_hotkey: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LongStateView {
+    Installing { percent: u8 },
+    Loading,
+    Ready,
+    Failed { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -131,6 +139,29 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_state_view_serializes_as_tagged() {
+        for (state, expected) in [
+            (
+                LongStateView::Installing { percent: 45 },
+                serde_json::json!({"kind":"installing","percent":45}),
+            ),
+            (
+                LongStateView::Loading,
+                serde_json::json!({"kind":"loading"}),
+            ),
+            (LongStateView::Ready, serde_json::json!({"kind":"ready"})),
+            (
+                LongStateView::Failed {
+                    message: "failed".into(),
+                },
+                serde_json::json!({"kind":"failed","message":"failed"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn message_maps_every_status_variant() {

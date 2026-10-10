@@ -393,8 +393,8 @@ impl Config {
         if self.engine == EngineKind::Remote && !caps.remote_engine {
             bail!("engine = \"remote\" requires a build with the remote-engine feature");
         }
-        if self.engine == EngineKind::Whisper && !caps.whisper {
-            bail!("engine = \"whisper\" requires a build with the whisper feature");
+        if self.engine == EngineKind::Whisper {
+            bail!("engine = \"whisper\" is no longer supported; use long_key = true");
         }
         if self.remote.spawn_sidecar {
             let (host, _) = sidecar_endpoint(&self.remote.ws_url)?;
@@ -916,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_whisper_engine_without_the_feature_when_capabilities_say_so() {
+    fn validate_rejects_whisper_as_standard_engine_even_with_the_feature() {
         let cfg = Config {
             engine: EngineKind::Whisper,
             ..Config::default()
@@ -937,7 +937,7 @@ mod tests {
                 long_key: false,
                 whisper: true,
             })
-            .is_ok());
+            .is_err());
     }
 
     #[test]

@@ -3,13 +3,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
-use kikigaki_core::config::{
-    postprocess_settings, punct_effective, Capabilities, Config, EngineKind,
-};
+use kikigaki_core::config::{postprocess_settings, Capabilities, Config, EngineKind};
 use kikigaki_core::engine::{Engine, EngineCmd, EngineMsg, EnginePhase, EngineSupervisor, Waker};
 use kikigaki_core::metrics;
 use kikigaki_core::postprocess::{to_protocol_final, PostprocessWorker};
@@ -46,6 +44,9 @@ pub enum ControllerCmd {
         reply: ReplyTx<crate::settings::SettingsSnapshot>,
     },
     ClearHistory {
+        reply: ReplyTx<()>,
+    },
+    RetryLongEngine {
         reply: ReplyTx<()>,
     },
     RetryDownload {
@@ -86,8 +87,6 @@ pub trait EngineFactory: Send + Sync {
     fn build(&self, kind: EngineKind) -> anyhow::Result<Box<dyn Engine>>;
 
     fn set_hotwords_enabled(&self, _enabled: bool) {}
-
-    fn set_engine_kind(&self, _kind: EngineKind) {}
 }
 
 pub trait MicPort: Send {
@@ -224,6 +223,7 @@ pub struct ControllerConfig {
     pub models_dir: PathBuf,
     pub bootstrap: BootstrapOutcome,
     pub process_started_at: Instant,
+    pub long_hotkey_registered: Option<bool>,
 }
 
 pub fn client_channels() -> (
@@ -255,7 +255,7 @@ pub fn spawn(
     mic: Box<dyn MicPort>,
     postprocess_factory: Box<dyn PostprocessFactory>,
     startup: Box<dyn StartupPort>,
-    engine_switch_startup_factory: StartupPortFactory,
+    long_install_factory: StartupPortFactory,
     clock: Box<dyn Clock>,
 ) -> (ControllerHandle, Receiver<()>) {
     spawn_with_poll_interval(
@@ -270,7 +270,7 @@ pub fn spawn(
         mic,
         postprocess_factory,
         startup,
-        engine_switch_startup_factory,
+        long_install_factory,
         clock,
         POLL_INTERVAL,
     )
@@ -289,7 +289,7 @@ fn spawn_with_poll_interval(
     mic: Box<dyn MicPort>,
     postprocess_factory: Box<dyn PostprocessFactory>,
     startup: Box<dyn StartupPort>,
-    engine_switch_startup_factory: StartupPortFactory,
+    long_install_factory: StartupPortFactory,
     clock: Box<dyn Clock>,
     poll_interval: Duration,
 ) -> (ControllerHandle, Receiver<()>) {
@@ -309,7 +309,7 @@ fn spawn_with_poll_interval(
                 mic,
                 postprocess_factory,
                 startup,
-                engine_switch_startup_factory,
+                long_install_factory,
                 clock,
                 controller_client,
                 poll_interval,
@@ -366,7 +366,7 @@ fn run(
     mic: Box<dyn MicPort>,
     postprocess_factory: Box<dyn PostprocessFactory>,
     startup: Box<dyn StartupPort>,
-    engine_switch_startup_factory: StartupPortFactory,
+    long_install_factory: StartupPortFactory,
     clock: Box<dyn Clock>,
     controller_client: ControllerClient,
     poll_interval: Duration,
@@ -377,13 +377,14 @@ fn run(
         models_dir,
         bootstrap,
         process_started_at,
+        long_hotkey_registered,
     } = cfg;
     let session = Session::new(SessionConfig {
         silence_pad_ms: settings.config().silence_pad_ms,
         final_timeout: Duration::from_millis(settings.config().final_timeout_ms),
     });
     let hotwords_enabled = settings.config().builtin_replace_dict;
-    let active_engine = settings.config().engine;
+    let standard_engine = settings.config().engine;
     let learned_path = settings.config().learned_file.clone();
     let (onboarding, bootstrap_error, auto_start) = match bootstrap {
         BootstrapOutcome::ReadyToStart => {
@@ -415,25 +416,30 @@ fn run(
     };
     let waker: Waker = Arc::new(move || controller_client.wake());
     let supervisor_factory = Arc::clone(&engine_factory);
-    let engine_selector = Arc::new(Mutex::new(active_engine));
-    let selector = Arc::clone(&engine_selector);
-    let supervisor = EngineSupervisor::new(Box::new(move || {
-        let kind = *selector.lock().unwrap();
-        supervisor_factory.build(kind)
-    }))
-    .with_waker(Arc::clone(&waker));
+    let supervisor =
+        EngineSupervisor::new(Box::new(move || supervisor_factory.build(standard_engine)))
+            .with_waker(Arc::clone(&waker));
+    let long_desired = settings.config().long_key_effective(capabilities);
+    let long_registered = long_desired && long_hotkey_registered != Some(false);
     let mut controller = Controller {
         settings,
         session,
         mic,
         supervisor: Some(supervisor),
         engine_factory,
-        engine_selector,
         startup,
-        engine_switch_startup_factory,
-        engine_switch_install: None,
-        engine_switch: None,
-        active_engine,
+        long_install_factory,
+        long: None,
+        long_desired,
+        long_origin: LongOrigin::Boot,
+        long_start_latched: false,
+        long_disable_pending: false,
+        long_hotkey_registered: long_registered,
+        long_notice: (long_desired && long_hotkey_registered == Some(false))
+            .then(|| "長文キーのホットキーが無効 — 再設定してください".into()),
+        retiring: Vec::new(),
+        retiring_installs: Vec::new(),
+        standard_engine,
         capabilities,
         models_dir,
         postprocess_factory,
@@ -495,36 +501,41 @@ fn run(
             controller.handle_hotkey_edge(edge, &mut outputs);
         }
         controller.reconcile_hotwords(&mut outputs);
-        controller.reconcile_engine_switch(&mut outputs);
         controller.handle_startup_events(&mut outputs);
         controller.handle_postprocess_events(&mut outputs);
         controller.handle_engine_messages(&mut outputs);
+        controller.handle_long_events();
         outputs.extend(
             controller
                 .session
                 .handle(Input::Tick, controller.clock.now()),
         );
         controller.execute_outputs(std::mem::take(&mut outputs));
-        // A final paste can make the session idle in execute_outputs(). Commit a waiting
-        // engine switch in that same turn, before another hotkey press can start an utterance.
-        controller.reconcile_engine_switch(&mut outputs);
-        controller.execute_outputs(std::mem::take(&mut outputs));
+        controller.reconcile_long();
         controller.publish_if_changed();
     }
 }
 
-struct EngineSwitch {
-    request_id: u64,
-    previous: EngineKind,
-    target: EngineKind,
-    stage: EngineSwitchStage,
+#[derive(Debug)]
+enum LongState {
+    Installing { percent: u8 },
+    Loading,
+    Ready,
+    Failed { reason: String },
 }
 
-enum EngineSwitchStage {
-    Installing,
-    WaitingForIdle,
-    WaitingForReady,
-    RollingBack { reason: String },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongOrigin {
+    Boot,
+    Settings,
+}
+
+struct LongEngine {
+    supervisor: Option<EngineSupervisor>,
+    install: Option<Box<dyn StartupPort>>,
+    state: LongState,
+    origin: LongOrigin,
+    installed: bool,
 }
 
 struct Controller {
@@ -533,12 +544,18 @@ struct Controller {
     mic: Box<dyn MicPort>,
     supervisor: Option<EngineSupervisor>,
     engine_factory: Arc<dyn EngineFactory>,
-    engine_selector: Arc<Mutex<EngineKind>>,
     startup: Box<dyn StartupPort>,
-    engine_switch_startup_factory: StartupPortFactory,
-    engine_switch_install: Option<Box<dyn StartupPort>>,
-    engine_switch: Option<EngineSwitch>,
-    active_engine: EngineKind,
+    long_install_factory: StartupPortFactory,
+    long: Option<LongEngine>,
+    long_desired: bool,
+    long_origin: LongOrigin,
+    long_start_latched: bool,
+    long_disable_pending: bool,
+    long_hotkey_registered: bool,
+    long_notice: Option<String>,
+    retiring: Vec<std::thread::JoinHandle<()>>,
+    retiring_installs: Vec<Box<dyn StartupPort>>,
+    standard_engine: EngineKind,
     capabilities: Capabilities,
     models_dir: PathBuf,
     postprocess_factory: Box<dyn PostprocessFactory>,
@@ -581,60 +598,16 @@ impl Controller {
         match command {
             ControllerCmd::Wake => {}
             ControllerCmd::ApplySettings { patch, reply } => {
-                if patch.engine.is_some() && self.postprocess.is_none() {
-                    let _ = reply.send(Err(UiError {
-                        code: "engine_not_started",
-                        message: "起動が完了していないため、認識エンジンを切り替えられません"
-                            .into(),
-                    }));
-                    return;
-                }
-                if patch.engine.is_some() && self.engine_switch.is_some() {
-                    let _ = reply.send(Err(UiError {
-                        code: "switch_in_progress",
-                        message: "エンジンを切り替え中です".into(),
-                    }));
-                    return;
-                }
-                let requested_engine = patch.engine;
-                let result = self.settings.apply(patch).map(|snapshot| {
-                    self.hotwords_desired = snapshot.builtin_replace_dict;
-                    self.reconcile_pending = self.hotwords_desired != self.hotwords_applied;
-                    let mut postprocess_config = self.settings.config().clone();
-                    postprocess_config.engine = self.active_engine;
-                    let postprocess_settings = postprocess_settings(
-                        &postprocess_config,
-                        self.capabilities,
-                        self.active_engine,
-                    );
-                    if let Some(worker) = self.postprocess.as_ref() {
-                        if let Err(error) = worker.configure(postprocess_settings) {
-                            tracing::warn!(%error, "configure post-processing");
-                        }
-                        if let Err(error) =
-                            worker.set_builtin_enabled(snapshot.builtin_replace_dict)
-                        {
-                            tracing::warn!(%error, "configure builtin replacement dictionary");
-                            self.postprocess_degraded =
-                                Some("内蔵置換辞書を反映できませんでした".into());
-                            // Persistence is authoritative: disk state can run ahead of the live
-                            // worker after a delivery failure, so return the persisted snapshot.
-                        } else {
-                            self.postprocess_degraded = None;
-                        }
-                    }
-                    if let Some(target) =
-                        requested_engine.filter(|target| *target != self.active_engine)
-                    {
-                        self.start_engine_switch(target);
-                    }
-                    self.settings_snapshot()
-                });
+                let result = self.apply_settings(patch);
                 let _ = reply.send(result);
             }
             ControllerCmd::ClearHistory { reply } => {
                 self.history.clear();
                 let _ = reply.send(Ok(()));
+            }
+            ControllerCmd::RetryLongEngine { reply } => {
+                let result = self.retry_long();
+                let _ = reply.send(result);
             }
             ControllerCmd::RetryDownload { reply } => {
                 let result = if self.download_in_flight {
@@ -770,7 +743,6 @@ impl Controller {
             strip_trailing_period: None,
             builtin_replace_dict: None,
             transcript_log: None,
-            engine: None,
         }) {
             Ok(_) => {
                 tracing::info!(chord = %chord, "hotkey re-registered after settings change");
@@ -785,21 +757,11 @@ impl Controller {
     }
 
     fn handle_hotkey_edge(&mut self, edge: HotkeyEdge, outputs: &mut Vec<Output>) {
-        let blocks_press = self.engine_switch.as_ref().is_some_and(|switch| {
-            matches!(
-                switch.stage,
-                EngineSwitchStage::WaitingForReady | EngineSwitchStage::RollingBack { .. }
-            )
-        });
-        if blocks_press && matches!(&edge, HotkeyEdge::Pressed(_)) {
-            self.dirty = true;
-            return;
-        }
         let Some(input) = hotkey_input(
             edge,
             self.window_focused,
             self.capturing_hotkey,
-            self.active_engine,
+            self.standard_engine,
         ) else {
             return;
         };
@@ -808,9 +770,6 @@ impl Controller {
     }
 
     fn reconcile_hotwords(&mut self, outputs: &mut Vec<Output>) {
-        if self.engine_switch.is_some() {
-            return;
-        }
         if !self.reconcile_pending {
             return;
         }
@@ -818,7 +777,7 @@ impl Controller {
             self.reconcile_pending = false;
             return;
         }
-        if matches!(self.active_engine, EngineKind::Remote | EngineKind::Whisper) {
+        if self.standard_engine == EngineKind::Remote {
             self.engine_factory
                 .set_hotwords_enabled(self.hotwords_desired);
             self.hotwords_applied = self.hotwords_desired;
@@ -864,214 +823,345 @@ impl Controller {
         self.dirty = true;
     }
 
-    fn start_engine_switch(&mut self, target: EngineKind) {
-        let previous = self.active_engine;
-        let mut target_config = self.settings.config().clone();
-        target_config.engine = target;
+    fn apply_settings(
+        &mut self,
+        patch: SettingsPatch,
+    ) -> Result<crate::settings::SettingsSnapshot, UiError> {
+        let requested = patch.long_key;
+        if requested == Some(true) && !self.capabilities.long_key {
+            return Err(UiError {
+                code: "unsupported_engine",
+                message: "この機能はこのビルドでは利用できません".into(),
+            });
+        }
+        if requested == Some(true) && self.status.is_startup_failed() && self.postprocess.is_none()
+        {
+            return Err(UiError {
+                code: "engine_not_started",
+                message: "起動が完了していないため、長文キーを有効にできません".into(),
+            });
+        }
+        let newly_registered = requested == Some(true) && !self.long_hotkey_registered;
+        if newly_registered {
+            let chord = patch
+                .long_hotkey
+                .as_deref()
+                .unwrap_or(&self.settings.config().long_hotkey);
+            self.hotkeys
+                .register(HotkeyKey::Long, chord)
+                .map_err(|message| UiError {
+                    code: "register_failed",
+                    message,
+                })?;
+        }
+        let snapshot = match self.settings.apply(patch) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if newly_registered {
+                    if let Err(message) = self.hotkeys.unregister(HotkeyKey::Long) {
+                        tracing::warn!(%message, "rollback long hotkey registration");
+                        self.long_notice =
+                            Some("長文キーのホットキーが無効 — 再設定してください".into());
+                    }
+                }
+                return Err(error);
+            }
+        };
+        self.hotwords_desired = snapshot.builtin_replace_dict;
+        self.reconcile_pending = self.hotwords_desired != self.hotwords_applied;
+        if let Some(worker) = self.postprocess.as_ref() {
+            if let Err(error) = worker.configure(postprocess_settings(
+                self.settings.config(),
+                self.capabilities,
+                self.standard_engine,
+            )) {
+                tracing::warn!(%error, "configure post-processing");
+            }
+            if let Err(error) = worker.set_builtin_enabled(snapshot.builtin_replace_dict) {
+                tracing::warn!(%error, "configure builtin replacement dictionary");
+                self.postprocess_degraded = Some("内蔵置換辞書を反映できませんでした".into());
+            } else {
+                self.postprocess_degraded = None;
+            }
+        }
+        if let Some(enabled) = requested {
+            let previously_desired = self.long_desired;
+            self.long_desired = enabled && self.capabilities.long_key;
+            self.long_disable_pending = !self.long_desired;
+            if self.long_desired {
+                if newly_registered {
+                    self.long_hotkey_registered = true;
+                    self.long_notice = None;
+                }
+                if !previously_desired {
+                    self.long_origin = LongOrigin::Settings;
+                }
+                if self.long_start_latched && self.long.is_none() {
+                    self.start_long(self.long_origin);
+                }
+            }
+        }
+        Ok(self.settings_snapshot())
+    }
+
+    fn start_long(&mut self, origin: LongOrigin) {
         let plan = StartupPlan::for_target(
-            target,
+            EngineKind::Whisper,
             self.models_dir.clone(),
             self.capabilities,
-            punct_effective(&target_config, self.capabilities, target),
+            false,
         );
-        let install = (self.engine_switch_startup_factory)(plan);
-        self.engine_switch = Some(EngineSwitch {
-            request_id: self.engine_build_generation,
-            previous,
-            target,
-            stage: EngineSwitchStage::Installing,
+        let factory = Arc::clone(&self.engine_factory);
+        let supervisor =
+            EngineSupervisor::new(Box::new(move || factory.build(EngineKind::Whisper)))
+                .with_waker(Arc::clone(&self.waker))
+                .with_deferred_teardown();
+        let install = (self.long_install_factory)(plan);
+        self.long = Some(LongEngine {
+            supervisor: Some(supervisor),
+            install: Some(install),
+            state: if self.retiring.is_empty() {
+                LongState::Installing { percent: 0 }
+            } else {
+                LongState::Loading
+            },
+            origin,
+            installed: false,
         });
-        self.engine_switch_install = Some(install);
-        let started = self
-            .engine_switch_install
+        if self.long_hotkey_registered {
+            self.long_notice = None;
+        }
+        self.dirty = true;
+        match self
+            .long
             .as_mut()
-            .expect("engine switch installer was just created")
-            .start();
-        match started {
-            Ok(true) => {}
-            Ok(false) => self.fail_engine_switch_install(
-                previous,
-                "Engine model installation is already running".into(),
-            ),
-            Err(error) => self.fail_engine_switch_install(
-                previous,
-                format!("Engine model installation failed — {error}"),
-            ),
-        }
-        self.dirty = true;
-    }
-
-    fn fail_engine_switch_install(&mut self, previous: EngineKind, reason: String) {
-        self.revert_engine_setting(previous);
-        self.configure_postprocess_for_engine(previous);
-        self.engine_switch = None;
-        self.engine_switch_install = None;
-        self.status = Status::Warning(reason);
-        self.dirty = true;
-    }
-
-    fn revert_engine_setting(&mut self, previous: EngineKind) {
-        if let Err(error) = self.settings.apply(SettingsPatch {
-            engine: Some(previous),
-            ..SettingsPatch::default()
-        }) {
-            tracing::error!(
-                code = error.code,
-                message = %error.message,
-                engine = ?previous,
-                "failed to revert persisted engine setting"
-            );
-        }
-    }
-
-    fn configure_postprocess_for_engine(&mut self, engine: EngineKind) {
-        let mut config = self.settings.config().clone();
-        config.engine = engine;
-        if let Some(worker) = self.postprocess.as_ref() {
-            if let Err(error) =
-                worker.configure(postprocess_settings(&config, self.capabilities, engine))
-            {
-                tracing::warn!(%error, ?engine, "configure post-processing for engine");
-            }
-        }
-    }
-
-    fn reconcile_engine_switch(&mut self, outputs: &mut Vec<Output>) {
-        if matches!(
-            self.engine_switch.as_ref().map(|switch| &switch.stage),
-            Some(EngineSwitchStage::Installing)
-        ) {
-            while let Some(event) = self
-                .engine_switch_install
-                .as_mut()
-                .and_then(|install| install.try_recv())
-            {
-                self.dirty = true;
-                match event {
-                    StartupEvent::Installing {
-                        id,
-                        done_bytes,
-                        total_bytes,
-                    } => {
-                        if matches!(&self.status, Status::Ok | Status::Installing(_)) {
-                            self.status =
-                                Status::Installing(progress_message(id, done_bytes, total_bytes));
-                        }
-                    }
-                    StartupEvent::Installed(_) => {
-                        if let Some(switch) = self.engine_switch.as_mut() {
-                            switch.stage = EngineSwitchStage::WaitingForIdle;
-                        }
-                        if matches!(&self.status, Status::Installing(_)) {
-                            self.status = Status::Ok;
-                        }
-                        break;
-                    }
-                    StartupEvent::Failed(reason) => {
-                        let previous = self
-                            .engine_switch
-                            .as_ref()
-                            .expect("install event requires an engine switch")
-                            .previous;
-                        self.fail_engine_switch_install(previous, reason);
-                        return;
-                    }
-                }
-            }
-        }
-
-        if !matches!(
-            self.engine_switch.as_ref().map(|switch| &switch.stage),
-            Some(EngineSwitchStage::WaitingForIdle)
-        ) || !matches!(self.session.state(), State::Idle | State::Disconnected)
-            || self
-                .supervisor
-                .as_ref()
-                .is_none_or(|supervisor| supervisor.phase() == EnginePhase::Starting)
+            .unwrap()
+            .install
+            .as_mut()
+            .unwrap()
+            .start()
         {
-            return;
-        }
-
-        let target = self
-            .engine_switch
-            .as_ref()
-            .expect("waiting switch checked above")
-            .target;
-        *self.engine_selector.lock().unwrap() = target;
-        self.engine_factory.set_engine_kind(target);
-        self.engine_build_generation = self.engine_build_generation.wrapping_add(1);
-        if let Some(switch) = self.engine_switch.as_mut() {
-            switch.request_id = self.engine_build_generation;
-        }
-        tracing::info!(
-            from = ?self.active_engine,
-            to = ?target,
-            engine_build_generation = self.engine_build_generation,
-            "engine switch: restarting supervisor"
-        );
-        let restart = self
-            .supervisor
-            .as_mut()
-            .expect("supervisor checked above")
-            .restart();
-        match restart {
-            Ok(true) => {
-                if let Some(switch) = self.engine_switch.as_mut() {
-                    switch.stage = EngineSwitchStage::WaitingForReady;
-                }
-            }
+            Ok(true) => {}
             Ok(false) => {
-                *self.engine_selector.lock().unwrap() = self.active_engine;
-                self.engine_factory.set_engine_kind(self.active_engine);
+                self.fail_long_install("Long engine model installation is already running".into())
             }
             Err(error) => {
-                let switch = self
-                    .engine_switch
-                    .take()
-                    .expect("waiting switch checked above");
-                self.begin_engine_switch_rollback(
-                    switch,
-                    format!("Engine restart failed — {error}"),
-                    outputs,
-                );
+                self.fail_long_install(format!("Long engine model installation failed — {error}"))
             }
+        }
+    }
+
+    fn retire_long(&mut self, mut supervisor: EngineSupervisor) {
+        // A closed event channel has already removed current; both forms must shut down here.
+        let closed = supervisor.take_closed_engine();
+        self.retiring.push(std::thread::spawn(move || {
+            if let Some(engine) = closed {
+                engine.shutdown();
+            }
+            drop(supervisor);
+        }));
+    }
+
+    fn retire_long_instance(&mut self) {
+        if let Some(mut long) = self.long.take() {
+            if let Some(supervisor) = long.supervisor.take() {
+                self.retire_long(supervisor);
+            }
+            if let Some(install) = long.install.take() {
+                self.retiring_installs.push(install);
+            }
+        }
+    }
+
+    fn fail_long_install(&mut self, reason: String) {
+        let origin = self.long.as_ref().expect("long installer exists").origin;
+        self.long_notice = Some(reason.clone());
+        if origin == LongOrigin::Settings {
+            if let Err(error) = self.settings.apply(SettingsPatch {
+                long_key: Some(false),
+                ..SettingsPatch::default()
+            }) {
+                tracing::error!(code = error.code, message = %error.message, "failed to compensate long key installation failure");
+                self.long_notice = Some(format!("{reason} / {}", error.message));
+            }
+            self.long_desired = false;
+            self.long_disable_pending = true;
+            self.disable_long();
+        } else {
+            self.fail_long_load(reason, None);
         }
         self.dirty = true;
     }
 
-    fn begin_engine_switch_rollback(
-        &mut self,
-        mut switch: EngineSwitch,
-        reason: String,
-        outputs: &mut Vec<Output>,
-    ) {
-        *self.engine_selector.lock().unwrap() = switch.previous;
-        self.engine_factory.set_engine_kind(switch.previous);
-        self.revert_engine_setting(switch.previous);
-        self.configure_postprocess_for_engine(switch.previous);
-        self.engine_build_generation = self.engine_build_generation.wrapping_add(1);
-        switch.request_id = self.engine_build_generation;
-        match self.supervisor.as_mut().map(EngineSupervisor::restart) {
-            Some(Ok(true)) => {
-                switch.stage = EngineSwitchStage::RollingBack { reason };
-                self.engine_switch = Some(switch);
+    fn fail_long_load(&mut self, reason: String, failed_model: Option<&'static str>) {
+        let supervisor = if let Some(long) = self.long.as_mut() {
+            if failed_model.is_some() {
+                if let Some(install) = long.install.as_mut() {
+                    install.invalidate_model_load_failure(failed_model);
+                }
             }
-            Some(Ok(false)) | None => {
-                self.engine_switch_install = None;
-                self.status = Status::EngineFailed(reason);
-                outputs.extend(
-                    self.session
-                        .handle(Input::EngineDisconnected, self.clock.now()),
-                );
+            long.state = LongState::Failed {
+                reason: reason.clone(),
+            };
+            long.supervisor.take()
+        } else {
+            None
+        };
+        if let Some(supervisor) = supervisor {
+            self.retire_long(supervisor);
+        }
+        self.long_notice = Some(reason);
+        self.dirty = true;
+    }
+
+    fn disable_long(&mut self) {
+        if self.long_hotkey_registered {
+            if let Err(message) = self.hotkeys.unregister(HotkeyKey::Long) {
+                tracing::warn!(%message, "unregister long hotkey");
+                self.long_notice = Some("長文キーのホットキーが無効 — 再設定してください".into());
             }
-            Some(Err(error)) => {
-                self.engine_switch_install = None;
-                self.status =
-                    Status::EngineFailed(format!("Engine rollback restart failed — {error}"));
-                outputs.extend(
-                    self.session
-                        .handle(Input::EngineDisconnected, self.clock.now()),
-                );
+            self.long_hotkey_registered = false;
+        }
+        self.retire_long_instance();
+        self.long_disable_pending = false;
+        self.dirty = true;
+    }
+
+    fn retry_long(&mut self) -> Result<(), UiError> {
+        let Some(origin) = self
+            .long
+            .as_ref()
+            .and_then(|long| matches!(long.state, LongState::Failed { .. }).then_some(long.origin))
+        else {
+            return Err(UiError {
+                code: "not_failed",
+                message: "長文エンジンは停止していません".into(),
+            });
+        };
+        self.retire_long_instance();
+        self.start_long(origin);
+        Ok(())
+    }
+
+    fn reconcile_long(&mut self) {
+        let mut pending = Vec::new();
+        for handle in self.retiring.drain(..) {
+            if handle.is_finished() {
+                if handle.join().is_err() {
+                    tracing::warn!("long engine retirement panicked");
+                }
+            } else {
+                pending.push(handle);
+            }
+        }
+        self.retiring = pending;
+        if self.long_disable_pending {
+            // Task 6 adds the owner check here; long edges are still dropped in this task.
+            self.disable_long();
+        }
+        if !self.long_desired || !self.long_start_latched {
+            return;
+        }
+        if self.long.is_none() {
+            self.start_long(self.long_origin);
+        }
+        self.start_installed_long();
+    }
+
+    fn start_installed_long(&mut self) {
+        let can_start = self.retiring.is_empty()
+            && self.long.as_ref().is_some_and(|long| {
+                long.installed
+                    && matches!(long.state, LongState::Loading)
+                    && long
+                        .supervisor
+                        .as_ref()
+                        .is_some_and(|supervisor| supervisor.sink().is_none())
+            });
+        if can_start {
+            let result = self
+                .long
+                .as_mut()
+                .unwrap()
+                .supervisor
+                .as_mut()
+                .unwrap()
+                .start();
+            if let Err(error) = result {
+                self.fail_long_load(format!("Long engine start failed — {error}"), None);
+            }
+        }
+    }
+
+    fn handle_long_events(&mut self) {
+        if !self.long_desired {
+            return;
+        }
+        loop {
+            let event = self
+                .long
+                .as_mut()
+                .filter(|long| !long.installed && !matches!(long.state, LongState::Failed { .. }))
+                .and_then(|long| long.install.as_mut())
+                .and_then(|install| install.try_recv());
+            let Some(event) = event else {
+                break;
+            };
+            self.dirty = true;
+            match event {
+                StartupEvent::Installing {
+                    done_bytes,
+                    total_bytes,
+                    ..
+                } => {
+                    let percent = if total_bytes == 0 {
+                        0
+                    } else {
+                        (done_bytes.saturating_mul(100) / total_bytes).min(100) as u8
+                    };
+                    self.long.as_mut().unwrap().state = if self.retiring.is_empty() {
+                        LongState::Installing { percent }
+                    } else {
+                        LongState::Loading
+                    };
+                }
+                StartupEvent::Installed(_) => {
+                    let long = self.long.as_mut().unwrap();
+                    long.installed = true;
+                    long.state = LongState::Loading;
+                    break;
+                }
+                StartupEvent::Failed(reason) => {
+                    self.fail_long_install(reason);
+                    return;
+                }
+            }
+        }
+        self.start_installed_long();
+        loop {
+            let message = self
+                .long
+                .as_mut()
+                .and_then(|long| long.supervisor.as_mut())
+                .and_then(EngineSupervisor::try_recv);
+            let Some(message) = message else {
+                break;
+            };
+            self.dirty = true;
+            match message {
+                EngineMsg::Ready => self.long.as_mut().unwrap().state = LongState::Ready,
+                EngineMsg::Disconnected {
+                    reason,
+                    failed_model,
+                } => {
+                    self.fail_long_load(reason, failed_model);
+                    // Retire the entire supervisor before another poll can shut it down inline.
+                    break;
+                }
+                EngineMsg::Final { gen, .. } => {
+                    // Routing and owner validation arrive in Task 6.
+                    tracing::warn!(gen, "ignoring long final without utterance routing");
+                }
             }
         }
     }
@@ -1146,7 +1236,7 @@ impl Controller {
                                 if let Err(error) = worker.configure(postprocess_settings(
                                     self.settings.config(),
                                     self.capabilities,
-                                    self.active_engine,
+                                    self.standard_engine,
                                 )) {
                                     tracing::warn!(%error, "configure new post-processing worker");
                                 }
@@ -1235,47 +1325,7 @@ impl Controller {
             self.dirty = true;
             let input = match message {
                 EngineMsg::Ready => {
-                    let rollback_completed = if matches!(
-                        self.engine_switch.as_ref().map(|switch| &switch.stage),
-                        Some(EngineSwitchStage::WaitingForReady)
-                    ) {
-                        let switch = self
-                            .engine_switch
-                            .take()
-                            .expect("waiting switch checked above");
-                        self.active_engine = switch.target;
-                        self.startup = self
-                            .engine_switch_install
-                            .take()
-                            .expect("committing switch has a target startup coordinator");
-                        self.configure_postprocess_for_engine(switch.target);
-                        self.status = Status::Ok;
-                        tracing::info!(
-                            target = ?switch.target,
-                            request_id = switch.request_id,
-                            "engine switch committed"
-                        );
-                        false
-                    } else if matches!(
-                        self.engine_switch.as_ref().map(|switch| &switch.stage),
-                        Some(EngineSwitchStage::RollingBack { .. })
-                    ) {
-                        let switch = self
-                            .engine_switch
-                            .take()
-                            .expect("rolling-back switch checked above");
-                        let EngineSwitchStage::RollingBack { reason } = switch.stage else {
-                            unreachable!("rolling-back switch checked above");
-                        };
-                        self.active_engine = switch.previous;
-                        self.engine_switch_install = None;
-                        self.configure_postprocess_for_engine(switch.previous);
-                        self.status = Status::Warning(reason);
-                        true
-                    } else {
-                        false
-                    };
-                    let stale = self.active_engine == EngineKind::Local
+                    let stale = self.standard_engine == EngineKind::Local
                         && self.hotwords_applied != self.hotwords_desired;
                     if stale {
                         self.reconcile_pending = true;
@@ -1283,7 +1333,7 @@ impl Controller {
                             engine_build_generation = self.engine_build_generation,
                             "engine ready for superseded hotword configuration"
                         );
-                    } else if !rollback_completed {
+                    } else {
                         let process_to_ready_ms = self
                             .clock
                             .now()
@@ -1304,6 +1354,12 @@ impl Controller {
                             self.first_ready = false;
                         }
                         self.status = Status::Ok;
+                        if !self.long_start_latched {
+                            self.long_start_latched = true;
+                            if self.long_desired {
+                                self.start_long(self.long_origin);
+                            }
+                        }
                     }
                     Input::Engine(Event::Ready { sr: SAMPLE_RATE })
                 }
@@ -1322,44 +1378,6 @@ impl Controller {
                     failed_model,
                 } => {
                     tracing::info!(failed_model, "engine disconnected");
-                    if matches!(
-                        self.engine_switch.as_ref().map(|switch| &switch.stage),
-                        Some(EngineSwitchStage::WaitingForReady)
-                    ) {
-                        if let Some(id) = failed_model {
-                            if let Some(install) = self.engine_switch_install.as_mut() {
-                                install.invalidate_model_load_failure(Some(id));
-                            }
-                        }
-                        let switch = self
-                            .engine_switch
-                            .take()
-                            .expect("waiting switch checked above");
-                        self.begin_engine_switch_rollback(switch, reason, outputs);
-                        continue;
-                    }
-                    if matches!(
-                        self.engine_switch.as_ref().map(|switch| &switch.stage),
-                        Some(EngineSwitchStage::RollingBack { .. })
-                    ) {
-                        let switch = self
-                            .engine_switch
-                            .take()
-                            .expect("rolling-back switch checked above");
-                        self.engine_switch_install = None;
-                        if let EngineSwitchStage::RollingBack {
-                            reason: first_reason,
-                        } = switch.stage
-                        {
-                            tracing::error!(
-                                target = ?switch.target,
-                                previous = ?switch.previous,
-                                first_reason,
-                                second_reason = %reason,
-                                "engine switch rollback also failed; giving up on the transaction"
-                            );
-                        }
-                    }
                     let startup_failed = failed_model.is_some()
                         && self.startup.invalidate_model_load_failure(failed_model);
                     self.status = if startup_failed {
@@ -1431,7 +1449,7 @@ impl Controller {
                                 crate::transcript::enqueue(
                                     self.settings.config().transcript_log,
                                     self.settings.config().transcript_dir.clone(),
-                                    match self.active_engine {
+                                    match self.standard_engine {
                                         EngineKind::Local => "local",
                                         EngineKind::Remote => "remote",
                                         EngineKind::Whisper => "whisper",
@@ -1503,19 +1521,10 @@ impl Controller {
         #[cfg(test)]
         self.sink.record_snapshot_build();
         let settings = self.settings_snapshot();
-        let swap_in_progress = self.engine_switch.as_ref().is_some_and(|switch| {
-            matches!(
-                switch.stage,
-                EngineSwitchStage::WaitingForReady | EngineSwitchStage::RollingBack { .. }
-            )
-        });
-        let phase = if swap_in_progress {
-            EnginePhase::Starting
-        } else {
-            self.supervisor
-                .as_ref()
-                .map_or(EnginePhase::Failed, EngineSupervisor::phase)
-        };
+        let phase = self
+            .supervisor
+            .as_ref()
+            .map_or(EnginePhase::Failed, EngineSupervisor::phase);
         let status = self.effective_status();
         UiSnapshot {
             revision: self.revision,
@@ -1526,12 +1535,9 @@ impl Controller {
                 hotkey: settings.hotkey.clone(),
                 punct_enabled: settings.punct_enabled,
                 strip_trailing_period: settings.strip_trailing_period,
-                engine_punctuates: settings.engine_punctuates,
-                engine: match self.active_engine {
-                    EngineKind::Local => "local",
-                    EngineKind::Remote => "remote",
-                    EngineKind::Whisper => "whisper",
-                },
+                long_hotkey: self
+                    .long_hotkey_registered
+                    .then(|| settings.long_hotkey.clone()),
             },
             settings,
             // The platform shell replaces this Tauri-free placeholder before publishing.
@@ -1547,23 +1553,38 @@ impl Controller {
 
     fn settings_snapshot(&self) -> crate::settings::SettingsSnapshot {
         let mut settings = self.settings.snapshot();
-        let mut active_config = self.settings.config().clone();
-        active_config.engine = self.active_engine;
-        settings.active_engine = self.active_engine;
-        settings.punct_enabled =
-            punct_effective(&active_config, self.capabilities, self.active_engine);
-        settings.engine_punctuates = active_config.engine_punctuates(self.active_engine);
+        settings.long_state = self.long.as_ref().map(|long| match &long.state {
+            LongState::Installing { percent } => {
+                crate::status::LongStateView::Installing { percent: *percent }
+            }
+            LongState::Loading => crate::status::LongStateView::Loading,
+            LongState::Ready => crate::status::LongStateView::Ready,
+            LongState::Failed { reason } => crate::status::LongStateView::Failed {
+                message: reason.clone(),
+            },
+        });
         settings
     }
 
     fn effective_status(&self) -> Status {
-        match (&self.status, &self.postprocess_degraded) {
-            (Status::EngineFailed(engine), Some(postprocess)) => {
-                Status::EngineFailed(format!("{engine} / {postprocess}"))
-            }
-            (Status::StartupFailed(_), _) | (_, None) => self.status.clone(),
-            (_, Some(postprocess)) => Status::Warning(postprocess.clone()),
+        if matches!(
+            self.status,
+            Status::StartupFailed(_) | Status::EngineFailed(_)
+        ) {
+            return match (&self.status, &self.postprocess_degraded) {
+                (Status::EngineFailed(engine), Some(postprocess)) => {
+                    Status::EngineFailed(format!("{engine} / {postprocess}"))
+                }
+                _ => self.status.clone(),
+            };
         }
+        if let Some(notice) = &self.long_notice {
+            return Status::Warning(notice.clone());
+        }
+        self.postprocess_degraded.as_ref().map_or_else(
+            || self.status.clone(),
+            |message| Status::Warning(message.clone()),
+        )
     }
 
     fn publish_if_changed(&mut self) {
@@ -1588,18 +1609,33 @@ impl Controller {
         self.shutting_down = true;
         self.dirty = true;
         self.mic.stop();
+        let deadline = Instant::now() + Duration::from_millis(4500);
+        self.retire_long_instance();
         self.postprocess.take();
         self.supervisor.take();
-        if self
-            .engine_switch_install
-            .as_mut()
-            .is_some_and(|install| !install.join(Duration::from_millis(500)))
-        {
-            tracing::warn!("engine switch startup worker did not join before shutdown deadline");
+        for install in &mut self.retiring_installs {
+            if !install.join(deadline.saturating_duration_since(Instant::now())) {
+                tracing::warn!("long install worker did not join before shutdown deadline");
+            }
         }
-        self.engine_switch_install.take();
-        if !self.startup.join(Duration::from_millis(500)) {
+        self.retiring_installs.clear();
+        if !self
+            .startup
+            .join(deadline.saturating_duration_since(Instant::now()))
+        {
             tracing::warn!("startup worker did not join before shutdown deadline");
+        }
+        for handle in self.retiring.drain(..) {
+            let (done, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(handle.join());
+            });
+            if !matches!(
+                rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+                Ok(Ok(()))
+            ) {
+                tracing::warn!("long engine retirement did not join before shutdown deadline");
+            }
         }
         self.publish_if_changed();
     }
@@ -1609,14 +1645,14 @@ fn hotkey_input(
     edge: HotkeyEdge,
     window_focused: bool,
     capturing_hotkey: bool,
-    active_engine: EngineKind,
+    standard_engine: EngineKind,
 ) -> Option<Input> {
     match edge {
         HotkeyEdge::Pressed(HotkeyKey::Long) | HotkeyEdge::Released(HotkeyKey::Long) => None,
         HotkeyEdge::Pressed(HotkeyKey::Standard) if window_focused || capturing_hotkey => None,
         HotkeyEdge::Pressed(HotkeyKey::Standard) => Some(Input::Pressed),
         HotkeyEdge::Released(HotkeyKey::Standard) => Some(Input::Released {
-            engine: active_engine,
+            engine: standard_engine,
         }),
     }
 }
@@ -1862,6 +1898,15 @@ mod tests {
         }
 
         fn shutdown(self: Box<Self>) {
+            self.state
+                .shutdown_threads
+                .lock()
+                .unwrap()
+                .push(thread::current().name().unwrap_or("unnamed").into());
+            if let Some(gate) = self.state.shutdown_gate.lock().unwrap().take() {
+                gate.entered.send(()).unwrap();
+                gate.release.recv().unwrap();
+            }
             if let Some(delay) = *self.state.shutdown_delay.lock().unwrap() {
                 thread::sleep(delay);
             }
@@ -1881,6 +1926,8 @@ mod tests {
         builds: AtomicUsize,
         observed_enabled: Mutex<Vec<bool>>,
         shutdown_delay: Mutex<Option<Duration>>,
+        shutdown_gate: Mutex<Option<BuildGate>>,
+        shutdown_threads: Mutex<Vec<String>>,
         observed_kinds: Mutex<Vec<EngineKind>>,
         plans: Mutex<VecDeque<FakeEngineBuild>>,
         event_senders: Mutex<Vec<SyncSender<EngineMsg>>>,
@@ -2056,6 +2103,7 @@ mod tests {
         hold_starts: AtomicBool,
         rescans: AtomicUsize,
         starts: AtomicUsize,
+        join_budgets: Mutex<Vec<Duration>>,
     }
 
     struct FakeStartup {
@@ -2102,7 +2150,8 @@ mod tests {
                 .unwrap_or(true)
         }
 
-        fn join(&mut self, _timeout: Duration) -> bool {
+        fn join(&mut self, timeout: Duration) -> bool {
+            self.state.join_budgets.lock().unwrap().push(timeout);
             true
         }
 
@@ -2256,6 +2305,43 @@ mod tests {
         gate: Option<BuildGate>,
         poll_interval: Duration,
     ) -> Harness {
+        harness_with_boot_long(
+            punct,
+            builtin_replace_dict,
+            engine_kind,
+            engine_plans,
+            bootstrap,
+            hotkey_plan,
+            rescans,
+            reject_late_paste,
+            clock,
+            gate,
+            poll_interval,
+            BootLong::default(),
+        )
+    }
+
+    #[derive(Default)]
+    struct BootLong {
+        enabled: bool,
+        registration: Option<bool>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn harness_with_boot_long(
+        punct: bool,
+        builtin_replace_dict: bool,
+        engine_kind: EngineKind,
+        engine_plans: VecDeque<FakeEngineBuild>,
+        bootstrap: BootstrapOutcome,
+        hotkey_plan: Vec<Result<(), String>>,
+        rescans: Vec<Option<OnboardingState>>,
+        reject_late_paste: bool,
+        clock: Option<Instant>,
+        gate: Option<BuildGate>,
+        poll_interval: Duration,
+        boot_long: BootLong,
+    ) -> Harness {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         let replace_file = temp.path().join("replace.toml");
@@ -2271,28 +2357,18 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "hotkey = \"Alt+Space\"\nengine = \"{engine_name}\"\nstrip_trailing_period = false\nbuiltin_replace_dict = {builtin_replace_dict}\nreplace_file = {:?}\nlearned_file = {:?}\nmetrics_path = {:?}\nmodels_dir = {:?}\n[punct]\nenabled = {}\n",
-                replace_file, learned_file, metrics_path, models_dir, punct,
+                "hotkey = \"Alt+Space\"\nengine = \"{engine_name}\"\nlong_key = {}\nstrip_trailing_period = false\nbuiltin_replace_dict = {builtin_replace_dict}\nreplace_file = {:?}\nlearned_file = {:?}\nmetrics_path = {:?}\nmodels_dir = {:?}\n[punct]\nenabled = {}\n",
+                boot_long.enabled, replace_file, learned_file, metrics_path, models_dir, punct,
             ),
         )
         .unwrap();
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: false,
+            long_key: true,
             whisper: true,
         };
-        let mut settings = SettingsCoordinator::load(config_path, capabilities).unwrap();
-        // Disk Whisper settings migrate to Local; exercise the intermediate engine switch
-        // through its supported patch path instead.
-        if engine_kind == EngineKind::Whisper {
-            settings
-                .apply(SettingsPatch {
-                    engine: Some(engine_kind),
-                    ..SettingsPatch::default()
-                })
-                .unwrap();
-        }
+        let settings = SettingsCoordinator::load(config_path, capabilities).unwrap();
         let (client, rx, hotkey, hotkey_rx) = client_channels();
         let tx = client.tx.clone();
         let snapshots = SinkState::default();
@@ -2333,6 +2409,7 @@ mod tests {
                 models_dir,
                 bootstrap,
                 process_started_at: Instant::now(),
+                long_hotkey_registered: boot_long.registration,
             },
             rx,
             hotkey_rx,
@@ -2385,6 +2462,748 @@ mod tests {
             metrics_path,
             startup,
             long_startup,
+        }
+    }
+
+    // Direct turns reuse the injected ports above; gates make teardown assertions deterministic.
+    struct LifecycleHarness {
+        controller: Controller,
+        engines: Arc<Vec<(EngineKind, Arc<FakeEngineState>)>>,
+        hotkeys: Arc<HotkeyState>,
+        startup: Arc<StartupState>,
+        long_startup: Arc<StartupState>,
+        pastes: Arc<PasteState>,
+        _temp: tempfile::TempDir,
+    }
+
+    impl Drop for LifecycleHarness {
+        fn drop(&mut self) {
+            self.controller.begin_shutdown();
+        }
+    }
+
+    impl LifecycleHarness {
+        fn new(enabled: bool, capable: bool) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            let replace_file = temp.path().join("replace.toml");
+            std::fs::write(&replace_file, "").unwrap();
+            std::fs::write(&path, format!("long_key = {enabled}\nreplace_file = {:?}\nmetrics_path = {:?}\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"))).unwrap();
+            let capabilities = Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: !capable,
+                long_key: capable,
+            };
+            let settings = SettingsCoordinator::load(path, capabilities).unwrap();
+            let engines = Arc::new(Vec::from([
+                (EngineKind::Local, Arc::new(FakeEngineState::default())),
+                (EngineKind::Remote, Arc::new(FakeEngineState::default())),
+                (EngineKind::Whisper, Arc::new(FakeEngineState::default())),
+            ]));
+            let factory: Arc<dyn EngineFactory> =
+                Arc::new(FakeEngineFactory::from_states(Arc::clone(&engines)));
+            let standard_factory = Arc::clone(&factory);
+            let hotkeys = Arc::new(HotkeyState::default());
+            let startup = Arc::new(StartupState::default());
+            let long_startup = Arc::new(StartupState::default());
+            let long_factory_state = Arc::clone(&long_startup);
+            let pastes = Arc::new(PasteState::default());
+            let controller = Controller {
+                settings,
+                session: Session::new(SessionConfig {
+                    silence_pad_ms: 500,
+                    final_timeout: Duration::from_secs(3),
+                }),
+                mic: Box::new(FakeMic(Arc::new(MicState::default()))),
+                supervisor: Some(EngineSupervisor::new(Box::new(move || {
+                    standard_factory.build(EngineKind::Local)
+                }))),
+                engine_factory: factory,
+                startup: Box::new(FakeStartup {
+                    rescans: VecDeque::new(),
+                    required: Vec::new(),
+                    state: Arc::clone(&startup),
+                }),
+                long_install_factory: Box::new(move |plan| {
+                    long_factory_state.plans.lock().unwrap().push(plan.clone());
+                    Box::new(FakeStartup {
+                        rescans: VecDeque::new(),
+                        required: plan.required,
+                        state: Arc::clone(&long_factory_state),
+                    })
+                }),
+                long: None,
+                long_desired: enabled && capable,
+                long_origin: LongOrigin::Boot,
+                long_start_latched: false,
+                long_disable_pending: false,
+                long_hotkey_registered: enabled && capable,
+                long_notice: None,
+                retiring: Vec::new(),
+                retiring_installs: Vec::new(),
+                standard_engine: EngineKind::Local,
+                capabilities,
+                models_dir: temp.path().join("models"),
+                postprocess_factory: Box::new(FakePostprocessFactory {
+                    replace_file,
+                    builtin: Arc::new(kikigaki_core::replace::builtin_rules().unwrap()),
+                    gate: Mutex::new(None),
+                    punctuator: Arc::new(PunctuatorState::default()),
+                }),
+                waker: Arc::new(|| {}),
+                postprocess: None,
+                sink: Box::new(FakeSink(SinkState::default())),
+                hotkeys: Box::new(ScriptedHotkeys(Arc::clone(&hotkeys))),
+                paster: Box::new(FakePaster(Arc::clone(&pastes))),
+                clock: Box::new(RealClock),
+                history: History::default(),
+                learned: Learned::empty(temp.path().join("learned.toml")),
+                status: Status::Ok,
+                onboarding: None,
+                bootstrap_error: None,
+                download_in_flight: false,
+                window_focused: false,
+                capturing_hotkey: false,
+                last_snapshot: None,
+                dirty: true,
+                revision: 0,
+                process_started_at: Instant::now(),
+                startup_cold: false,
+                first_ready: true,
+                pending_finals: HashMap::new(),
+                active_generation: 0,
+                hotwords_desired: false,
+                hotwords_applied: false,
+                reconcile_pending: false,
+                engine_build_generation: 0,
+                postprocess_degraded: None,
+                shutting_down: false,
+            };
+            Self {
+                controller,
+                engines,
+                hotkeys,
+                startup,
+                long_startup,
+                pastes,
+                _temp: temp,
+            }
+        }
+
+        fn engine(&self, kind: EngineKind) -> Arc<FakeEngineState> {
+            Arc::clone(&self.engines.iter().find(|(key, _)| *key == kind).unwrap().1)
+        }
+
+        fn turn(&mut self) {
+            let c = &mut self.controller;
+            let mut outputs = Vec::new();
+            c.reconcile_hotwords(&mut outputs);
+            c.handle_startup_events(&mut outputs);
+            c.handle_postprocess_events(&mut outputs);
+            c.handle_engine_messages(&mut outputs);
+            c.handle_long_events();
+            c.execute_outputs(outputs);
+            c.reconcile_long();
+        }
+
+        fn boot(&mut self, pending: bool) {
+            if pending {
+                self.engine(EngineKind::Local)
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .push_back(FakeEngineBuild::Pending);
+            }
+            self.controller.startup.start().unwrap();
+            self.turn();
+        }
+
+        fn apply(&mut self, enabled: bool) -> Result<SettingsSnapshot, UiError> {
+            let (reply, rx) = mpsc::sync_channel(1);
+            self.controller
+                .handle_command(ControllerCmd::ApplySettings {
+                    patch: SettingsPatch {
+                        long_key: Some(enabled),
+                        ..SettingsPatch::default()
+                    },
+                    reply,
+                });
+            rx.try_recv().unwrap()
+        }
+
+        fn retry(&mut self) -> Result<(), UiError> {
+            let (reply, rx) = mpsc::sync_channel(1);
+            self.controller
+                .handle_command(ControllerCmd::RetryLongEngine { reply });
+            rx.try_recv().unwrap()
+        }
+
+        fn ready_long(&mut self) {
+            self.boot(false);
+            self.apply(true).unwrap();
+            self.turn();
+            assert!(matches!(
+                self.controller.long.as_ref().unwrap().state,
+                LongState::Ready
+            ));
+        }
+
+        fn disconnected(&mut self, model: Option<&'static str>) {
+            self.engine(EngineKind::Whisper)
+                .send(EngineMsg::Disconnected {
+                    reason: "long failed".into(),
+                    failed_model: model,
+                });
+            self.turn();
+        }
+
+        fn await_retirement(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !self.controller.retiring.is_empty() {
+                assert!(Instant::now() < deadline, "retirement did not finish");
+                self.turn();
+                thread::yield_now();
+            }
+        }
+
+        fn shutdown_gate(&self) -> (Receiver<()>, SyncSender<()>) {
+            let (entered, entered_rx) = mpsc::sync_channel(1);
+            let (release, release_rx) = mpsc::sync_channel(1);
+            *self
+                .engine(EngineKind::Whisper)
+                .shutdown_gate
+                .lock()
+                .unwrap() = Some(BuildGate {
+                entered,
+                release: release_rx,
+            });
+            (entered_rx, release)
+        }
+
+        fn dictate(&mut self) {
+            let c = &mut self.controller;
+            let mut outputs = Vec::new();
+            c.handle_hotkey_edge(HotkeyEdge::Pressed(HotkeyKey::Standard), &mut outputs);
+            c.handle_hotkey_edge(HotkeyEdge::Released(HotkeyKey::Standard), &mut outputs);
+            c.execute_outputs(outputs);
+            assert_eq!(c.session.state(), State::Finalizing);
+            self.engine(EngineKind::Local)
+                .send(final_message(1, "standard works"));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self.pastes.attempts.lock().unwrap().is_empty() {
+                assert!(Instant::now() < deadline, "standard dictation stalled");
+                self.turn();
+                thread::yield_now();
+            }
+            assert_eq!(self.controller.session.state(), State::Idle);
+        }
+    }
+
+    #[test]
+    fn long_engine_starts_only_after_standard_first_ready() {
+        let mut h = LifecycleHarness::new(true, true);
+        h.boot(true);
+        assert!(h.controller.long.is_none());
+        assert_eq!(h.long_startup.starts.load(Ordering::Relaxed), 0);
+        h.controller.hotwords_desired = true;
+        h.engine(EngineKind::Local).send(EngineMsg::Ready);
+        h.turn();
+        assert!(
+            h.controller.long.is_none(),
+            "stale Ready must not latch long startup"
+        );
+        h.turn();
+        assert!(h.controller.long.is_some());
+        assert_eq!(h.long_startup.starts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn standard_restart_ready_does_not_recreate_long() {
+        let mut h = LifecycleHarness::new(true, true);
+        h.boot(false);
+        h.controller.first_ready = true; // Metrics and long-start latches are independent.
+        h.controller.supervisor.as_mut().unwrap().restart().unwrap();
+        h.turn();
+        assert_eq!(h.long_startup.starts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn long_engine_reaches_ready_through_install_and_load() {
+        let mut h = LifecycleHarness::new(true, true);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.engine(EngineKind::Whisper)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
+        h.boot(false);
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installing {
+                id: "whisper",
+                done_bytes: 45,
+                total_bytes: 100,
+            });
+        h.turn();
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Installing { percent: 45 }
+        ));
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installed(
+                kikigaki_core::startup::InstallReport {
+                    installed: Vec::new(),
+                    reused: Vec::new(),
+                },
+            ));
+        h.turn();
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Loading
+        ));
+        h.engine(EngineKind::Whisper).send(EngineMsg::Ready);
+        h.turn();
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
+        let plans = h.long_startup.plans.lock().unwrap();
+        assert_eq!(plans[0].engine, EngineKind::Whisper);
+        assert!(!plans[0]
+            .required
+            .iter()
+            .any(|model| model.id == "mojicast-punct"));
+    }
+
+    #[test]
+    fn long_events_never_change_session_or_standard_status() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.controller.status = Status::Warning("paste warning".into());
+        h.controller.startup_cold = true;
+        h.apply(true).unwrap();
+        h.turn();
+        h.disconnected(None);
+        assert_eq!(h.controller.session.state(), State::Idle);
+        assert_eq!(h.controller.status, Status::Warning("paste warning".into()));
+        assert!(h.controller.startup_cold);
+        assert!(!h.controller.download_in_flight);
+        assert!(h.controller.onboarding.is_none());
+        assert_eq!(h.controller.snapshot().status.phase, "ready");
+        h.engine(EngineKind::Local).send(EngineMsg::Ready);
+        h.turn();
+        assert_eq!(
+            h.controller.snapshot().status.message.as_deref(),
+            Some("long failed")
+        );
+        h.controller.status = Status::StartupFailed("standard failed".into());
+        assert_eq!(
+            h.controller.snapshot().status.message.as_deref(),
+            Some("standard failed")
+        );
+    }
+
+    #[test]
+    fn long_install_progress_does_not_clear_a_paste_warning() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.controller.status = Status::Warning("paste warning".into());
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installing {
+                id: "whisper",
+                done_bytes: 45,
+                total_bytes: 100,
+            });
+        h.turn();
+        assert_eq!(
+            h.controller.snapshot().status.message.as_deref(),
+            Some("paste warning")
+        );
+    }
+
+    #[test]
+    fn enable_registers_then_persists_then_starts() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(true);
+        let result = h.apply(true).unwrap();
+        assert!(result.long_key);
+        assert_eq!(
+            *h.hotkeys.registered.lock().unwrap(),
+            [(HotkeyKey::Long, "Alt+Shift+Space".into())]
+        );
+        assert!(std::fs::read_to_string(h._temp.path().join("config.toml"))
+            .unwrap()
+            .contains("long_key = true"));
+        assert_eq!(h.long_startup.starts.load(Ordering::Relaxed), 0);
+        h.engine(EngineKind::Local).send(EngineMsg::Ready);
+        h.turn();
+        assert_eq!(h.long_startup.starts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn enable_registration_failure_does_not_persist() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.hotkeys
+            .plan
+            .lock()
+            .unwrap()
+            .push_back(Err("registration failed".into()));
+        assert_eq!(h.apply(true).unwrap_err().code, "register_failed");
+        assert!(!h.controller.settings.config().long_key);
+        assert!(h.controller.long.is_none());
+    }
+
+    #[test]
+    fn enable_persist_failure_unregisters() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        std::fs::write(h._temp.path().join("config.toml"), "# external change\n").unwrap();
+        assert_eq!(h.apply(true).unwrap_err().code, "external_change");
+        assert_eq!(*h.hotkeys.unregistered.lock().unwrap(), [HotkeyKey::Long]);
+        assert!(!h.controller.long_desired);
+        assert!(h.controller.long.is_none());
+    }
+
+    #[test]
+    fn enable_install_failure_reverts_long_key_and_unregisters() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Failed("download failed".into()));
+        h.turn();
+        assert!(!h.controller.settings.config().long_key);
+        assert_eq!(*h.hotkeys.unregistered.lock().unwrap(), [HotkeyKey::Long]);
+        assert!(h.controller.long.is_none());
+        assert_eq!(h.controller.long_notice.as_deref(), Some("download failed"));
+        assert_eq!(h.controller.session.state(), State::Idle);
+    }
+
+    #[test]
+    fn load_failure_keeps_long_key_and_reports_failed() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.ready_long();
+        h.disconnected(None);
+        assert!(h.controller.settings.config().long_key);
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Failed { .. }
+        ));
+        assert!(h.hotkeys.unregistered.lock().unwrap().is_empty());
+        assert_eq!(h.controller.session.state(), State::Idle);
+    }
+
+    #[test]
+    fn start_error_goes_to_failed() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.engine(EngineKind::Whisper)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Fail("start failed".into()));
+        h.apply(true).unwrap();
+        h.turn();
+        assert!(h.controller.settings.config().long_key);
+        assert!(
+            matches!(&h.controller.long.as_ref().unwrap().state, LongState::Failed { reason } if reason.contains("start failed"))
+        );
+    }
+
+    #[test]
+    fn long_channel_closed_without_message_retires_off_thread() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.ready_long();
+        let (entered, release) = h.shutdown_gate();
+        h.engine(EngineKind::Whisper)
+            .event_senders
+            .lock()
+            .unwrap()
+            .clear();
+        h.turn();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Failed { .. }
+        ));
+        assert_eq!(h.controller.retiring.len(), 1);
+        h.dictate();
+        release.send(()).unwrap();
+        h.await_retirement();
+    }
+
+    #[test]
+    fn retry_from_failed_invalidates_failed_model_and_recreates() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        assert_eq!(h.retry().unwrap_err().code, "not_failed");
+        h.apply(true).unwrap();
+        h.turn();
+        h.disconnected(Some(kikigaki_core::models::WHISPER_MODEL_ID));
+        assert_eq!(
+            *h.long_startup.invalidated.lock().unwrap(),
+            [kikigaki_core::models::WHISPER_MODEL_ID]
+        );
+        assert!(h.startup.invalidated.lock().unwrap().is_empty());
+        h.retry().unwrap();
+        h.await_retirement();
+        h.turn();
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
+        assert_eq!(
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(h.long_startup.starts.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn disable_retires_off_thread_while_standard_keeps_dictating() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.ready_long();
+        *h.engine(EngineKind::Whisper).shutdown_delay.lock().unwrap() =
+            Some(Duration::from_millis(1500));
+        let (entered, release) = h.shutdown_gate();
+        h.apply(false).unwrap();
+        h.turn();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        h.dictate();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(h.controller.long.is_none());
+        assert_eq!(*h.hotkeys.unregistered.lock().unwrap(), [HotkeyKey::Long]);
+        release.send(()).unwrap();
+        h.await_retirement();
+    }
+
+    #[test]
+    fn enable_disable_enable_during_install_converges_to_enabled_once() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.apply(false).unwrap();
+        h.turn();
+        h.apply(true).unwrap();
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installed(
+                kikigaki_core::startup::InstallReport {
+                    installed: Vec::new(),
+                    reused: Vec::new(),
+                },
+            ));
+        h.turn();
+        h.await_retirement();
+        h.turn();
+        assert!(h.controller.settings.config().long_key);
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
+        assert_eq!(
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            h.engine(EngineKind::Local).builds.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn reenable_waits_for_retirement_before_building() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.ready_long();
+        let (entered, release) = h.shutdown_gate();
+        h.apply(false).unwrap();
+        h.turn();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        h.apply(true).unwrap();
+        h.turn();
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Loading
+        ));
+        assert_eq!(
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            1
+        );
+        release.send(()).unwrap();
+        h.await_retirement();
+        h.turn();
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
+        assert_eq!(
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn reenable_progress_waits_in_loading_while_retiring() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.ready_long();
+        let (entered, release) = h.shutdown_gate();
+        h.apply(false).unwrap();
+        h.turn();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Installing {
+                id: "whisper",
+                done_bytes: 45,
+                total_bytes: 100,
+            });
+        h.turn();
+        let waiting = matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Loading
+        );
+        release.send(()).unwrap();
+        h.await_retirement();
+        assert!(
+            waiting,
+            "retirement must keep the new long instance in Loading"
+        );
+    }
+
+    #[test]
+    fn boot_long_registration_failure_notice_survives_standard_ready() {
+        let harness = harness_with_boot_long(
+            false,
+            false,
+            EngineKind::Local,
+            VecDeque::new(),
+            BootstrapOutcome::ReadyToStart,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            POLL_INTERVAL,
+            BootLong {
+                enabled: true,
+                registration: Some(false),
+            },
+        );
+        wait_snapshot(&harness, |snapshot| {
+            matches!(
+                snapshot.settings.long_state,
+                Some(crate::status::LongStateView::Ready)
+            )
+        });
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
+        harness.client.wake();
+        controller_barrier(&harness);
+        let snapshot = latest(&harness).unwrap();
+        assert_eq!(
+            snapshot.status.message.as_deref(),
+            Some("長文キーのホットキーが無効 — 再設定してください")
+        );
+        assert!(snapshot.status.long_hotkey.is_none());
+        assert_eq!(harness.long_startup.plans.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hotword_reconcile_restarts_only_standard() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.ready_long();
+        let (reply, rx) = mpsc::sync_channel(1);
+        h.controller.handle_command(ControllerCmd::ApplySettings {
+            patch: SettingsPatch {
+                builtin_replace_dict: Some(true),
+                ..SettingsPatch::default()
+            },
+            reply,
+        });
+        rx.try_recv().unwrap().unwrap();
+        h.turn();
+        assert_eq!(
+            h.engine(EngineKind::Local).builds.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            *h.engine(EngineKind::Local).observed_enabled.lock().unwrap(),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn long_key_without_capability_never_creates_long_engine() {
+        let mut h = LifecycleHarness::new(true, false);
+        h.boot(false);
+        h.turn();
+        assert!(h.controller.long.is_none());
+        assert!(h.hotkeys.registered.lock().unwrap().is_empty());
+        assert!(!h.controller.settings_snapshot().long_available);
+        assert_eq!(
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn settings_long_key_rejected_without_capability() {
+        let mut h = LifecycleHarness::new(false, false);
+        h.boot(false);
+        assert_eq!(h.apply(true).unwrap_err().code, "unsupported_engine");
+        assert!(!h.controller.settings.config().long_key);
+        assert!(h.hotkeys.registered.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shutdown_with_both_engines_delaying_meets_deadline() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.ready_long();
+        for kind in [EngineKind::Local, EngineKind::Whisper] {
+            *h.engine(kind).shutdown_delay.lock().unwrap() = Some(Duration::from_secs(2));
+        }
+        let started = Instant::now();
+        h.controller.begin_shutdown();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(h.controller.retiring.is_empty());
+        for startup in [&h.startup, &h.long_startup] {
+            let budgets = startup.join_budgets.lock().unwrap();
+            assert_eq!(budgets.len(), 1);
+            assert!(budgets[0] <= Duration::from_millis(2600));
+        }
+        for kind in [EngineKind::Local, EngineKind::Whisper] {
+            assert_eq!(h.engine(kind).shutdown_threads.lock().unwrap().len(), 1);
         }
     }
 
@@ -2571,32 +3390,6 @@ mod tests {
                     strip_trailing_period: None,
                     builtin_replace_dict: Some(enabled),
                     transcript_log: None,
-                    engine: None,
-                },
-                reply,
-            })
-            .unwrap()
-    }
-
-    fn apply_engine(harness: &Harness, engine: EngineKind) -> Result<SettingsSnapshot, UiError> {
-        harness
-            .client
-            .send_and_wait(|reply| ControllerCmd::ApplySettings {
-                patch: SettingsPatch {
-                    engine: Some(engine),
-                    ..SettingsPatch::default()
-                },
-                reply,
-            })
-    }
-
-    fn apply_strip_trailing_period(harness: &Harness, strip: bool) -> SettingsSnapshot {
-        harness
-            .client
-            .send_and_wait(|reply| ControllerCmd::ApplySettings {
-                patch: SettingsPatch {
-                    strip_trailing_period: Some(strip),
-                    ..SettingsPatch::default()
                 },
                 reply,
             })
@@ -2653,983 +3446,149 @@ mod tests {
     }
 
     #[test]
-    fn switch_to_whisper_with_models_already_installed_reaches_ready_and_commits() {
-        let harness = ready_harness();
-        harness
-            .engine(EngineKind::Whisper)
+    fn long_install_completion_does_not_clear_a_non_installing_status() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.controller.status = Status::Warning("paste warning".into());
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
             .push_back(FakeEngineBuild::Pending);
-
-        let requested = apply_engine(&harness, EngineKind::Whisper).unwrap();
-        assert_eq!(requested.engine, EngineKind::Whisper);
-        assert_eq!(requested.active_engine, EngineKind::Local);
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-
-        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
-        harness.client.wake();
-        let committed = wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.active_engine == EngineKind::Whisper
-        });
-
-        assert_eq!(committed.settings.engine, EngineKind::Whisper);
-        assert_eq!(
-            *harness
-                .engine(EngineKind::Local)
-                .observed_kinds
-                .lock()
-                .unwrap(),
-            [EngineKind::Local]
-        );
-        assert_eq!(
-            *harness
-                .engine(EngineKind::Whisper)
-                .observed_kinds
-                .lock()
-                .unwrap(),
-            [EngineKind::Whisper]
-        );
-        let plans = harness.long_startup.plans.lock().unwrap();
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].engine, EngineKind::Whisper);
-        assert!(!plans[0]
-            .required
-            .iter()
-            .any(|model| model.id == "mojicast-punct"));
-    }
-
-    #[test]
-    fn committed_switch_uses_target_startup_for_model_failure_and_reconnect() {
-        let harness = ready_harness();
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
+        h.apply(true).unwrap();
+        h.long_startup
+            .events
             .lock()
             .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
-        harness.client.wake();
-        wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.active_engine == EngineKind::Whisper
-        });
-        let boot_starts_before = harness.startup.starts.load(Ordering::Relaxed);
-
-        harness
-            .engine(EngineKind::Whisper)
-            .send(EngineMsg::Disconnected {
-                reason: "Whisper model failed".into(),
-                failed_model: Some(kikigaki_core::models::WHISPER_MODEL_ID),
-            });
-        let failed = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.message.as_deref() == Some("Whisper model failed")
-        });
-        assert_eq!(failed.status.phase, "failed");
-        assert!(harness.startup.invalidated.lock().unwrap().is_empty());
+            .push_back(StartupEvent::Installed(
+                kikigaki_core::startup::InstallReport {
+                    installed: Vec::new(),
+                    reused: Vec::new(),
+                },
+            ));
+        h.turn();
         assert_eq!(
-            *harness.long_startup.invalidated.lock().unwrap(),
-            [kikigaki_core::models::WHISPER_MODEL_ID]
+            h.controller.snapshot().status.message.as_deref(),
+            Some("paste warning")
         );
-
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        assert!(poll(
-            || harness.long_startup.starts.load(Ordering::Relaxed) == 2
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Loading
         ));
-        assert_eq!(
-            harness.startup.starts.load(Ordering::Relaxed),
-            boot_starts_before
-        );
     }
 
     #[test]
-    fn disconnected_active_engine_can_switch_to_whisper_and_resume_dictation() {
-        let harness = ready_harness();
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-        harness
-            .engine(EngineKind::Local)
-            .send(EngineMsg::Disconnected {
-                reason: "active engine failed".into(),
-                failed_model: None,
-            });
-        harness.client.wake();
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "disconnected");
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
-        harness.client.wake();
-        let committed = wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.active_engine == EngineKind::Whisper
-                && snapshot.status.state == "idle"
-        });
-
-        assert_eq!(committed.settings.engine, EngineKind::Whisper);
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        let engine = harness.engine(EngineKind::Whisper);
-        let receivers = engine.command_receivers.lock().unwrap();
-        assert!(receivers[0]
-            .lock()
-            .unwrap()
-            .try_iter()
-            .any(|command| command == EngineCmd::Begin { gen: 1 }));
-    }
-
-    #[test]
-    fn synchronous_install_failure_reverts_config_and_leaves_the_previous_engine_active() {
-        let harness = ready_harness();
-        harness
-            .long_startup
-            .hold_starts
-            .store(true, Ordering::Relaxed);
-        harness
-            .long_startup
-            .events
-            .lock()
-            .unwrap()
-            .push_back(StartupEvent::Failed("download failed".into()));
-
-        let requested = apply_engine(&harness, EngineKind::Whisper).unwrap();
-        assert_eq!(requested.engine, EngineKind::Whisper);
-        assert_eq!(requested.active_engine, EngineKind::Local);
-        let failed = wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.engine == EngineKind::Local
-                && snapshot.status.message.as_deref() == Some("download failed")
-        });
-
-        assert_eq!(failed.settings.active_engine, EngineKind::Local);
-        assert_eq!(failed.status.phase, "ready");
-        assert_eq!(
-            harness
-                .engine(EngineKind::Local)
-                .builds
-                .load(Ordering::Relaxed),
-            1
-        );
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        let engine = harness.engine(EngineKind::Local);
-        let receivers = engine.command_receivers.lock().unwrap();
-        assert!(receivers[0]
-            .lock()
-            .unwrap()
-            .try_iter()
-            .any(|command| command == EngineCmd::Begin { gen: 1 }));
-    }
-
-    #[test]
-    fn asynchronous_disconnected_after_restart_ok_true_triggers_rollback() {
-        let harness = ready_harness();
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-        harness
-            .engine(EngineKind::Local)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        harness
-            .engine(EngineKind::Whisper)
-            .send(EngineMsg::Disconnected {
-                reason: "candidate failed".into(),
-                failed_model: None,
-            });
-        harness.client.wake();
-        wait_for_builds(&harness, 3);
-        wait_for_engine_instances(&harness, 3);
-        assert_eq!(
-            *harness
-                .engine(EngineKind::Local)
-                .observed_kinds
-                .lock()
-                .unwrap(),
-            [EngineKind::Local, EngineKind::Local]
-        );
-        assert_eq!(
-            *harness
-                .engine(EngineKind::Whisper)
-                .observed_kinds
-                .lock()
-                .unwrap(),
-            [EngineKind::Whisper]
-        );
-
-        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
-        harness.client.wake();
-        let rolled_back = wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.engine == EngineKind::Local
-                && snapshot.settings.active_engine == EngineKind::Local
-                && snapshot.status.message.as_deref() == Some("candidate failed")
-        });
-
-        assert_eq!(rolled_back.status.phase, "ready");
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        let engine = harness.engine(EngineKind::Local);
-        let receivers = engine.command_receivers.lock().unwrap();
-        assert!(receivers[1]
-            .lock()
-            .unwrap()
-            .try_iter()
-            .any(|command| command == EngineCmd::Begin { gen: 1 }));
-    }
-
-    #[test]
-    fn synchronous_restart_failure_reverts_config_and_restarts_the_previous_engine() {
-        let harness = ready_harness();
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Fail("candidate build failed".into()));
-        harness
-            .engine(EngineKind::Local)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 3);
-        wait_for_engine_instances(&harness, 2);
-        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
-        harness.client.wake();
-        let rolled_back = wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.engine == EngineKind::Local
-                && snapshot.settings.active_engine == EngineKind::Local
-                && snapshot
-                    .status
-                    .message
-                    .as_deref()
-                    .is_some_and(|message| message.contains("candidate build failed"))
-        });
-
-        assert_eq!(rolled_back.status.phase, "ready");
-        assert_eq!(
-            *harness
-                .engine(EngineKind::Local)
-                .observed_kinds
-                .lock()
-                .unwrap(),
-            [EngineKind::Local, EngineKind::Local]
-        );
-        assert_eq!(
-            *harness
-                .engine(EngineKind::Whisper)
-                .observed_kinds
-                .lock()
-                .unwrap(),
-            [EngineKind::Whisper]
-        );
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        let engine = harness.engine(EngineKind::Local);
-        let receivers = engine.command_receivers.lock().unwrap();
-        assert!(receivers[1]
-            .lock()
-            .unwrap()
-            .try_iter()
-            .any(|command| command == EngineCmd::Begin { gen: 1 }));
-    }
-
-    #[test]
-    fn double_failure_during_rollback_clears_the_switch_instead_of_sticking() {
-        let harness = ready_harness();
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-        harness
-            .engine(EngineKind::Local)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        harness
-            .engine(EngineKind::Whisper)
-            .send(EngineMsg::Disconnected {
-                reason: "candidate failed".into(),
-                failed_model: None,
-            });
-        harness.client.wake();
-        wait_for_builds(&harness, 3);
-        wait_for_engine_instances(&harness, 3);
-        harness
-            .engine(EngineKind::Local)
-            .send(EngineMsg::Disconnected {
-                reason: "rollback failed".into(),
-                failed_model: None,
-            });
-        harness.client.wake();
-        let failed = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.state == "disconnected"
-                && snapshot.status.message.as_deref() == Some("rollback failed")
-        });
-
-        assert_eq!(failed.settings.engine, EngineKind::Local);
-        assert_eq!(failed.settings.active_engine, EngineKind::Local);
-        assert_eq!(
-            harness
-                .engine(EngineKind::Local)
-                .builds
-                .load(Ordering::Relaxed),
-            2
-        );
-        assert!(apply_builtin(&harness, true).builtin_replace_dict);
-        assert!(apply_engine(&harness, EngineKind::Whisper).is_ok());
-        wait_for_builds(&harness, 4);
-        let switched = wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.active_engine == EngineKind::Whisper
-        });
-        assert_eq!(switched.settings.engine, EngineKind::Whisper);
-    }
-
-    #[test]
-    fn hotkey_presses_work_on_the_active_engine_while_the_target_installs() {
-        let harness = harness(
-            true,
-            BootstrapOutcome::ReadyToStart,
-            Vec::new(),
-            Vec::new(),
-            false,
-            None,
-            None,
-        );
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-        harness
-            .long_startup
-            .hold_starts
-            .store(true, Ordering::Relaxed);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        harness
-            .long_startup
-            .events
-            .lock()
-            .unwrap()
-            .push_back(StartupEvent::Installing {
-                id: "whisper",
-                done_bytes: 45,
-                total_bytes: 100,
-            });
-        harness.client.wake();
-        let pending = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.message.as_deref() == Some("Downloading whisper … 45%")
-        });
-        assert_eq!(pending.status.phase, "ready");
-        assert_eq!(pending.settings.active_engine, EngineKind::Local);
-        assert_eq!(pending.settings.engine, EngineKind::Whisper);
-        assert!(pending.settings.punct_enabled);
-        assert!(!pending.settings.engine_punctuates);
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        let recording = wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        // StartMic consults the real macOS microphone permission even under test;
-        // an unprivileged test process legitimately gets the permission warning
-        // there instead of the download-progress message.
-        if !super::microphone_permission_denied() {
-            assert_eq!(
-                recording.status.message.as_deref(),
-                Some("Downloading whisper … 45%")
-            );
-        }
-        harness
-            .hotkey
-            .send(HotkeyEdge::Released(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness
-            .engine(EngineKind::Local)
-            .send(final_message(1, "旧エンジン"));
-        harness.client.wake();
-        assert!(poll(|| !harness.pastes.attempts.lock().unwrap().is_empty()));
-
-        assert_eq!(
-            harness.pastes.attempts.lock().unwrap().as_slice(),
-            ["旧エンジン。"]
-        );
-        assert_eq!(harness.mic.starts.load(Ordering::Relaxed), 1);
-        let engine = harness.engine(EngineKind::Local);
-        let receivers = engine.command_receivers.lock().unwrap();
-        assert_eq!(
-            receivers[0].lock().unwrap().try_iter().collect::<Vec<_>>(),
-            [
-                EngineCmd::Begin { gen: 1 },
-                EngineCmd::End {
-                    gen: 1,
-                    pad_ms: 500,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn switch_install_progress_does_not_clear_a_paste_warning() {
-        let old = Instant::now() - Duration::from_secs(10);
-        let harness = harness(
-            false,
-            BootstrapOutcome::ReadyToStart,
-            Vec::new(),
-            Vec::new(),
-            true,
-            Some(old),
-            None,
-        );
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-        harness
-            .long_startup
-            .hold_starts
-            .store(true, Ordering::Relaxed);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        transcribe(&harness, 1, "paste failure");
-        let warning = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.message.as_deref()
-                == Some("Accessibility permission denied — System Settings › Privacy")
-        });
-        assert_eq!(warning.status.phase, "ready");
-
-        harness
-            .long_startup
-            .events
-            .lock()
-            .unwrap()
-            .push_back(StartupEvent::Installing {
-                id: "whisper",
-                done_bytes: 45,
-                total_bytes: 100,
-            });
-        harness.client.wake();
-        assert!(poll(|| harness
-            .long_startup
-            .events
-            .lock()
-            .unwrap()
-            .is_empty()));
-        controller_barrier(&harness);
-
-        assert_eq!(
-            latest(&harness).unwrap().status.message.as_deref(),
-            Some("Accessibility permission denied — System Settings › Privacy")
-        );
-    }
-
-    #[test]
-    fn switch_install_completion_does_not_clear_a_non_installing_status() {
-        let old = Instant::now() - Duration::from_secs(10);
-        let harness = harness(
-            false,
-            BootstrapOutcome::ReadyToStart,
-            Vec::new(),
-            Vec::new(),
-            true,
-            Some(old),
-            None,
-        );
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-        harness
-            .long_startup
-            .hold_starts
-            .store(true, Ordering::Relaxed);
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        transcribe(&harness, 1, "paste failure");
-        wait_snapshot(&harness, |snapshot| {
-            snapshot.status.message.as_deref()
-                == Some("Accessibility permission denied — System Settings › Privacy")
-        });
-
-        harness
-            .long_startup
-            .events
-            .lock()
-            .unwrap()
-            .push_back(StartupEvent::Installed(
-                kikigaki_core::startup::InstallReport {
-                    installed: Vec::new(),
-                    reused: Vec::new(),
-                },
-            ));
-        harness.client.wake();
-        wait_for_builds(&harness, 2);
-        controller_barrier(&harness);
-
-        assert_eq!(
-            latest(&harness).unwrap().status.message.as_deref(),
-            Some("Accessibility permission denied — System Settings › Privacy")
-        );
-    }
-
-    #[test]
-    fn hotkey_presses_are_rejected_while_the_candidate_engine_is_starting() {
-        let harness = ready_harness();
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        let pending = wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.engine != snapshot.settings.active_engine
-        });
-        assert_eq!(pending.status.phase, "starting");
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        controller_barrier(&harness);
-
-        assert_eq!(latest(&harness).unwrap().status.state, "idle");
-        assert_eq!(harness.mic.starts.load(Ordering::Relaxed), 0);
-        let engine = harness.engine(EngineKind::Whisper);
-        let receivers = engine.command_receivers.lock().unwrap();
-        assert!(receivers[0].lock().unwrap().try_iter().next().is_none());
-    }
-
-    #[test]
-    fn a_switch_requested_mid_utterance_defers_until_idle() {
-        let harness = ready_harness();
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        assert!(poll(|| {
-            !harness.long_startup.plans.lock().unwrap().is_empty()
-                && harness.long_startup.events.lock().unwrap().is_empty()
-        }));
-        assert_eq!(
-            harness
-                .engine(EngineKind::Local)
-                .builds
-                .load(Ordering::Relaxed),
-            1
-        );
-
-        harness
-            .hotkey
-            .send(HotkeyEdge::Released(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness
-            .engine(EngineKind::Local)
-            .send(final_message(1, "done"));
-        harness.client.wake();
-        let swapping = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.state == "idle" && snapshot.status.phase == "starting"
-        });
-        assert_eq!(swapping.settings.active_engine, EngineKind::Local);
-        wait_for_builds(&harness, 2);
-    }
-
-    #[test]
-    fn a_switch_whose_install_finishes_while_recording_swaps_after_the_utterance() {
-        let harness = ready_harness();
-        harness
-            .long_startup
-            .hold_starts
-            .store(true, Ordering::Relaxed);
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        harness
-            .long_startup
-            .events
-            .lock()
-            .unwrap()
-            .push_back(StartupEvent::Installed(
-                kikigaki_core::startup::InstallReport {
-                    installed: Vec::new(),
-                    reused: Vec::new(),
-                },
-            ));
-        harness.client.wake();
-        controller_barrier(&harness);
-        assert_eq!(
-            harness
-                .engine(EngineKind::Local)
-                .builds
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(latest(&harness).unwrap().status.state, "recording");
-
-        harness
-            .hotkey
-            .send(HotkeyEdge::Released(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness
-            .engine(EngineKind::Local)
-            .send(final_message(1, "done"));
-        harness.client.wake();
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-        wait_for_builds(&harness, 2);
-    }
-
-    #[test]
-    fn a_second_switch_request_during_an_in_flight_switch_is_rejected() {
-        let harness = ready_harness();
-        harness
-            .long_startup
-            .hold_starts
-            .store(true, Ordering::Relaxed);
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.engine == EngineKind::Whisper
-                && snapshot.settings.active_engine == EngineKind::Local
-        });
-
-        let error = apply_engine(&harness, EngineKind::Local).unwrap_err();
-
-        assert_eq!(error.code, "switch_in_progress");
-        assert_eq!(error.message, "エンジンを切り替え中です");
-        let pending = latest(&harness).unwrap();
-        assert_eq!(pending.settings.engine, EngineKind::Whisper);
-        assert_eq!(pending.settings.active_engine, EngineKind::Local);
-        assert_eq!(harness.long_startup.plans.lock().unwrap().len(), 1);
-        assert_eq!(
-            harness
-                .engine(EngineKind::Local)
-                .builds
-                .load(Ordering::Relaxed),
-            1
-        );
-    }
-
-    #[test]
-    fn engine_switch_is_rejected_after_boot_startup_failure_without_persisting() {
-        let harness = harness(
-            false,
-            BootstrapOutcome::NeedsOnboarding(onboarding(false, "models")),
-            Vec::new(),
-            Vec::new(),
-            false,
-            None,
-            None,
-        );
-        harness
-            .startup
+    fn long_enable_is_rejected_after_boot_startup_failure_without_persisting() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.startup
             .events
             .lock()
             .unwrap()
             .push_back(StartupEvent::Failed("boot failed".into()));
-        let failed = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.message.as_deref() == Some("boot failed")
-        });
-        assert_eq!(failed.status.phase, "failed");
-
-        let config_path = harness._temp.path().join("config.toml");
-        let config_before = std::fs::read_to_string(&config_path).unwrap();
-        let error = apply_engine(&harness, EngineKind::Whisper).unwrap_err();
-
-        assert_eq!(error.code, "engine_not_started");
+        h.turn();
+        let path = h._temp.path().join("config.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(h.apply(true).unwrap_err().code, "engine_not_started");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
         assert_eq!(
-            error.message,
-            "起動が完了していないため、認識エンジンを切り替えられません"
+            h.controller.status,
+            Status::StartupFailed("boot failed".into())
         );
-        assert_eq!(std::fs::read_to_string(config_path).unwrap(), config_before);
-        let unchanged = latest(&harness).unwrap();
-        assert_eq!(unchanged.settings.engine, EngineKind::Local);
-        assert_eq!(unchanged.settings.active_engine, EngineKind::Local);
-        assert_eq!(unchanged.status.phase, "failed");
-        assert_eq!(unchanged.status.message.as_deref(), Some("boot failed"));
-        assert!(harness.long_startup.plans.lock().unwrap().is_empty());
-        assert_eq!(
-            harness
-                .engine(EngineKind::Local)
-                .builds
-                .load(Ordering::Relaxed),
-            0
-        );
+        assert!(h.long_startup.plans.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn local_to_whisper_commit_disables_local_punctuation() {
-        let harness = harness_with_engine_options(
-            true,
-            false,
-            EngineKind::Local,
-            VecDeque::from([FakeEngineBuild::Ready]),
-            BootstrapOutcome::ReadyToStart,
-            Vec::new(),
-            Vec::new(),
-            false,
-            None,
-            None,
-            POLL_INTERVAL,
-        );
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
-        harness.client.wake();
-        wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.active_engine == EngineKind::Whisper
+    fn long_enable_preserves_standard_punctuation_and_dictionary_during_recording() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        let (reply, rx) = mpsc::sync_channel(1);
+        h.controller.handle_command(ControllerCmd::ApplySettings {
+            patch: SettingsPatch {
+                punctuation: Some(crate::settings::PunctSetting::On),
+                builtin_replace_dict: Some(true),
+                ..SettingsPatch::default()
+            },
+            reply,
         });
-        transcribe_with(&harness, EngineKind::Whisper, 1, "こんにちは");
-
-        assert_eq!(
-            harness.pastes.attempts.lock().unwrap().last().unwrap(),
-            "こんにちは"
-        );
-    }
-
-    #[test]
-    fn switch_preserves_active_engine_punctuation_until_the_utterance_finishes() {
-        let harness = harness_with_engine_options(
-            true,
-            false,
-            EngineKind::Local,
-            VecDeque::from([FakeEngineBuild::Ready]),
-            BootstrapOutcome::ReadyToStart,
-            Vec::new(),
-            Vec::new(),
-            false,
-            None,
-            None,
-            POLL_INTERVAL,
-        );
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-        harness
-            .hotkey
-            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-
-        let switching = apply_engine(&harness, EngineKind::Whisper).unwrap();
-        assert_eq!(switching.active_engine, EngineKind::Local);
-        assert!(switching.punct_enabled);
-        assert!(!switching.engine_punctuates);
-        harness
-            .hotkey
-            .send(HotkeyEdge::Released(HotkeyKey::Standard));
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness
-            .engine(EngineKind::Local)
-            .send(final_message(1, "切り替え前"));
-        assert!(poll(|| !harness.pastes.attempts.lock().unwrap().is_empty()));
-        assert_eq!(
-            harness.pastes.attempts.lock().unwrap().as_slice(),
-            ["切り替え前。"]
-        );
-
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
-        harness.client.wake();
-        wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.active_engine == EngineKind::Whisper
-        });
-        transcribe_with(&harness, EngineKind::Whisper, 2, "切り替え後");
-
-        assert_eq!(
-            harness.pastes.attempts.lock().unwrap().as_slice(),
-            ["切り替え前。", "切り替え後"]
-        );
-    }
-
-    #[test]
-    fn whisper_trailing_period_follows_strip_setting_without_local_punctuation() {
-        for (strip, expected) in [(false, "Whisper。"), (true, "Whisper")] {
-            let harness = harness_with_engine_options(
-                true,
-                false,
-                EngineKind::Whisper,
-                VecDeque::new(),
-                BootstrapOutcome::ReadyToStart,
-                Vec::new(),
-                Vec::new(),
-                false,
-                None,
-                None,
-                POLL_INTERVAL,
-            );
-            let ready = wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-            assert!(ready.settings.engine_punctuates);
-            assert!(!ready.settings.punct_enabled);
-
-            let settings = apply_strip_trailing_period(&harness, strip);
-            assert!(settings.engine_punctuates);
-            assert!(!settings.punct_enabled);
-            assert_eq!(settings.strip_trailing_period, strip);
-            transcribe_with(&harness, EngineKind::Whisper, 1, "Whisper。");
-
-            assert_eq!(
-                harness.pastes.attempts.lock().unwrap().last().unwrap(),
-                expected
-            );
+        rx.try_recv().unwrap().unwrap();
+        h.turn();
+        let mut outputs = Vec::new();
+        h.controller
+            .handle_hotkey_edge(HotkeyEdge::Pressed(HotkeyKey::Standard), &mut outputs);
+        h.controller.execute_outputs(outputs);
+        h.apply(true).unwrap();
+        h.turn();
+        assert_eq!(h.controller.session.state(), State::Recording);
+        assert!(h.controller.settings_snapshot().punct_enabled);
+        let mut outputs = Vec::new();
+        h.controller
+            .handle_hotkey_edge(HotkeyEdge::Released(HotkeyKey::Standard), &mut outputs);
+        h.controller.execute_outputs(outputs);
+        h.engine(EngineKind::Local)
+            .send(final_message(1, "クバネティス"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while h.pastes.attempts.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline);
+            h.turn();
+            thread::yield_now();
         }
-    }
-
-    #[test]
-    fn local_to_whisper_failure_and_rollback_restores_local_punctuation() {
-        let harness = harness_with_engine_options(
-            true,
-            false,
-            EngineKind::Local,
-            VecDeque::from([FakeEngineBuild::Ready, FakeEngineBuild::Pending]),
-            BootstrapOutcome::ReadyToStart,
-            Vec::new(),
-            Vec::new(),
-            false,
-            None,
-            None,
-            POLL_INTERVAL,
-        );
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
-            .lock()
-            .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        harness
-            .engine(EngineKind::Whisper)
-            .send(EngineMsg::Disconnected {
-                reason: "candidate failed".into(),
-                failed_model: None,
-            });
-        harness.client.wake();
-        wait_for_builds(&harness, 3);
-        wait_for_engine_instances(&harness, 3);
-        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
-        harness.client.wake();
-        wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.active_engine == EngineKind::Local
-                && snapshot.status.message.as_deref() == Some("candidate failed")
-        });
-        transcribe(&harness, 1, "こんにちは");
-
+        assert_eq!(*h.pastes.attempts.lock().unwrap(), ["Kubernetes。"]);
         assert_eq!(
-            harness.pastes.attempts.lock().unwrap().last().unwrap(),
-            "こんにちは。"
+            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
+            1
         );
     }
 
     #[test]
-    fn hotword_toggle_on_whisper_is_applied_to_the_next_local_build() {
-        let harness = harness_with_engine_options(
-            false,
-            true,
-            EngineKind::Local,
-            VecDeque::from([FakeEngineBuild::Ready, FakeEngineBuild::Pending]),
-            BootstrapOutcome::ReadyToStart,
-            Vec::new(),
-            Vec::new(),
-            false,
-            None,
-            None,
-            POLL_INTERVAL,
-        );
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-
-        harness
-            .engine(EngineKind::Whisper)
-            .plans
+    fn long_install_failure_compensation_write_failure_keeps_runtime_disabled() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.apply(true).unwrap();
+        std::fs::write(h._temp.path().join("config.toml"), "# external change\n").unwrap();
+        h.long_startup
+            .events
             .lock()
             .unwrap()
-            .push_back(FakeEngineBuild::Pending);
-        apply_engine(&harness, EngineKind::Whisper).unwrap();
-        wait_for_builds(&harness, 2);
-        wait_for_engine_instances(&harness, 2);
-        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
-        harness.client.wake();
-        wait_snapshot(&harness, |snapshot| {
-            snapshot.settings.active_engine == EngineKind::Whisper
-        });
+            .push_back(StartupEvent::Failed("download failed".into()));
+        h.turn();
+        assert!(h.controller.settings.config().long_key);
+        assert!(!h.controller.long_desired);
+        assert!(h.controller.long.is_none());
+        assert_eq!(*h.hotkeys.unregistered.lock().unwrap(), [HotkeyKey::Long]);
+        assert!(h
+            .controller
+            .long_notice
+            .as_deref()
+            .unwrap()
+            .contains("設定ファイルが外部"));
+    }
 
-        assert!(!apply_builtin(&harness, false).builtin_replace_dict);
-        controller_barrier(&harness);
-        apply_engine(&harness, EngineKind::Local).unwrap();
-        wait_for_builds(&harness, 3);
-
-        assert_eq!(
-            *harness
-                .engine(EngineKind::Whisper)
-                .observed_enabled
-                .lock()
-                .unwrap(),
-            [true]
-        );
-        assert_eq!(
-            *harness
-                .engine(EngineKind::Local)
-                .observed_enabled
-                .lock()
-                .unwrap(),
-            [true, false]
-        );
+    #[test]
+    fn boot_long_install_failure_keeps_setting_and_can_retry() {
+        let mut h = LifecycleHarness::new(true, true);
+        h.long_startup.hold_starts.store(true, Ordering::Relaxed);
+        h.boot(false);
+        h.long_startup
+            .events
+            .lock()
+            .unwrap()
+            .push_back(StartupEvent::Failed("boot download failed".into()));
+        h.turn();
+        assert!(h.controller.settings.config().long_key);
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Failed { .. }
+        ));
+        h.long_startup.hold_starts.store(false, Ordering::Relaxed);
+        h.retry().unwrap();
+        h.await_retirement();
+        h.turn();
+        assert!(matches!(
+            h.controller.long.as_ref().unwrap().state,
+            LongState::Ready
+        ));
     }
 
     fn startup_metric_count(harness: &Harness) -> usize {
@@ -4052,11 +4011,11 @@ mod tests {
     }
 
     #[test]
-    fn whisper_keeps_postprocess_punctuation_disabled() {
+    fn long_enable_keeps_standard_postprocess_punctuation_enabled() {
         let harness = harness_with_engine_options(
             true,
             false,
-            EngineKind::Whisper,
+            EngineKind::Local,
             VecDeque::new(),
             BootstrapOutcome::ReadyToStart,
             Vec::new(),
@@ -4067,21 +4026,39 @@ mod tests {
             POLL_INTERVAL,
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::ApplySettings {
+                patch: SettingsPatch {
+                    long_key: Some(true),
+                    ..SettingsPatch::default()
+                },
+                reply,
+            })
+            .unwrap();
+        wait_snapshot(&harness, |snapshot| {
+            matches!(
+                snapshot.settings.long_state,
+                Some(crate::status::LongStateView::Ready)
+            )
+        });
 
-        transcribe_with(&harness, EngineKind::Whisper, 1, "こんにちは");
+        wait_for_engine_instances(&harness, 2);
+        assert_eq!(harness.long_startup.plans.lock().unwrap().len(), 1);
+        transcribe_with(&harness, EngineKind::Local, 1, "こんにちは");
 
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
-            "こんにちは"
+            "こんにちは。"
         );
     }
 
     #[test]
-    fn whisper_applies_builtin_replacement_dictionary() {
+    fn local_applies_builtin_replacement_dictionary_with_long_resident() {
         let harness = harness_with_engine_options(
             false,
             false,
-            EngineKind::Whisper,
+            EngineKind::Local,
             VecDeque::new(),
             BootstrapOutcome::ReadyToStart,
             Vec::new(),
@@ -4092,9 +4069,25 @@ mod tests {
             POLL_INTERVAL,
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::ApplySettings {
+                patch: SettingsPatch {
+                    long_key: Some(true),
+                    ..SettingsPatch::default()
+                },
+                reply,
+            })
+            .unwrap();
+        wait_snapshot(&harness, |snapshot| {
+            matches!(
+                snapshot.settings.long_state,
+                Some(crate::status::LongStateView::Ready)
+            )
+        });
 
         apply_builtin(&harness, true);
-        transcribe_with(&harness, EngineKind::Whisper, 1, "クバネティス");
+        transcribe_with(&harness, EngineKind::Local, 1, "クバネティス");
 
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
@@ -4107,7 +4100,7 @@ mod tests {
         let harness = harness_with_engine_options(
             false,
             false,
-            EngineKind::Whisper,
+            EngineKind::Local,
             VecDeque::new(),
             BootstrapOutcome::ReadyToStart,
             Vec::new(),
@@ -4118,6 +4111,22 @@ mod tests {
             POLL_INTERVAL,
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
+        harness
+            .client
+            .send_and_wait(|reply| ControllerCmd::ApplySettings {
+                patch: SettingsPatch {
+                    long_key: Some(true),
+                    ..SettingsPatch::default()
+                },
+                reply,
+            })
+            .unwrap();
+        wait_snapshot(&harness, |snapshot| {
+            matches!(
+                snapshot.settings.long_state,
+                Some(crate::status::LongStateView::Ready)
+            )
+        });
         let builds_before = harness
             .engine(EngineKind::Whisper)
             .builds
@@ -4366,7 +4375,6 @@ mod tests {
                 strip_trailing_period: None,
                 builtin_replace_dict: None,
                 transcript_log: None,
-                engine: None,
             },
             reply,
         })
@@ -4400,7 +4408,6 @@ mod tests {
                     strip_trailing_period: None,
                     builtin_replace_dict: None,
                     transcript_log: None,
-                    engine: None,
                 },
                 reply: a_tx,
             })
@@ -4417,7 +4424,6 @@ mod tests {
                     strip_trailing_period: None,
                     builtin_replace_dict: None,
                     transcript_log: None,
-                    engine: None,
                 },
                 reply: b_tx,
             })
@@ -4616,7 +4622,6 @@ mod tests {
                     strip_trailing_period: None,
                     builtin_replace_dict: Some(true),
                     transcript_log: None,
-                    engine: None,
                 },
                 reply,
             })
@@ -4665,7 +4670,6 @@ mod tests {
                     strip_trailing_period: None,
                     builtin_replace_dict: Some(true),
                     transcript_log: None,
-                    engine: None,
                 },
                 reply,
             })
@@ -4739,7 +4743,6 @@ mod tests {
                         strip_trailing_period: None,
                         builtin_replace_dict: None,
                         transcript_log: None,
-                        engine: None,
                     },
                     reply,
                 })

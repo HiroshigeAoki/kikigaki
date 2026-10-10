@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
@@ -25,9 +25,16 @@ use crate::status::{
     UiStatus,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HotkeyKey {
+    Standard,
+    Long,
+}
+
 pub enum HotkeyEdge {
-    Pressed,
-    Released,
+    Pressed(HotkeyKey),
+    Released(HotkeyKey),
 }
 
 pub enum ControllerCmd {
@@ -66,8 +73,9 @@ pub trait ControllerEventSink: Send {
 }
 
 pub trait HotkeyPort: Send {
-    fn register(&self, chord: &str) -> Result<(), String>;
-    fn unregister(&self, chord: &str) -> Result<(), String>;
+    /// Register or replace this key's chord, leaving its previous chord intact on failure.
+    fn register(&self, key: HotkeyKey, chord: &str) -> Result<(), String>;
+    fn unregister(&self, key: HotkeyKey) -> Result<(), String>;
 }
 
 pub trait Paster: Send {
@@ -75,7 +83,7 @@ pub trait Paster: Send {
 }
 
 pub trait EngineFactory: Send + Sync {
-    fn build(&self) -> anyhow::Result<Box<dyn Engine>>;
+    fn build(&self, kind: EngineKind) -> anyhow::Result<Box<dyn Engine>>;
 
     fn set_hotwords_enabled(&self, _enabled: bool) {}
 
@@ -407,14 +415,20 @@ fn run(
     };
     let waker: Waker = Arc::new(move || controller_client.wake());
     let supervisor_factory = Arc::clone(&engine_factory);
-    let supervisor = EngineSupervisor::new(Box::new(move || supervisor_factory.build()))
-        .with_waker(Arc::clone(&waker));
+    let engine_selector = Arc::new(Mutex::new(active_engine));
+    let selector = Arc::clone(&engine_selector);
+    let supervisor = EngineSupervisor::new(Box::new(move || {
+        let kind = *selector.lock().unwrap();
+        supervisor_factory.build(kind)
+    }))
+    .with_waker(Arc::clone(&waker));
     let mut controller = Controller {
         settings,
         session,
         mic,
         supervisor: Some(supervisor),
         engine_factory,
+        engine_selector,
         startup,
         engine_switch_startup_factory,
         engine_switch_install: None,
@@ -519,6 +533,7 @@ struct Controller {
     mic: Box<dyn MicPort>,
     supervisor: Option<EngineSupervisor>,
     engine_factory: Arc<dyn EngineFactory>,
+    engine_selector: Arc<Mutex<EngineKind>>,
     startup: Box<dyn StartupPort>,
     engine_switch_startup_factory: StartupPortFactory,
     engine_switch_install: Option<Box<dyn StartupPort>>,
@@ -653,8 +668,7 @@ impl Controller {
                     }));
                     return;
                 }
-                let old = self.settings.config().hotkey.clone();
-                match self.hotkeys.unregister(&old) {
+                match self.hotkeys.unregister(HotkeyKey::Standard) {
                     Ok(()) => {
                         self.capturing_hotkey = true;
                         let _ = reply.send(Ok(()));
@@ -707,13 +721,15 @@ impl Controller {
     }
 
     fn reregister_or_warn(&mut self, chord: &str) -> Result<(), UiError> {
-        self.hotkeys.register(chord).map_err(|message| {
-            self.status = Status::Warning("ホットキーが無効 — 再設定してください".into());
-            UiError {
-                code: "register_failed",
-                message,
-            }
-        })
+        self.hotkeys
+            .register(HotkeyKey::Standard, chord)
+            .map_err(|message| {
+                self.status = Status::Warning("ホットキーが無効 — 再設定してください".into());
+                UiError {
+                    code: "register_failed",
+                    message,
+                }
+            })
     }
 
     fn end_hotkey_capture(
@@ -738,7 +754,7 @@ impl Controller {
             let _ = reply.send(result.map(|()| self.settings_snapshot()));
             return;
         }
-        if let Err(message) = self.hotkeys.register(&chord) {
+        if let Err(message) = self.hotkeys.register(HotkeyKey::Standard, &chord) {
             let _ = self.reregister_or_warn(&old);
             let _ = reply.send(Err(UiError {
                 code: "register_failed",
@@ -746,7 +762,6 @@ impl Controller {
             }));
             return;
         }
-        let _ = self.hotkeys.unregister(&old);
         match self.settings.apply(SettingsPatch {
             long_key: None,
             long_hotkey: None,
@@ -762,7 +777,7 @@ impl Controller {
                 let _ = reply.send(Ok(self.settings_snapshot()));
             }
             Err(error) => {
-                let _ = self.hotkeys.unregister(&chord);
+                let _ = self.hotkeys.unregister(HotkeyKey::Standard);
                 let _ = self.reregister_or_warn(&old);
                 let _ = reply.send(Err(error));
             }
@@ -776,7 +791,7 @@ impl Controller {
                 EngineSwitchStage::WaitingForReady | EngineSwitchStage::RollingBack { .. }
             )
         });
-        if blocks_press && matches!(&edge, HotkeyEdge::Pressed) {
+        if blocks_press && matches!(&edge, HotkeyEdge::Pressed(_)) {
             self.dirty = true;
             return;
         }
@@ -982,6 +997,7 @@ impl Controller {
             .as_ref()
             .expect("waiting switch checked above")
             .target;
+        *self.engine_selector.lock().unwrap() = target;
         self.engine_factory.set_engine_kind(target);
         self.engine_build_generation = self.engine_build_generation.wrapping_add(1);
         if let Some(switch) = self.engine_switch.as_mut() {
@@ -1005,6 +1021,7 @@ impl Controller {
                 }
             }
             Ok(false) => {
+                *self.engine_selector.lock().unwrap() = self.active_engine;
                 self.engine_factory.set_engine_kind(self.active_engine);
             }
             Err(error) => {
@@ -1028,6 +1045,7 @@ impl Controller {
         reason: String,
         outputs: &mut Vec<Output>,
     ) {
+        *self.engine_selector.lock().unwrap() = switch.previous;
         self.engine_factory.set_engine_kind(switch.previous);
         self.revert_engine_setting(switch.previous);
         self.configure_postprocess_for_engine(switch.previous);
@@ -1594,9 +1612,10 @@ fn hotkey_input(
     active_engine: EngineKind,
 ) -> Option<Input> {
     match edge {
-        HotkeyEdge::Pressed if window_focused || capturing_hotkey => None,
-        HotkeyEdge::Pressed => Some(Input::Pressed),
-        HotkeyEdge::Released => Some(Input::Released {
+        HotkeyEdge::Pressed(HotkeyKey::Long) | HotkeyEdge::Released(HotkeyKey::Long) => None,
+        HotkeyEdge::Pressed(HotkeyKey::Standard) if window_focused || capturing_hotkey => None,
+        HotkeyEdge::Pressed(HotkeyKey::Standard) => Some(Input::Pressed),
+        HotkeyEdge::Released(HotkeyKey::Standard) => Some(Input::Released {
             engine: active_engine,
         }),
     }
@@ -1681,6 +1700,70 @@ mod tests {
     use crate::status::{BootstrapError, OnboardingState};
 
     #[test]
+    fn hotkey_input_drops_long_edges_until_routing_exists() {
+        for edge in [
+            HotkeyEdge::Pressed(HotkeyKey::Long),
+            HotkeyEdge::Released(HotkeyKey::Long),
+        ] {
+            assert!(hotkey_input(edge, false, false, EngineKind::Local).is_none());
+        }
+    }
+
+    #[test]
+    fn factory_builds_the_requested_kind() {
+        let factory = FakeEngineFactory::new(Arc::new(FakeEngineState::default()));
+        for kind in [EngineKind::Local, EngineKind::Remote, EngineKind::Whisper] {
+            let mut engine = factory.build(kind).unwrap();
+            assert!(matches!(engine.events().try_recv(), Ok(EngineMsg::Ready)));
+            assert_eq!(factory.engine(kind).builds.load(Ordering::Relaxed), 1);
+            assert_eq!(*factory.engine(kind).observed_kinds.lock().unwrap(), [kind]);
+        }
+    }
+
+    #[test]
+    fn fake_harness_isolates_engine_kinds() {
+        let harness = ready_harness();
+        let factory = FakeEngineFactory::from_states(Arc::clone(&harness.engines));
+        harness
+            .engine(EngineKind::Whisper)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
+        let mut standard = factory.build(EngineKind::Local).unwrap();
+        assert!(matches!(standard.events().try_recv(), Ok(EngineMsg::Ready)));
+        let mut long = factory.build(EngineKind::Whisper).unwrap();
+        harness
+            .engine(EngineKind::Whisper)
+            .send(final_message(99, "long only"));
+        assert!(matches!(
+            long.events().try_recv(),
+            Ok(EngineMsg::Final { gen: 99, .. })
+        ));
+        assert!(matches!(
+            standard.events().try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        controller_barrier(&harness);
+        assert!(harness.pastes.attempts.lock().unwrap().is_empty());
+        assert!(harness
+            .engine(EngineKind::Local)
+            .canceled
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .event_senders
+                .lock()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn bootstrap_outcomes_have_stable_log_labels() {
         assert_eq!(BootstrapOutcome::ReadyToStart.label(), "ready_to_start");
         assert_eq!(
@@ -1722,20 +1805,20 @@ mod tests {
     #[derive(Default)]
     struct HotkeyState {
         plan: Mutex<VecDeque<Result<(), String>>>,
-        registered: Mutex<Vec<String>>,
-        unregistered: Mutex<Vec<String>>,
+        registered: Mutex<Vec<(HotkeyKey, String)>>,
+        unregistered: Mutex<Vec<HotkeyKey>>,
     }
 
     struct ScriptedHotkeys(Arc<HotkeyState>);
 
     impl HotkeyPort for ScriptedHotkeys {
-        fn register(&self, chord: &str) -> Result<(), String> {
-            self.0.registered.lock().unwrap().push(chord.into());
+        fn register(&self, key: HotkeyKey, chord: &str) -> Result<(), String> {
+            self.0.registered.lock().unwrap().push((key, chord.into()));
             self.0.plan.lock().unwrap().pop_front().unwrap_or(Ok(()))
         }
 
-        fn unregister(&self, chord: &str) -> Result<(), String> {
-            self.0.unregistered.lock().unwrap().push(chord.into());
+        fn unregister(&self, key: HotkeyKey) -> Result<(), String> {
+            self.0.unregistered.lock().unwrap().push(key);
             Ok(())
         }
     }
@@ -1779,6 +1862,9 @@ mod tests {
         }
 
         fn shutdown(self: Box<Self>) {
+            if let Some(delay) = *self.state.shutdown_delay.lock().unwrap() {
+                thread::sleep(delay);
+            }
             let _ = self.sink.send(EngineCmd::Shutdown);
         }
     }
@@ -1794,7 +1880,7 @@ mod tests {
         enabled: AtomicBool,
         builds: AtomicUsize,
         observed_enabled: Mutex<Vec<bool>>,
-        kind: Mutex<Option<EngineKind>>,
+        shutdown_delay: Mutex<Option<Duration>>,
         observed_kinds: Mutex<Vec<EngineKind>>,
         plans: Mutex<VecDeque<FakeEngineBuild>>,
         event_senders: Mutex<Vec<SyncSender<EngineMsg>>>,
@@ -1815,44 +1901,36 @@ mod tests {
     }
 
     struct FakeEngineFactory {
-        state: Arc<FakeEngineState>,
+        states: Arc<Vec<(EngineKind, Arc<FakeEngineState>)>>,
     }
 
     impl EngineFactory for FakeEngineFactory {
-        fn build(&self) -> anyhow::Result<Box<dyn Engine>> {
-            self.state.builds.fetch_add(1, Ordering::Relaxed);
-            self.state
+        fn build(&self, kind: EngineKind) -> anyhow::Result<Box<dyn Engine>> {
+            let state = self.engine(kind);
+            state.builds.fetch_add(1, Ordering::Relaxed);
+            state
                 .observed_enabled
                 .lock()
                 .unwrap()
-                .push(self.state.enabled.load(Ordering::Relaxed));
-            self.state
-                .observed_kinds
-                .lock()
-                .unwrap()
-                .push(self.state.kind.lock().unwrap().unwrap_or(EngineKind::Local));
-            match self
-                .state
+                .push(state.enabled.load(Ordering::Relaxed));
+            state.observed_kinds.lock().unwrap().push(kind);
+            let plan = state
                 .plans
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(FakeEngineBuild::Ready)
-            {
+                .unwrap_or(FakeEngineBuild::Ready);
+            match plan {
                 FakeEngineBuild::Fail(message) => anyhow::bail!(message),
                 plan => {
                     let (event_tx, events) = mpsc::sync_channel(64);
-                    self.state
-                        .event_senders
-                        .lock()
-                        .unwrap()
-                        .push(event_tx.clone());
+                    state.event_senders.lock().unwrap().push(event_tx.clone());
                     if matches!(plan, FakeEngineBuild::Ready) {
                         event_tx.send(EngineMsg::Ready).unwrap();
                     }
                     let (sink, commands) = engine::channel();
                     let commands = Arc::new(Mutex::new(commands));
-                    self.state
+                    state
                         .command_receivers
                         .lock()
                         .unwrap()
@@ -1861,36 +1939,35 @@ mod tests {
                         sink,
                         _commands: commands,
                         events,
-                        state: Arc::clone(&self.state),
+                        state,
                     }))
                 }
             }
         }
 
         fn set_hotwords_enabled(&self, enabled: bool) {
-            self.state.enabled.store(enabled, Ordering::Relaxed);
-        }
-
-        fn set_engine_kind(&self, kind: EngineKind) {
-            *self.state.kind.lock().unwrap() = Some(kind);
+            for state in self.states.iter().map(|(_, state)| state) {
+                state.enabled.store(enabled, Ordering::Relaxed);
+            }
         }
     }
 
     impl FakeEngineFactory {
-        fn new(state: Arc<FakeEngineState>) -> Self {
-            Self { state }
+        fn new(standard: Arc<FakeEngineState>) -> Self {
+            Self::from_states(Arc::new(Vec::from([
+                (EngineKind::Local, standard),
+                (EngineKind::Remote, Arc::new(FakeEngineState::default())),
+                (EngineKind::Whisper, Arc::new(FakeEngineState::default())),
+            ])))
         }
-    }
 
-    #[test]
-    fn engine_factory_tracks_the_requested_engine_kind() {
-        let state = Arc::new(FakeEngineState::default());
-        let factory = FakeEngineFactory::new(Arc::clone(&state));
+        fn from_states(states: Arc<Vec<(EngineKind, Arc<FakeEngineState>)>>) -> Self {
+            Self { states }
+        }
 
-        factory.set_engine_kind(EngineKind::Whisper);
-        drop(factory.build().unwrap());
-
-        assert_eq!(*state.observed_kinds.lock().unwrap(), [EngineKind::Whisper]);
+        fn engine(&self, kind: EngineKind) -> Arc<FakeEngineState> {
+            Arc::clone(&self.states.iter().find(|(key, _)| *key == kind).unwrap().1)
+        }
     }
 
     #[derive(Default)]
@@ -2054,15 +2131,19 @@ mod tests {
         snapshots: SinkState,
         hotkeys: Arc<HotkeyState>,
         pastes: Arc<PasteState>,
-        engine: Arc<FakeEngineState>,
+        engines: Arc<Vec<(EngineKind, Arc<FakeEngineState>)>>,
         mic: Arc<MicState>,
         punctuator: Arc<PunctuatorState>,
         metrics_path: PathBuf,
         startup: Arc<StartupState>,
-        switch_startup: Arc<StartupState>,
+        long_startup: Arc<StartupState>,
     }
 
     impl Harness {
+        fn engine(&self, kind: EngineKind) -> Arc<FakeEngineState> {
+            Arc::clone(&self.engines.iter().find(|(key, _)| *key == kind).unwrap().1)
+        }
+
         fn stop(&mut self) -> bool {
             let handle = self.handle.take().unwrap();
             handle.request_quit();
@@ -2226,14 +2307,25 @@ mod tests {
         let mic = Arc::new(MicState::default());
         let punctuator = Arc::new(PunctuatorState::default());
         let startup = Arc::new(StartupState::default());
-        let switch_startup = Arc::new(StartupState::default());
-        let engine = Arc::new(FakeEngineState {
-            enabled: AtomicBool::new(builtin_replace_dict),
-            kind: Mutex::new(Some(engine_kind)),
-            plans: Mutex::new(engine_plans),
-            ..FakeEngineState::default()
-        });
-        let switch_startup_for_factory = Arc::clone(&switch_startup);
+        let long_startup = Arc::new(StartupState::default());
+        let engines = Arc::new(Vec::from([
+            (EngineKind::Local, Arc::new(FakeEngineState::default())),
+            (EngineKind::Remote, Arc::new(FakeEngineState::default())),
+            (EngineKind::Whisper, Arc::new(FakeEngineState::default())),
+        ]));
+        engines
+            .iter()
+            .find(|(key, _)| *key == engine_kind)
+            .unwrap()
+            .1
+            .plans
+            .lock()
+            .unwrap()
+            .extend(engine_plans);
+        for state in engines.iter().map(|(_, state)| state) {
+            state.enabled.store(builtin_replace_dict, Ordering::Relaxed);
+        }
+        let long_startup_for_factory = Arc::clone(&long_startup);
         let (handle, _exited) = spawn_with_poll_interval(
             ControllerConfig {
                 settings,
@@ -2248,7 +2340,7 @@ mod tests {
             Box::new(FakeSink(snapshots.clone())),
             Box::new(ScriptedHotkeys(Arc::clone(&hotkeys))),
             Box::new(FakePaster(Arc::clone(&pastes))),
-            Arc::new(FakeEngineFactory::new(Arc::clone(&engine))),
+            Arc::new(FakeEngineFactory::from_states(Arc::clone(&engines))),
             Box::new(FakeMic(Arc::clone(&mic))),
             Box::new(FakePostprocessFactory {
                 replace_file,
@@ -2265,7 +2357,7 @@ mod tests {
                 state: Arc::clone(&startup),
             }),
             Box::new(move |plan| {
-                switch_startup_for_factory
+                long_startup_for_factory
                     .plans
                     .lock()
                     .unwrap()
@@ -2273,7 +2365,7 @@ mod tests {
                 Box::new(FakeStartup {
                     rescans: VecDeque::new(),
                     required: plan.required,
-                    state: Arc::clone(&switch_startup_for_factory),
+                    state: Arc::clone(&long_startup_for_factory),
                 })
             }),
             Box::new(FakeClock(clock)),
@@ -2287,12 +2379,12 @@ mod tests {
             snapshots,
             hotkeys,
             pastes,
-            engine,
+            engines,
             mic,
             punctuator,
             metrics_path,
             startup,
-            switch_startup,
+            long_startup,
         }
     }
 
@@ -2409,12 +2501,20 @@ mod tests {
     }
 
     fn transcribe(harness: &Harness, gen: u64, text: &str) {
+        transcribe_with(harness, EngineKind::Local, gen, text);
+    }
+
+    fn transcribe_with(harness: &Harness, kind: EngineKind, gen: u64, text: &str) {
         let attempts = harness.pastes.attempts.lock().unwrap().len();
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(harness, |snapshot| snapshot.status.state == "recording");
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(harness, |snapshot| snapshot.status.state == "finalizing");
-        harness.engine.send(final_message(gen, text));
+        harness.engine(kind).send(final_message(gen, text));
         assert!(
             poll(|| harness.pastes.attempts.lock().unwrap().len() > attempts),
             "paste was not attempted"
@@ -2424,16 +2524,26 @@ mod tests {
     #[test]
     fn repress_while_finalizing_aborts_and_enqueues_cancel_before_the_next_begin() {
         let harness = ready_harness();
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
 
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
 
-        assert_eq!(*harness.engine.canceled.lock().unwrap(), vec![1]);
-        let receivers = harness.engine.command_receivers.lock().unwrap();
+        assert_eq!(
+            *harness.engine(EngineKind::Local).canceled.lock().unwrap(),
+            vec![1]
+        );
+        let engine = harness.engine(EngineKind::Local);
+        let receivers = engine.command_receivers.lock().unwrap();
         let commands: Vec<_> = receivers[0].lock().unwrap().try_iter().collect();
         assert_eq!(
             commands,
@@ -2507,17 +2617,36 @@ mod tests {
 
     fn wait_for_builds(harness: &Harness, expected: usize) {
         assert!(
-            poll(|| harness.engine.builds.load(Ordering::Relaxed) == expected),
+            poll(|| harness
+                .engines
+                .iter()
+                .map(|(_, state)| state.builds.load(Ordering::Relaxed))
+                .sum::<usize>()
+                == expected),
             "engine build count did not reach {expected}; actual={}",
-            harness.engine.builds.load(Ordering::Relaxed)
+            harness
+                .engines
+                .iter()
+                .map(|(_, state)| state.builds.load(Ordering::Relaxed))
+                .sum::<usize>()
         );
     }
 
     fn wait_for_engine_instances(harness: &Harness, expected: usize) {
         assert!(
             poll(|| {
-                harness.engine.event_senders.lock().unwrap().len() == expected
-                    && harness.engine.command_receivers.lock().unwrap().len() == expected
+                harness
+                    .engines
+                    .iter()
+                    .map(|(_, state)| state.event_senders.lock().unwrap().len())
+                    .sum::<usize>()
+                    == expected
+                    && harness
+                        .engines
+                        .iter()
+                        .map(|(_, state)| state.command_receivers.lock().unwrap().len())
+                        .sum::<usize>()
+                        == expected
             }),
             "engine instance count did not reach {expected}"
         );
@@ -2527,7 +2656,7 @@ mod tests {
     fn switch_to_whisper_with_models_already_installed_reaches_ready_and_commits() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
@@ -2539,7 +2668,7 @@ mod tests {
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
 
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
         harness.client.wake();
         let committed = wait_snapshot(&harness, |snapshot| {
             snapshot.settings.active_engine == EngineKind::Whisper
@@ -2547,10 +2676,22 @@ mod tests {
 
         assert_eq!(committed.settings.engine, EngineKind::Whisper);
         assert_eq!(
-            *harness.engine.observed_kinds.lock().unwrap(),
-            [EngineKind::Local, EngineKind::Whisper]
+            *harness
+                .engine(EngineKind::Local)
+                .observed_kinds
+                .lock()
+                .unwrap(),
+            [EngineKind::Local]
         );
-        let plans = harness.switch_startup.plans.lock().unwrap();
+        assert_eq!(
+            *harness
+                .engine(EngineKind::Whisper)
+                .observed_kinds
+                .lock()
+                .unwrap(),
+            [EngineKind::Whisper]
+        );
+        let plans = harness.long_startup.plans.lock().unwrap();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].engine, EngineKind::Whisper);
         assert!(!plans[0]
@@ -2563,7 +2704,7 @@ mod tests {
     fn committed_switch_uses_target_startup_for_model_failure_and_reconnect() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
@@ -2572,33 +2713,35 @@ mod tests {
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| {
             snapshot.settings.active_engine == EngineKind::Whisper
         });
         let boot_starts_before = harness.startup.starts.load(Ordering::Relaxed);
 
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "Whisper model failed".into(),
-            failed_model: Some(kikigaki_core::models::WHISPER_MODEL_ID),
-        });
+        harness
+            .engine(EngineKind::Whisper)
+            .send(EngineMsg::Disconnected {
+                reason: "Whisper model failed".into(),
+                failed_model: Some(kikigaki_core::models::WHISPER_MODEL_ID),
+            });
         let failed = wait_snapshot(&harness, |snapshot| {
             snapshot.status.message.as_deref() == Some("Whisper model failed")
         });
         assert_eq!(failed.status.phase, "failed");
         assert!(harness.startup.invalidated.lock().unwrap().is_empty());
         assert_eq!(
-            *harness.switch_startup.invalidated.lock().unwrap(),
+            *harness.long_startup.invalidated.lock().unwrap(),
             [kikigaki_core::models::WHISPER_MODEL_ID]
         );
 
-        harness.hotkey.send(HotkeyEdge::Pressed);
-        assert!(poll(|| harness
-            .switch_startup
-            .starts
-            .load(Ordering::Relaxed)
-            == 2));
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
+        assert!(poll(
+            || harness.long_startup.starts.load(Ordering::Relaxed) == 2
+        ));
         assert_eq!(
             harness.startup.starts.load(Ordering::Relaxed),
             boot_starts_before
@@ -2609,22 +2752,24 @@ mod tests {
     fn disconnected_active_engine_can_switch_to_whisper_and_resume_dictation() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
             .push_back(FakeEngineBuild::Pending);
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "active engine failed".into(),
-            failed_model: None,
-        });
+        harness
+            .engine(EngineKind::Local)
+            .send(EngineMsg::Disconnected {
+                reason: "active engine failed".into(),
+                failed_model: None,
+            });
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "disconnected");
 
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
         harness.client.wake();
         let committed = wait_snapshot(&harness, |snapshot| {
             snapshot.settings.active_engine == EngineKind::Whisper
@@ -2632,10 +2777,13 @@ mod tests {
         });
 
         assert_eq!(committed.settings.engine, EngineKind::Whisper);
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        let receivers = harness.engine.command_receivers.lock().unwrap();
-        assert!(receivers[1]
+        let engine = harness.engine(EngineKind::Whisper);
+        let receivers = engine.command_receivers.lock().unwrap();
+        assert!(receivers[0]
             .lock()
             .unwrap()
             .try_iter()
@@ -2646,11 +2794,11 @@ mod tests {
     fn synchronous_install_failure_reverts_config_and_leaves_the_previous_engine_active() {
         let harness = ready_harness();
         harness
-            .switch_startup
+            .long_startup
             .hold_starts
             .store(true, Ordering::Relaxed);
         harness
-            .switch_startup
+            .long_startup
             .events
             .lock()
             .unwrap()
@@ -2666,10 +2814,19 @@ mod tests {
 
         assert_eq!(failed.settings.active_engine, EngineKind::Local);
         assert_eq!(failed.status.phase, "ready");
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        let receivers = harness.engine.command_receivers.lock().unwrap();
+        let engine = harness.engine(EngineKind::Local);
+        let receivers = engine.command_receivers.lock().unwrap();
         assert!(receivers[0]
             .lock()
             .unwrap()
@@ -2681,28 +2838,48 @@ mod tests {
     fn asynchronous_disconnected_after_restart_ok_true_triggers_rollback() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
-            .extend([FakeEngineBuild::Pending, FakeEngineBuild::Pending]);
+            .push_back(FakeEngineBuild::Pending);
+        harness
+            .engine(EngineKind::Local)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
 
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "candidate failed".into(),
-            failed_model: None,
-        });
+        harness
+            .engine(EngineKind::Whisper)
+            .send(EngineMsg::Disconnected {
+                reason: "candidate failed".into(),
+                failed_model: None,
+            });
         harness.client.wake();
         wait_for_builds(&harness, 3);
         wait_for_engine_instances(&harness, 3);
         assert_eq!(
-            *harness.engine.observed_kinds.lock().unwrap(),
-            [EngineKind::Local, EngineKind::Whisper, EngineKind::Local]
+            *harness
+                .engine(EngineKind::Local)
+                .observed_kinds
+                .lock()
+                .unwrap(),
+            [EngineKind::Local, EngineKind::Local]
+        );
+        assert_eq!(
+            *harness
+                .engine(EngineKind::Whisper)
+                .observed_kinds
+                .lock()
+                .unwrap(),
+            [EngineKind::Whisper]
         );
 
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         let rolled_back = wait_snapshot(&harness, |snapshot| {
             snapshot.settings.engine == EngineKind::Local
@@ -2711,10 +2888,13 @@ mod tests {
         });
 
         assert_eq!(rolled_back.status.phase, "ready");
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        let receivers = harness.engine.command_receivers.lock().unwrap();
-        assert!(receivers[2]
+        let engine = harness.engine(EngineKind::Local);
+        let receivers = engine.command_receivers.lock().unwrap();
+        assert!(receivers[1]
             .lock()
             .unwrap()
             .try_iter()
@@ -2724,15 +2904,23 @@ mod tests {
     #[test]
     fn synchronous_restart_failure_reverts_config_and_restarts_the_previous_engine() {
         let harness = ready_harness();
-        harness.engine.plans.lock().unwrap().extend([
-            FakeEngineBuild::Fail("candidate build failed".into()),
-            FakeEngineBuild::Pending,
-        ]);
+        harness
+            .engine(EngineKind::Whisper)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Fail("candidate build failed".into()));
+        harness
+            .engine(EngineKind::Local)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
 
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         wait_for_builds(&harness, 3);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         let rolled_back = wait_snapshot(&harness, |snapshot| {
             snapshot.settings.engine == EngineKind::Local
@@ -2746,12 +2934,27 @@ mod tests {
 
         assert_eq!(rolled_back.status.phase, "ready");
         assert_eq!(
-            *harness.engine.observed_kinds.lock().unwrap(),
-            [EngineKind::Local, EngineKind::Whisper, EngineKind::Local]
+            *harness
+                .engine(EngineKind::Local)
+                .observed_kinds
+                .lock()
+                .unwrap(),
+            [EngineKind::Local, EngineKind::Local]
         );
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        assert_eq!(
+            *harness
+                .engine(EngineKind::Whisper)
+                .observed_kinds
+                .lock()
+                .unwrap(),
+            [EngineKind::Whisper]
+        );
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        let receivers = harness.engine.command_receivers.lock().unwrap();
+        let engine = harness.engine(EngineKind::Local);
+        let receivers = engine.command_receivers.lock().unwrap();
         assert!(receivers[1]
             .lock()
             .unwrap()
@@ -2763,26 +2966,36 @@ mod tests {
     fn double_failure_during_rollback_clears_the_switch_instead_of_sticking() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
-            .extend([FakeEngineBuild::Pending, FakeEngineBuild::Pending]);
+            .push_back(FakeEngineBuild::Pending);
+        harness
+            .engine(EngineKind::Local)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
 
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "candidate failed".into(),
-            failed_model: None,
-        });
+        harness
+            .engine(EngineKind::Whisper)
+            .send(EngineMsg::Disconnected {
+                reason: "candidate failed".into(),
+                failed_model: None,
+            });
         harness.client.wake();
         wait_for_builds(&harness, 3);
         wait_for_engine_instances(&harness, 3);
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "rollback failed".into(),
-            failed_model: None,
-        });
+        harness
+            .engine(EngineKind::Local)
+            .send(EngineMsg::Disconnected {
+                reason: "rollback failed".into(),
+                failed_model: None,
+            });
         harness.client.wake();
         let failed = wait_snapshot(&harness, |snapshot| {
             snapshot.status.state == "disconnected"
@@ -2791,7 +3004,13 @@ mod tests {
 
         assert_eq!(failed.settings.engine, EngineKind::Local);
         assert_eq!(failed.settings.active_engine, EngineKind::Local);
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            2
+        );
         assert!(apply_builtin(&harness, true).builtin_replace_dict);
         assert!(apply_engine(&harness, EngineKind::Whisper).is_ok());
         wait_for_builds(&harness, 4);
@@ -2814,13 +3033,13 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         harness
-            .switch_startup
+            .long_startup
             .hold_starts
             .store(true, Ordering::Relaxed);
 
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         harness
-            .switch_startup
+            .long_startup
             .events
             .lock()
             .unwrap()
@@ -2838,7 +3057,9 @@ mod tests {
         assert_eq!(pending.settings.engine, EngineKind::Whisper);
         assert!(pending.settings.punct_enabled);
         assert!(!pending.settings.engine_punctuates);
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         let recording = wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
         // StartMic consults the real macOS microphone permission even under test;
         // an unprivileged test process legitimately gets the permission warning
@@ -2849,9 +3070,13 @@ mod tests {
                 Some("Downloading whisper … 45%")
             );
         }
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness.engine.send(final_message(1, "旧エンジン"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(1, "旧エンジン"));
         harness.client.wake();
         assert!(poll(|| !harness.pastes.attempts.lock().unwrap().is_empty()));
 
@@ -2860,7 +3085,8 @@ mod tests {
             ["旧エンジン。"]
         );
         assert_eq!(harness.mic.starts.load(Ordering::Relaxed), 1);
-        let receivers = harness.engine.command_receivers.lock().unwrap();
+        let engine = harness.engine(EngineKind::Local);
+        let receivers = engine.command_receivers.lock().unwrap();
         assert_eq!(
             receivers[0].lock().unwrap().try_iter().collect::<Vec<_>>(),
             [
@@ -2887,7 +3113,7 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         harness
-            .switch_startup
+            .long_startup
             .hold_starts
             .store(true, Ordering::Relaxed);
 
@@ -2900,7 +3126,7 @@ mod tests {
         assert_eq!(warning.status.phase, "ready");
 
         harness
-            .switch_startup
+            .long_startup
             .events
             .lock()
             .unwrap()
@@ -2911,7 +3137,7 @@ mod tests {
             });
         harness.client.wake();
         assert!(poll(|| harness
-            .switch_startup
+            .long_startup
             .events
             .lock()
             .unwrap()
@@ -2938,11 +3164,11 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         harness
-            .switch_startup
+            .long_startup
             .hold_starts
             .store(true, Ordering::Relaxed);
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
@@ -2956,7 +3182,7 @@ mod tests {
         });
 
         harness
-            .switch_startup
+            .long_startup
             .events
             .lock()
             .unwrap()
@@ -2980,7 +3206,7 @@ mod tests {
     fn hotkey_presses_are_rejected_while_the_candidate_engine_is_starting() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
@@ -2993,37 +3219,52 @@ mod tests {
             snapshot.settings.engine != snapshot.settings.active_engine
         });
         assert_eq!(pending.status.phase, "starting");
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         controller_barrier(&harness);
 
         assert_eq!(latest(&harness).unwrap().status.state, "idle");
         assert_eq!(harness.mic.starts.load(Ordering::Relaxed), 0);
-        let receivers = harness.engine.command_receivers.lock().unwrap();
-        assert!(receivers[1].lock().unwrap().try_iter().next().is_none());
+        let engine = harness.engine(EngineKind::Whisper);
+        let receivers = engine.command_receivers.lock().unwrap();
+        assert!(receivers[0].lock().unwrap().try_iter().next().is_none());
     }
 
     #[test]
     fn a_switch_requested_mid_utterance_defers_until_idle() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
             .push_back(FakeEngineBuild::Pending);
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
 
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         assert!(poll(|| {
-            !harness.switch_startup.plans.lock().unwrap().is_empty()
-                && harness.switch_startup.events.lock().unwrap().is_empty()
+            !harness.long_startup.plans.lock().unwrap().is_empty()
+                && harness.long_startup.events.lock().unwrap().is_empty()
         }));
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
 
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness.engine.send(final_message(1, "done"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(1, "done"));
         harness.client.wake();
         let swapping = wait_snapshot(&harness, |snapshot| {
             snapshot.status.state == "idle" && snapshot.status.phase == "starting"
@@ -3036,21 +3277,23 @@ mod tests {
     fn a_switch_whose_install_finishes_while_recording_swaps_after_the_utterance() {
         let harness = ready_harness();
         harness
-            .switch_startup
+            .long_startup
             .hold_starts
             .store(true, Ordering::Relaxed);
         harness
-            .engine
+            .engine(EngineKind::Whisper)
             .plans
             .lock()
             .unwrap()
             .push_back(FakeEngineBuild::Pending);
 
         apply_engine(&harness, EngineKind::Whisper).unwrap();
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
         harness
-            .switch_startup
+            .long_startup
             .events
             .lock()
             .unwrap()
@@ -3062,12 +3305,22 @@ mod tests {
             ));
         harness.client.wake();
         controller_barrier(&harness);
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(latest(&harness).unwrap().status.state, "recording");
 
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness.engine.send(final_message(1, "done"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(1, "done"));
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         wait_for_builds(&harness, 2);
@@ -3077,7 +3330,7 @@ mod tests {
     fn a_second_switch_request_during_an_in_flight_switch_is_rejected() {
         let harness = ready_harness();
         harness
-            .switch_startup
+            .long_startup
             .hold_starts
             .store(true, Ordering::Relaxed);
         apply_engine(&harness, EngineKind::Whisper).unwrap();
@@ -3093,8 +3346,14 @@ mod tests {
         let pending = latest(&harness).unwrap();
         assert_eq!(pending.settings.engine, EngineKind::Whisper);
         assert_eq!(pending.settings.active_engine, EngineKind::Local);
-        assert_eq!(harness.switch_startup.plans.lock().unwrap().len(), 1);
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(harness.long_startup.plans.lock().unwrap().len(), 1);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -3134,8 +3393,14 @@ mod tests {
         assert_eq!(unchanged.settings.active_engine, EngineKind::Local);
         assert_eq!(unchanged.status.phase, "failed");
         assert_eq!(unchanged.status.message.as_deref(), Some("boot failed"));
-        assert!(harness.switch_startup.plans.lock().unwrap().is_empty());
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 0);
+        assert!(harness.long_startup.plans.lock().unwrap().is_empty());
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -3144,7 +3409,7 @@ mod tests {
             true,
             false,
             EngineKind::Local,
-            VecDeque::from([FakeEngineBuild::Ready, FakeEngineBuild::Pending]),
+            VecDeque::from([FakeEngineBuild::Ready]),
             BootstrapOutcome::ReadyToStart,
             Vec::new(),
             Vec::new(),
@@ -3155,15 +3420,21 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
 
+        harness
+            .engine(EngineKind::Whisper)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| {
             snapshot.settings.active_engine == EngineKind::Whisper
         });
-        transcribe(&harness, 1, "こんにちは");
+        transcribe_with(&harness, EngineKind::Whisper, 1, "こんにちは");
 
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
@@ -3177,7 +3448,7 @@ mod tests {
             true,
             false,
             EngineKind::Local,
-            VecDeque::from([FakeEngineBuild::Ready, FakeEngineBuild::Pending]),
+            VecDeque::from([FakeEngineBuild::Ready]),
             BootstrapOutcome::ReadyToStart,
             Vec::new(),
             Vec::new(),
@@ -3187,16 +3458,22 @@ mod tests {
             POLL_INTERVAL,
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
 
         let switching = apply_engine(&harness, EngineKind::Whisper).unwrap();
         assert_eq!(switching.active_engine, EngineKind::Local);
         assert!(switching.punct_enabled);
         assert!(!switching.engine_punctuates);
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness.engine.send(final_message(1, "切り替え前"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(1, "切り替え前"));
         assert!(poll(|| !harness.pastes.attempts.lock().unwrap().is_empty()));
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().as_slice(),
@@ -3205,12 +3482,12 @@ mod tests {
 
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| {
             snapshot.settings.active_engine == EngineKind::Whisper
         });
-        transcribe(&harness, 2, "切り替え後");
+        transcribe_with(&harness, EngineKind::Whisper, 2, "切り替え後");
 
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().as_slice(),
@@ -3242,7 +3519,7 @@ mod tests {
             assert!(settings.engine_punctuates);
             assert!(!settings.punct_enabled);
             assert_eq!(settings.strip_trailing_period, strip);
-            transcribe(&harness, 1, "Whisper。");
+            transcribe_with(&harness, EngineKind::Whisper, 1, "Whisper。");
 
             assert_eq!(
                 harness.pastes.attempts.lock().unwrap().last().unwrap(),
@@ -3257,11 +3534,7 @@ mod tests {
             true,
             false,
             EngineKind::Local,
-            VecDeque::from([
-                FakeEngineBuild::Ready,
-                FakeEngineBuild::Pending,
-                FakeEngineBuild::Pending,
-            ]),
+            VecDeque::from([FakeEngineBuild::Ready, FakeEngineBuild::Pending]),
             BootstrapOutcome::ReadyToStart,
             Vec::new(),
             Vec::new(),
@@ -3272,17 +3545,25 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
 
+        harness
+            .engine(EngineKind::Whisper)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "candidate failed".into(),
-            failed_model: None,
-        });
+        harness
+            .engine(EngineKind::Whisper)
+            .send(EngineMsg::Disconnected {
+                reason: "candidate failed".into(),
+                failed_model: None,
+            });
         harness.client.wake();
         wait_for_builds(&harness, 3);
         wait_for_engine_instances(&harness, 3);
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| {
             snapshot.settings.active_engine == EngineKind::Local
@@ -3302,11 +3583,7 @@ mod tests {
             false,
             true,
             EngineKind::Local,
-            VecDeque::from([
-                FakeEngineBuild::Ready,
-                FakeEngineBuild::Pending,
-                FakeEngineBuild::Pending,
-            ]),
+            VecDeque::from([FakeEngineBuild::Ready, FakeEngineBuild::Pending]),
             BootstrapOutcome::ReadyToStart,
             Vec::new(),
             Vec::new(),
@@ -3317,10 +3594,16 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
 
+        harness
+            .engine(EngineKind::Whisper)
+            .plans
+            .lock()
+            .unwrap()
+            .push_back(FakeEngineBuild::Pending);
         apply_engine(&harness, EngineKind::Whisper).unwrap();
         wait_for_builds(&harness, 2);
         wait_for_engine_instances(&harness, 2);
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Whisper).send(EngineMsg::Ready);
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| {
             snapshot.settings.active_engine == EngineKind::Whisper
@@ -3332,8 +3615,20 @@ mod tests {
         wait_for_builds(&harness, 3);
 
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
-            [true, true, false]
+            *harness
+                .engine(EngineKind::Whisper)
+                .observed_enabled
+                .lock()
+                .unwrap(),
+            [true]
+        );
+        assert_eq!(
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
+            [true, false]
         );
     }
 
@@ -3347,7 +3642,9 @@ mod tests {
 
     fn crash_postprocess_worker(harness: &Harness) {
         harness.punctuator.panic.store(true, Ordering::Relaxed);
-        harness.engine.send(final_message(999, "crash"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(999, "crash"));
         harness.client.wake();
         for _ in 0..300 {
             if harness.punctuator.panicked.load(Ordering::Relaxed) {
@@ -3363,7 +3660,7 @@ mod tests {
     fn hotword_toggle_reconciles_once_on_next_idle_tick() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Local)
             .plans
             .lock()
             .unwrap()
@@ -3373,9 +3670,19 @@ mod tests {
         wait_for_builds(&harness, 2);
         thread::sleep(Duration::from_millis(60));
 
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 2);
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
             [false, true]
         );
     }
@@ -3384,29 +3691,51 @@ mod tests {
     fn hotword_toggle_waits_through_recording_and_finalizing() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Local)
             .plans
             .lock()
             .unwrap()
             .push_back(FakeEngineBuild::Pending);
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
 
         apply_builtin(&harness, true);
         thread::sleep(Duration::from_millis(60));
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
 
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
         thread::sleep(Duration::from_millis(60));
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
 
-        harness.engine.send(final_message(1, "done"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(1, "done"));
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         wait_for_builds(&harness, 2);
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
             [false, true]
         );
     }
@@ -3415,26 +3744,42 @@ mod tests {
     fn hotword_toggle_while_finalizing_waits_for_idle() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Local)
             .plans
             .lock()
             .unwrap()
             .push_back(FakeEngineBuild::Pending);
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
 
         apply_builtin(&harness, true);
         thread::sleep(Duration::from_millis(60));
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
 
-        harness.engine.send(final_message(1, "done"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(1, "done"));
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         wait_for_builds(&harness, 2);
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
             [false, true]
         );
     }
@@ -3460,13 +3805,23 @@ mod tests {
         apply_builtin(&harness, false);
         apply_builtin(&harness, true);
         thread::sleep(Duration::from_millis(60));
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
 
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         wait_for_builds(&harness, 2);
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
             [false, true]
         );
     }
@@ -3490,20 +3845,33 @@ mod tests {
 
         apply_builtin(&harness, true);
         apply_builtin(&harness, false);
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         thread::sleep(Duration::from_millis(60));
 
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
-        assert_eq!(*harness.engine.observed_enabled.lock().unwrap(), [false]);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
+            [false]
+        );
     }
 
     #[test]
     fn hotword_reconcile_failure_disconnects_stops_mic_and_retries() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Local)
             .plans
             .lock()
             .unwrap()
@@ -3524,10 +3892,16 @@ mod tests {
         assert!(!harness.mic.running.load(Ordering::Relaxed));
         assert!(harness.mic.stops.load(Ordering::Relaxed) > stops_before);
 
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_for_builds(&harness, 4);
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
             [false, true, false, true]
         );
     }
@@ -3558,13 +3932,23 @@ mod tests {
 
         assert_eq!(snapshot.status.phase, "ready");
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
             [false, true]
         );
 
         apply_builtin(&harness, true);
         thread::sleep(Duration::from_millis(60));
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            2
+        );
         assert!(latest(&harness)
             .unwrap()
             .status
@@ -3576,7 +3960,7 @@ mod tests {
     fn engine_reconcile_failure_does_not_mark_postprocess_degraded() {
         let harness = ready_harness();
         harness
-            .engine
+            .engine(EngineKind::Local)
             .plans
             .lock()
             .unwrap()
@@ -3609,7 +3993,7 @@ mod tests {
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         crash_postprocess_worker(&harness);
         harness
-            .engine
+            .engine(EngineKind::Local)
             .plans
             .lock()
             .unwrap()
@@ -3645,9 +4029,22 @@ mod tests {
         apply_builtin(&harness, true);
         thread::sleep(Duration::from_millis(100));
 
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
-        assert_eq!(*harness.engine.observed_enabled.lock().unwrap(), [false]);
-        transcribe(&harness, 1, "クバネティス");
+        assert_eq!(
+            harness
+                .engine(EngineKind::Remote)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            *harness
+                .engine(EngineKind::Remote)
+                .observed_enabled
+                .lock()
+                .unwrap(),
+            [false]
+        );
+        transcribe_with(&harness, EngineKind::Remote, 1, "クバネティス");
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
             "Kubernetes"
@@ -3671,7 +4068,7 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
 
-        transcribe(&harness, 1, "こんにちは");
+        transcribe_with(&harness, EngineKind::Whisper, 1, "こんにちは");
 
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
@@ -3697,7 +4094,7 @@ mod tests {
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
 
         apply_builtin(&harness, true);
-        transcribe(&harness, 1, "クバネティス");
+        transcribe_with(&harness, EngineKind::Whisper, 1, "クバネティス");
 
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
@@ -3721,12 +4118,21 @@ mod tests {
             POLL_INTERVAL,
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-        let builds_before = harness.engine.builds.load(Ordering::Relaxed);
+        let builds_before = harness
+            .engine(EngineKind::Whisper)
+            .builds
+            .load(Ordering::Relaxed);
 
         apply_builtin(&harness, true);
         thread::sleep(Duration::from_millis(60));
 
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), builds_before);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Whisper)
+                .builds
+                .load(Ordering::Relaxed),
+            builds_before
+        );
     }
 
     #[test]
@@ -3755,7 +4161,7 @@ mod tests {
         assert_eq!(error.code, "register_failed");
         apply_builtin(&harness, true);
 
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         wait_for_builds(&harness, 2);
         wait_snapshot(&harness, |snapshot| {
@@ -3765,7 +4171,7 @@ mod tests {
         });
         assert_eq!(startup_metric_count(&harness), 0);
 
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| {
             snapshot.status.state == "idle" && snapshot.status.message.is_none()
@@ -3776,40 +4182,58 @@ mod tests {
     #[test]
     fn reconnect_restart_preserves_pending_hotword_reconcile() {
         let harness = ready_harness();
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "connection lost".into(),
-            failed_model: None,
-        });
+        harness
+            .engine(EngineKind::Local)
+            .send(EngineMsg::Disconnected {
+                reason: "connection lost".into(),
+                failed_model: None,
+            });
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "disconnected");
         harness
-            .engine
+            .engine(EngineKind::Local)
             .plans
             .lock()
             .unwrap()
             .extend([FakeEngineBuild::Pending, FakeEngineBuild::Pending]);
 
         apply_builtin(&harness, true);
-        assert_eq!(harness.engine.builds.load(Ordering::Relaxed), 1);
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        assert_eq!(
+            harness
+                .engine(EngineKind::Local)
+                .builds
+                .load(Ordering::Relaxed),
+            1
+        );
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_for_builds(&harness, 2);
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
             [false, false]
         );
 
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         wait_for_builds(&harness, 3);
         let interim = wait_snapshot(&harness, |snapshot| snapshot.status.phase == "starting");
         assert_eq!(interim.status.state, "idle");
         assert_eq!(interim.status.message.as_deref(), Some("connection lost"));
         assert_eq!(
-            *harness.engine.observed_enabled.lock().unwrap(),
+            *harness
+                .engine(EngineKind::Local)
+                .observed_enabled
+                .lock()
+                .unwrap(),
             [false, false, true]
         );
 
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| snapshot.status.message.is_none());
     }
@@ -3817,14 +4241,20 @@ mod tests {
     #[test]
     fn release_while_window_focused_is_honored() {
         let harness = ready_harness();
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
         harness.client.send(ControllerCmd::SetWindowFocused(true));
         thread::sleep(Duration::from_millis(30));
 
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
-        harness.engine.send(final_message(1, "done"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(1, "done"));
         harness.client.wake();
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
     }
@@ -3837,11 +4267,23 @@ mod tests {
         });
         let now = Instant::now();
         session.handle(Input::Engine(Event::Ready { sr: SAMPLE_RATE }), now);
-        let pressed = hotkey_input(HotkeyEdge::Pressed, false, false, EngineKind::Local).unwrap();
+        let pressed = hotkey_input(
+            HotkeyEdge::Pressed(HotkeyKey::Standard),
+            false,
+            false,
+            EngineKind::Local,
+        )
+        .unwrap();
         session.handle(pressed, now);
         assert_eq!(session.state(), State::Recording);
 
-        let released = hotkey_input(HotkeyEdge::Released, false, true, EngineKind::Local).unwrap();
+        let released = hotkey_input(
+            HotkeyEdge::Released(HotkeyKey::Standard),
+            false,
+            true,
+            EngineKind::Local,
+        )
+        .unwrap();
         session.handle(released, now + Duration::from_millis(1));
         assert_eq!(session.state(), State::Finalizing);
         session.handle(
@@ -3862,13 +4304,19 @@ mod tests {
     #[test]
     fn engine_final_is_processed_without_waiting_for_the_poll_tick() {
         let harness = ready_harness_with_poll_interval(Duration::from_millis(500));
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
-        harness.hotkey.send(HotkeyEdge::Released);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Released(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "finalizing");
 
         let started = Instant::now();
-        harness.engine.send(final_message(1, "awake"));
+        harness
+            .engine(EngineKind::Local)
+            .send(final_message(1, "awake"));
         harness.client.wake();
         while harness.pastes.attempts.lock().unwrap().is_empty() {
             assert!(
@@ -3883,7 +4331,9 @@ mod tests {
     fn hotkey_edge_is_handled_without_waiting_for_the_poll_tick() {
         let harness = ready_harness_with_poll_interval(Duration::from_millis(500));
         let started = Instant::now();
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         while latest(&harness).unwrap().status.state != "recording" {
             assert!(
                 started.elapsed() < Duration::from_millis(100),
@@ -4040,10 +4490,18 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(*harness.hotkeys.unregistered.lock().unwrap(), ["Alt+Space"]);
-        assert_eq!(*harness.hotkeys.registered.lock().unwrap(), ["Alt+Space"]);
+        assert_eq!(
+            *harness.hotkeys.unregistered.lock().unwrap(),
+            [HotkeyKey::Standard]
+        );
+        assert_eq!(
+            *harness.hotkeys.registered.lock().unwrap(),
+            [(HotkeyKey::Standard, "Alt+Space".into())]
+        );
 
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
     }
 
@@ -4056,10 +4514,12 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(true);
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "bad model".into(),
-            failed_model: Some("asr"),
-        });
+        harness
+            .engine(EngineKind::Local)
+            .send(EngineMsg::Disconnected {
+                reason: "bad model".into(),
+                failed_model: Some("asr"),
+            });
         let snapshot = wait_snapshot(&harness, |snapshot| {
             snapshot.status.message.as_deref() == Some("bad model")
         });
@@ -4067,10 +4527,12 @@ mod tests {
         assert_eq!(*harness.startup.invalidated.lock().unwrap(), ["asr"]);
 
         let harness = ready_harness();
-        harness.engine.send(EngineMsg::Disconnected {
-            reason: "engine stopped".into(),
-            failed_model: None,
-        });
+        harness
+            .engine(EngineKind::Local)
+            .send(EngineMsg::Disconnected {
+                reason: "engine stopped".into(),
+                failed_model: None,
+            });
         let snapshot = wait_snapshot(&harness, |snapshot| {
             snapshot.status.message.as_deref() == Some("engine stopped")
         });
@@ -4081,7 +4543,7 @@ mod tests {
     #[test]
     fn first_ready_records_startup_metric_once() {
         let harness = ready_harness();
-        harness.engine.send(EngineMsg::Ready);
+        harness.engine(EngineKind::Local).send(EngineMsg::Ready);
 
         for _ in 0..100 {
             let startup_rows = std::fs::read_to_string(&harness.metrics_path)
@@ -4123,7 +4585,9 @@ mod tests {
     #[test]
     fn begin_hotkey_capture_refused_while_recording() {
         let harness = ready_harness();
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "recording");
         let error = harness
             .client
@@ -4220,7 +4684,9 @@ mod tests {
         let harness = ready_harness();
         harness.client.send(ControllerCmd::SetWindowFocused(true));
         thread::sleep(Duration::from_millis(50));
-        harness.hotkey.send(HotkeyEdge::Pressed);
+        harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         thread::sleep(Duration::from_millis(100));
         assert_eq!(latest(&harness).unwrap().status.state, "idle");
         assert_eq!(harness.mic.starts.load(Ordering::Relaxed), 0);

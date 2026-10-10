@@ -24,6 +24,10 @@ pub struct Config {
     pub final_timeout_ms: u64,
     /// Enable the built-in katakana→English replacement dictionary tier. Default false (opt-in).
     pub builtin_replace_dict: bool,
+    /// Persist successful transcriptions as local JSONL records. Default false (opt-in).
+    pub transcript_log: bool,
+    /// Directory containing date-partitioned transcript logs.
+    pub transcript_dir: PathBuf,
     /// Replacement dictionary used during transcription post-processing.
     pub replace_file: PathBuf,
     /// Destination JSONL file for latency records.
@@ -38,7 +42,7 @@ pub struct Config {
     pub punct: PunctConfig,
     /// Remote hayamimi engine settings.
     pub remote: RemoteConfig,
-    /// Learned correction rules, merged over `replace_file` with priority (§5).
+    /// Hand-edited personal replacement rules, merged over `replace_file` with priority (§5).
     pub learned_file: PathBuf,
 }
 
@@ -284,6 +288,8 @@ impl Default for Config {
             silence_pad_ms: 500,
             final_timeout_ms: 3_000,
             builtin_replace_dict: false,
+            transcript_log: false,
+            transcript_dir: home.join(".config/kikigaki/transcripts"),
             replace_file: home.join(".config/kikigaki/replace.toml"),
             metrics_path: home.join("Library/Logs/kikigaki/latency.jsonl"),
             models_dir: dirs::data_local_dir()
@@ -395,6 +401,7 @@ impl Config {
         self.metrics_path = expand_tilde(&self.metrics_path);
         self.models_dir = expand_tilde(&self.models_dir);
         self.learned_file = expand_tilde(&self.learned_file);
+        self.transcript_dir = expand_tilde(&self.transcript_dir);
         self.remote.hayamimi_dir = expand_tilde(&self.remote.hayamimi_dir);
         self.remote.python = expand_tilde(&self.remote.python);
     }
@@ -494,9 +501,11 @@ mod tests {
     fn default_round_trips_through_toml() {
         let expected = Config::default();
         assert!(!expected.builtin_replace_dict);
+        assert!(!expected.transcript_log);
         let actual: Config = toml::from_str(&toml::to_string(&expected).unwrap()).unwrap();
         assert_eq!(actual, expected);
         assert!(!actual.builtin_replace_dict);
+        assert!(!actual.transcript_log);
         assert_eq!(actual.engine, EngineKind::Local);
         assert_eq!(actual.asr.num_threads, 4);
         assert_eq!(actual.asr.hotwords_score, 3.0);
@@ -517,6 +526,9 @@ mod tests {
         assert!(actual
             .learned_file
             .ends_with(".config/kikigaki/learned.toml"));
+        assert!(actual
+            .transcript_dir
+            .ends_with(".config/kikigaki/transcripts"));
         assert!(default_path().ends_with(".config/kikigaki/config.toml"));
     }
 
@@ -539,6 +551,21 @@ mod tests {
         let actual = Config::load(Some(&path)).unwrap();
         assert!(actual.builtin_replace_dict);
         assert_eq!(actual.engine, Config::default().engine);
+    }
+
+    #[test]
+    fn transcript_log_settings_load_and_expand_tilde() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            &temp,
+            "transcript_log = true\ntranscript_dir = \"~/private-transcripts\"\n",
+        );
+        let actual = Config::load(Some(&path)).unwrap();
+        assert!(actual.transcript_log);
+        assert_eq!(
+            actual.transcript_dir,
+            home_dir().join("private-transcripts")
+        );
     }
 
     #[test]

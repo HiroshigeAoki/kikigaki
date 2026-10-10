@@ -51,14 +51,12 @@ pub fn run() -> anyhow::Result<()> {
             set_launch_at_login,
             retry_bootstrap,
             open_config,
+            open_transcript_dir,
             open_settings_pane,
             request_microphone_access,
             start_download,
             retry_download,
             list_history,
-            preview_correction,
-            remember_correction,
-            delete_learned_rule,
             clear_history,
             quit,
         ])
@@ -349,7 +347,6 @@ fn default_snapshot(
         autostart: autostart_state(app),
         onboarding,
         history: Vec::new(),
-        learned_rules: Vec::new(),
         bootstrap_error,
     }
 }
@@ -927,6 +924,32 @@ fn open_config(state: tauri::State<'_, Arc<ShellState>>) -> Result<(), crate::st
     Ok(())
 }
 
+#[tauri::command]
+fn open_transcript_dir(
+    state: tauri::State<'_, Arc<ShellState>>,
+) -> Result<(), crate::status::UiError> {
+    let path = state.latest.lock().unwrap().settings.transcript_dir.clone();
+    std::fs::create_dir_all(&path).map_err(|error| crate::status::UiError {
+        code: "create_failed",
+        message: format!("記録フォルダを作成できませんでした: {error}"),
+    })?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).map_err(
+        |error| crate::status::UiError {
+            code: "create_failed",
+            message: format!("記録フォルダを保護できませんでした: {error}"),
+        },
+    )?;
+    std::process::Command::new("open")
+        .arg(path)
+        .status()
+        .map_err(|error| crate::status::UiError {
+            code: "open_failed",
+            message: format!("{error}"),
+        })?;
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OnboardingPane {
@@ -989,49 +1012,6 @@ async fn retry_download(
 #[tauri::command]
 fn list_history(state: tauri::State<'_, Arc<ShellState>>) -> Vec<crate::history::HistoryEntry> {
     state.latest.lock().unwrap().history.clone()
-}
-
-#[tauri::command]
-fn preview_correction(
-    state: tauri::State<'_, Arc<ShellState>>,
-    entry_id: u64,
-    corrected: String,
-) -> Result<crate::correction::Correction, crate::status::UiError> {
-    let snapshot = state.latest.lock().unwrap();
-    let entry = snapshot
-        .history
-        .iter()
-        .find(|entry| entry.id == entry_id)
-        .ok_or_else(|| crate::status::UiError {
-            code: "not_found",
-            message: "履歴が見つかりません".into(),
-        })?;
-    Ok(crate::correction::diff(&entry.raw, &corrected))
-}
-
-#[tauri::command]
-async fn remember_correction(
-    state: tauri::State<'_, Arc<ShellState>>,
-    entry_id: u64,
-    corrected: String,
-) -> Result<(), crate::status::UiError> {
-    state.client.send_and_wait(
-        |reply| crate::controller::ControllerCmd::RememberCorrection {
-            entry_id,
-            corrected,
-            reply,
-        },
-    )
-}
-
-#[tauri::command]
-async fn delete_learned_rule(
-    state: tauri::State<'_, Arc<ShellState>>,
-    id: u64,
-) -> Result<(), crate::status::UiError> {
-    state
-        .client
-        .send_and_wait(|reply| crate::controller::ControllerCmd::DeleteLearnedRule { id, reply })
 }
 
 #[tauri::command]

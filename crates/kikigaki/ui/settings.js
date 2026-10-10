@@ -15,7 +15,6 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const EVENT_NAME = 'kikigaki://event';
-const MAX_CORRECTION_CHARS = 500;
 const MODIFIER_NAMES = ['Meta', 'Alt', 'Control', 'Shift'];
 const MODIFIER_SYMBOLS = { Meta: 'Cmd', Alt: 'Alt', Control: 'Ctrl', Shift: 'Shift' };
 
@@ -26,6 +25,7 @@ let currentSnapshot = null;
 let capturingHotkey = false;
 let autostartPending = false;
 let builtinReplaceDictPending = false;
+let transcriptLogPending = false;
 let currentOnboarding = null;
 const inlineErrors = new WeakMap();
 
@@ -123,6 +123,12 @@ function applyBuiltinReplaceDict(settings) {
   control.disabled = builtinReplaceDictPending;
 }
 
+function applyTranscriptLog(settings) {
+  const control = document.getElementById('transcriptLogSwitch');
+  control.setAttribute('aria-checked', String(settings.transcript_log));
+  control.disabled = transcriptLogPending;
+}
+
 function cacheSettings(settings) {
   if (currentSnapshot) currentSnapshot = { ...currentSnapshot, settings };
 }
@@ -164,13 +170,7 @@ function createHistoryRow(entry) {
   text.className = 'txt';
   text.textContent = entry.text;
 
-  const fixButton = document.createElement('button');
-  fixButton.className = 'btn small';
-  fixButton.type = 'button';
-  fixButton.textContent = '直す';
-  fixButton.addEventListener('click', () => openCorrectionEditor(entry, row));
-
-  row.append(time, text, fixButton);
+  row.append(time, text);
   return row;
 }
 
@@ -182,160 +182,6 @@ function applyHistory(entries) {
     return;
   }
   for (const entry of entries) list.appendChild(createHistoryRow(entry));
-}
-
-function appendDiffPart(container, tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  node.textContent = text;
-  container.appendChild(node);
-}
-
-function renderCorrectionPreview(container, correction, saveButton) {
-  container.replaceChildren();
-  saveButton.disabled = correction.kind === 'none';
-  if (correction.kind === 'none') {
-    appendDiffPart(container, 'span', '', correction.message);
-    saveButton.textContent = 'この置き換えを覚える';
-    return;
-  }
-
-  appendDiffPart(
-    container,
-    'span',
-    '',
-    correction.kind === 'sentence' ? '文全体を置き換え:' : '覚える置き換え:',
-  );
-  appendDiffPart(container, 'mark', '', correction.from);
-  appendDiffPart(container, 'span', 'arrow', '→');
-  appendDiffPart(container, 'mark', 'to', correction.to);
-  saveButton.textContent = correction.kind === 'sentence' ? '文全体を置き換える' : 'この置き換えを覚える';
-}
-
-function openCorrectionEditor(entry, existingRow) {
-  const row = document.createElement('div');
-  row.className = 'item edit';
-
-  const time = historyTimeElement(entry);
-
-  const body = document.createElement('div');
-  body.className = 'txt';
-  const heard = document.createElement('div');
-  heard.className = 'heard';
-  heard.textContent = `聞き取り: ${entry.text}`;
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.value = entry.text;
-  input.setAttribute('aria-label', '正しい文');
-  const diff = document.createElement('div');
-  diff.className = 'diff';
-  diff.setAttribute('aria-live', 'polite');
-
-  const actions = document.createElement('div');
-  actions.className = 'actions';
-  const cancelButton = document.createElement('button');
-  cancelButton.className = 'btn small';
-  cancelButton.type = 'button';
-  cancelButton.textContent = 'キャンセル';
-  const saveButton = document.createElement('button');
-  saveButton.className = 'btn small primary';
-  saveButton.type = 'button';
-  saveButton.textContent = 'この置き換えを覚える';
-  saveButton.disabled = true;
-  actions.append(cancelButton, saveButton);
-  body.append(heard, input, diff, actions);
-  row.append(time, body);
-  existingRow.replaceWith(row);
-  input.focus();
-  input.select();
-
-  let preview = null;
-  let previewTimer = null;
-  let previewSequence = 0;
-
-  const requestPreview = () => {
-    previewSequence += 1;
-    const sequence = previewSequence;
-    clearTimeout(previewTimer);
-    preview = null;
-    saveButton.disabled = true;
-    diff.replaceChildren();
-    const corrected = input.value;
-    if (corrected === entry.text) {
-      renderCorrectionPreview(diff, { kind: 'none', message: '変更はありません。' }, saveButton);
-      return;
-    }
-    if ([...corrected].length > MAX_CORRECTION_CHARS) {
-      renderCorrectionPreview(diff, { kind: 'none', message: `修正は${MAX_CORRECTION_CHARS}文字までです` }, saveButton);
-      return;
-    }
-    previewTimer = setTimeout(async () => {
-      try {
-        const result = await invoke('preview_correction', { entryId: entry.id, corrected });
-        if (!row.isConnected || sequence !== previewSequence) return;
-        preview = result;
-        renderCorrectionPreview(diff, result, saveButton);
-      } catch (error) {
-        if (!row.isConnected || sequence !== previewSequence) return;
-        renderCorrectionPreview(diff, { kind: 'none', message: errorMessage(error) }, saveButton);
-      }
-    }, 180);
-  };
-
-  input.addEventListener('input', requestPreview);
-  cancelButton.addEventListener('click', () => {
-    clearTimeout(previewTimer);
-    if (currentSnapshot) applyHistory(currentSnapshot.history);
-  });
-  saveButton.addEventListener('click', async () => {
-    if (!preview || (preview.kind !== 'word' && preview.kind !== 'sentence')) return;
-    saveButton.disabled = true;
-    input.disabled = true;
-    cancelButton.disabled = true;
-    try {
-      await invoke('remember_correction', { entryId: entry.id, corrected: input.value });
-      if (currentSnapshot) applyHistory(currentSnapshot.history);
-      showInlineError(document.getElementById('historyList'), { message: '覚えました。' }, false);
-    } catch (error) {
-      input.disabled = false;
-      cancelButton.disabled = false;
-      saveButton.disabled = false;
-      showInlineError(row, error);
-    }
-  });
-  requestPreview();
-}
-
-function applyLearnedRules(rules) {
-  const list = document.getElementById('learnedList');
-  list.replaceChildren();
-  if (rules.length === 0) {
-    list.appendChild(emptyMessage('覚えた置き換えはありません'));
-    return;
-  }
-  for (const rule of rules) {
-    const row = document.createElement('div');
-    row.className = 'item';
-    const spacer = document.createElement('span');
-    const text = document.createElement('div');
-    text.className = 'txt';
-    text.textContent = `${rule.from.join(' / ')} → ${rule.to}`;
-    const deleteButton = document.createElement('button');
-    deleteButton.className = 'btn small';
-    deleteButton.type = 'button';
-    deleteButton.textContent = '削除';
-    deleteButton.addEventListener('click', async () => {
-      deleteButton.disabled = true;
-      try {
-        await invoke('delete_learned_rule', { id: rule.id });
-      } catch (error) {
-        deleteButton.disabled = false;
-        showInlineError(row, error);
-      }
-    });
-    row.append(spacer, text, deleteButton);
-    list.appendChild(row);
-  }
 }
 
 function setStepState(stepId, numberId, number, done, current) {
@@ -404,9 +250,9 @@ function applySnapshot(snapshot) {
   applyEngineSeg(snapshot.settings);
   applyPunctSeg(snapshot.settings);
   applyBuiltinReplaceDict(snapshot.settings);
+  applyTranscriptLog(snapshot.settings);
   applyAutostart(snapshot.autostart);
   applyHistory(snapshot.history);
-  applyLearnedRules(snapshot.learned_rules);
   if (snapshot.bootstrap_error) {
     showConfigError(snapshot.bootstrap_error);
   } else if (snapshot.onboarding) {
@@ -571,6 +417,23 @@ document.getElementById('builtinReplaceDictSwitch').addEventListener('click', as
   }
 });
 
+document.getElementById('transcriptLogSwitch').addEventListener('click', async (event) => {
+  const control = event.currentTarget;
+  if (control.disabled || transcriptLogPending) return;
+  const enabled = control.getAttribute('aria-checked') !== 'true';
+  transcriptLogPending = true;
+  control.disabled = true;
+  try {
+    const settings = await invoke('apply_settings', { patch: { transcriptLog: enabled } });
+    cacheSettings(settings);
+  } catch (error) {
+    showInlineError(control, error);
+  } finally {
+    transcriptLogPending = false;
+    if (currentSnapshot) applyTranscriptLog(currentSnapshot.settings);
+  }
+});
+
 document.getElementById('autostartSwitch').addEventListener('click', async (event) => {
   const control = event.currentTarget;
   if (control.disabled) return;
@@ -597,6 +460,10 @@ document.getElementById('autostartSwitch').addEventListener('click', async (even
 
 document.getElementById('openConfigButton').addEventListener('click', () => {
   invoke('open_config').catch((error) => showInlineError(document.getElementById('openConfigButton'), error));
+});
+
+document.getElementById('openTranscriptDirButton').addEventListener('click', () => {
+  invoke('open_transcript_dir').catch((error) => showInlineError(document.getElementById('openTranscriptDirButton'), error));
 });
 
 document.getElementById('quitButton').addEventListener('click', () => {

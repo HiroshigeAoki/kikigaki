@@ -53,10 +53,16 @@
 
         <section class="group">
           <h2>最近の聞き取り</h2>
+          <div class="row">
+            <div class="l"><b>聞き取りを記録</b><small>認識した文章だけをこの Mac に保存します。音声は保存しません。</small></div>
+            <button class="switch" id="transcriptLogSwitch" type="button" role="switch" aria-checked="false" aria-label="聞き取りを記録"></button>
+          </div>
+          <div class="row">
+            <div class="l"><b>記録フォルダ</b></div>
+            <button class="btn small" id="openTranscriptDirButton" type="button">記録フォルダを開く</button>
+          </div>
           <div class="hist" id="historyList"></div>
-          <p class="note">直近 200 件。テキストのみ保存し、音声は残しません。同じ言い間違いが続くときに「直す」と、次から自動で置き換えます。</p>
-          <div class="subsection-heading">置き換え一覧</div>
-          <div class="learned" id="learnedList"></div>
+          <p class="note">直近 200 件を表示します。アプリを終了すると消えます。</p>
         </section>
 
         <section class="group">

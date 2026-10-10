@@ -53,7 +53,6 @@ pub struct UiSnapshot {
     pub autostart: AutostartState,
     pub onboarding: Option<OnboardingState>,
     pub history: Vec<crate::history::HistoryEntry>,
-    pub learned_rules: Vec<crate::learned::LearnedRule>,
     pub bootstrap_error: Option<BootstrapError>,
 }
 

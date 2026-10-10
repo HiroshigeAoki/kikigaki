@@ -15,7 +15,6 @@ use kikigaki_core::protocol::{Event, SAMPLE_RATE};
 use kikigaki_core::session::{Input, Output, Session, SessionConfig, State};
 use kikigaki_core::startup::{StartupEvent, StartupPlan};
 
-use crate::correction::Correction;
 use crate::history::History;
 use crate::learned::Learned;
 use crate::settings::{SettingsCoordinator, SettingsPatch};
@@ -36,15 +35,6 @@ pub enum ControllerCmd {
     ApplySettings {
         patch: SettingsPatch,
         reply: ReplyTx<crate::settings::SettingsSnapshot>,
-    },
-    RememberCorrection {
-        entry_id: u64,
-        corrected: String,
-        reply: ReplyTx<()>,
-    },
-    DeleteLearnedRule {
-        id: u64,
-        reply: ReplyTx<()>,
     },
     ClearHistory {
         reply: ReplyTx<()>,
@@ -623,24 +613,6 @@ impl Controller {
                 });
                 let _ = reply.send(result);
             }
-            ControllerCmd::RememberCorrection {
-                entry_id,
-                corrected,
-                reply,
-            } => {
-                let result = self.remember_correction(entry_id, corrected);
-                let _ = reply.send(result);
-            }
-            ControllerCmd::DeleteLearnedRule { id, reply } => {
-                let result = self
-                    .learned
-                    .delete(id)
-                    .map_err(|error| persistence_error("置き換えを削除できませんでした", error))
-                    .map(|rules| {
-                        self.reload_rules(rules);
-                    });
-                let _ = reply.send(result);
-            }
             ControllerCmd::ClearHistory { reply } => {
                 self.history.clear();
                 let _ = reply.send(Ok(()));
@@ -730,40 +702,6 @@ impl Controller {
         }
     }
 
-    fn remember_correction(&mut self, entry_id: u64, corrected: String) -> Result<(), UiError> {
-        let raw = self
-            .history
-            .get(entry_id)
-            .map(|entry| entry.raw.clone())
-            .ok_or_else(|| UiError {
-                code: "not_found",
-                message: "履歴が見つかりません".into(),
-            })?;
-        let (from, to) = match crate::correction::diff(&raw, &corrected) {
-            Correction::Word { from, to } | Correction::Sentence { from, to } => (from, to),
-            Correction::None { message } => {
-                return Err(UiError {
-                    code: "nothing_to_learn",
-                    message,
-                })
-            }
-        };
-        let rules = self
-            .learned
-            .remember(vec![from], to)
-            .map_err(|error| persistence_error("置き換えを保存できませんでした", error))?;
-        self.reload_rules(rules);
-        Ok(())
-    }
-
-    fn reload_rules(&mut self, rules: std::sync::Arc<kikigaki_core::replace::Rules>) {
-        if let Some(worker) = self.postprocess.as_ref() {
-            if let Err(error) = worker.reload_rules(rules) {
-                tracing::warn!(%error, "reload learned rules");
-            }
-        }
-    }
-
     fn reregister_or_warn(&mut self, chord: &str) -> Result<(), UiError> {
         self.hotkeys.register(chord).map_err(|message| {
             self.status = Status::Warning("ホットキーが無効 — 再設定してください".into());
@@ -810,6 +748,7 @@ impl Controller {
             punctuation: None,
             strip_trailing_period: None,
             builtin_replace_dict: None,
+            transcript_log: None,
             engine: None,
         }) {
             Ok(_) => {
@@ -1464,7 +1403,20 @@ impl Controller {
                             if let Some((raw, text)) =
                                 self.pending_finals.remove(&self.active_generation)
                             {
-                                self.history.push(raw, text, Utc::now());
+                                let at = Utc::now();
+                                crate::transcript::enqueue(
+                                    self.settings.config().transcript_log,
+                                    self.settings.config().transcript_dir.clone(),
+                                    match self.active_engine {
+                                        EngineKind::Local => "local",
+                                        EngineKind::Remote => "remote",
+                                        EngineKind::Whisper => "whisper",
+                                    },
+                                    raw.clone(),
+                                    text.clone(),
+                                    at,
+                                );
+                                self.history.push(raw, text, at);
                             }
                             pending.extend(self.session.pasted(self.clock.now()));
                         }
@@ -1565,7 +1517,6 @@ impl Controller {
             },
             onboarding: self.onboarding.clone(),
             history: self.history.list(),
-            learned_rules: self.learned.list().to_vec(),
             bootstrap_error: self.bootstrap_error.clone(),
         }
     }
@@ -1719,7 +1670,7 @@ mod tests {
     use kikigaki_core::replace::ReplaceFile;
 
     use super::*;
-    use crate::settings::{PunctSetting, SettingsSnapshot};
+    use crate::settings::SettingsSnapshot;
     use crate::status::{BootstrapError, OnboardingState};
 
     #[test]
@@ -2490,6 +2441,7 @@ mod tests {
                     punctuation: None,
                     strip_trailing_period: None,
                     builtin_replace_dict: Some(enabled),
+                    transcript_log: None,
                     engine: None,
                 },
                 reply,
@@ -3942,6 +3894,7 @@ mod tests {
                 punctuation: None,
                 strip_trailing_period: None,
                 builtin_replace_dict: None,
+                transcript_log: None,
                 engine: None,
             },
             reply,
@@ -3973,6 +3926,7 @@ mod tests {
                     punctuation: None,
                     strip_trailing_period: None,
                     builtin_replace_dict: None,
+                    transcript_log: None,
                     engine: None,
                 },
                 reply: a_tx,
@@ -3987,6 +3941,7 @@ mod tests {
                     punctuation: None,
                     strip_trailing_period: None,
                     builtin_replace_dict: None,
+                    transcript_log: None,
                     engine: None,
                 },
                 reply: b_tx,
@@ -4153,39 +4108,6 @@ mod tests {
     }
 
     #[test]
-    fn ordered_configure_then_reload_rules_apply_in_order() {
-        let harness = ready_harness();
-        transcribe(&harness, 1, "x");
-        let entry = wait_snapshot(&harness, |snapshot| snapshot.history.len() == 1).history[0].id;
-        harness
-            .client
-            .send_and_wait(|reply| ControllerCmd::ApplySettings {
-                patch: SettingsPatch {
-                    hotkey: None,
-                    punctuation: Some(PunctSetting::On),
-                    strip_trailing_period: None,
-                    builtin_replace_dict: None,
-                    engine: None,
-                },
-                reply,
-            })
-            .unwrap();
-        harness
-            .client
-            .send_and_wait(|reply| ControllerCmd::RememberCorrection {
-                entry_id: entry,
-                corrected: "y".into(),
-                reply,
-            })
-            .unwrap();
-        transcribe(&harness, 2, "x");
-        assert_eq!(
-            harness.pastes.attempts.lock().unwrap().last().unwrap(),
-            "y。"
-        );
-    }
-
-    #[test]
     fn builtin_dictionary_toggle_changes_live_transcription_output() {
         let harness = ready_harness();
         transcribe(&harness, 1, "クバネティス");
@@ -4202,6 +4124,7 @@ mod tests {
                     punctuation: None,
                     strip_trailing_period: None,
                     builtin_replace_dict: Some(true),
+                    transcript_log: None,
                     engine: None,
                 },
                 reply,
@@ -4248,6 +4171,7 @@ mod tests {
                     punctuation: None,
                     strip_trailing_period: None,
                     builtin_replace_dict: Some(true),
+                    transcript_log: None,
                     engine: None,
                 },
                 reply,
@@ -4259,46 +4183,6 @@ mod tests {
         assert_eq!(
             harness.pastes.attempts.lock().unwrap().last().unwrap(),
             "クバネティス"
-        );
-    }
-
-    #[test]
-    fn correction_learned_with_builtin_enabled_uses_raw_asr_and_survives_toggle_off() {
-        let harness = ready_harness_with_builtin_enabled();
-        transcribe(&harness, 1, "クバネティス");
-        let first = wait_snapshot(&harness, |snapshot| snapshot.history.len() == 1);
-        assert_eq!(first.history[0].raw, "クバネティス");
-        assert_eq!(first.history[0].text, "Kubernetes");
-
-        harness
-            .client
-            .send_and_wait(|reply| ControllerCmd::RememberCorrection {
-                entry_id: first.history[0].id,
-                corrected: "Kubernetes".into(),
-                reply,
-            })
-            .unwrap();
-        let learned = wait_snapshot(&harness, |snapshot| snapshot.learned_rules.len() == 1);
-        assert_eq!(learned.learned_rules[0].from, ["クバネティス"]);
-        assert_eq!(learned.learned_rules[0].to, "Kubernetes");
-
-        harness
-            .client
-            .send_and_wait(|reply| ControllerCmd::ApplySettings {
-                patch: SettingsPatch {
-                    hotkey: None,
-                    punctuation: None,
-                    strip_trailing_period: None,
-                    builtin_replace_dict: Some(false),
-                    engine: None,
-                },
-                reply,
-            })
-            .unwrap();
-        transcribe(&harness, 2, "クバネティス");
-        assert_eq!(
-            harness.pastes.attempts.lock().unwrap().last().unwrap(),
-            "Kubernetes"
         );
     }
 
@@ -4357,6 +4241,7 @@ mod tests {
                         punctuation: None,
                         strip_trailing_period: None,
                         builtin_replace_dict: None,
+                        transcript_log: None,
                         engine: None,
                     },
                     reply,
@@ -4402,29 +4287,6 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("paste failure metric not written");
-    }
-
-    #[test]
-    fn end_to_end_final_paste_history_correction_reload_next_final() {
-        let harness = ready_harness();
-        transcribe(&harness, 1, "misheard");
-        let first = wait_snapshot(&harness, |snapshot| snapshot.history.len() == 1);
-        assert_eq!(first.history[0].raw, "misheard");
-        assert_eq!(first.history[0].text, "misheard");
-        let entry_id = first.history[0].id;
-        harness
-            .client
-            .send_and_wait(|reply| ControllerCmd::RememberCorrection {
-                entry_id,
-                corrected: "corrected".into(),
-                reply,
-            })
-            .unwrap();
-        transcribe(&harness, 2, "misheard");
-        assert_eq!(
-            harness.pastes.attempts.lock().unwrap().last().unwrap(),
-            "corrected"
-        );
     }
 
     #[test]

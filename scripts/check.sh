@@ -21,6 +21,14 @@ else
   echo "SKIP: python3 is unavailable; hotword evaluation self-tests not run"
 fi
 
+echo "== icon assets =="
+if command -v uv >/dev/null 2>&1; then
+  uv run scripts/icons/make_icons.py --self-test
+  uv run scripts/icons/make_icons.py --check
+else
+  echo "SKIP: uv is unavailable; icon asset checks not run"
+fi
+
 echo "== fmt =="
 cargo fmt --all --check
 

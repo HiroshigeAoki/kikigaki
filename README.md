@@ -1,3 +1,5 @@
+<img src="docs/branding/kikigaki-icon-master-1024.png" alt="kikigaki のアイコン" width="128">
+
 # kikigaki
 
 日本語特化・完全ローカルのプッシュトゥトーク型音声入力アプリ(macOS)。

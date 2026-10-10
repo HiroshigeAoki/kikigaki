@@ -248,7 +248,6 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: false,
             long_key: true,
         };
         let coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
@@ -350,7 +349,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: true,
             },
         )
         .unwrap();
@@ -421,19 +419,13 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
         coordinator
             .apply(SettingsPatch {
-                long_key: None,
-                long_hotkey: None,
                 hotkey: Some("Cmd+Shift+Space".into()),
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
+                ..SettingsPatch::default()
             })
             .unwrap();
         let on_disk = std::fs::read_to_string(path).unwrap();
@@ -457,20 +449,14 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
 
         let snapshot = coordinator
             .apply(SettingsPatch {
-                long_key: None,
-                long_hotkey: None,
-                hotkey: None,
-                punctuation: None,
-                strip_trailing_period: None,
                 builtin_replace_dict: Some(true),
-                transcript_log: None,
+                ..SettingsPatch::default()
             })
             .unwrap();
 
@@ -493,7 +479,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
@@ -534,7 +519,6 @@ mod tests {
                 Capabilities {
                     punct: false,
                     remote_engine: false,
-                    whisper: !available,
                     long_key: available,
                 },
             )
@@ -557,7 +541,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
@@ -565,13 +548,7 @@ mod tests {
 
         let snapshot = coordinator
             .apply(SettingsPatch {
-                long_key: None,
-                long_hotkey: None,
-                hotkey: None,
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
+                ..SettingsPatch::default()
             })
             .unwrap();
 
@@ -592,19 +569,13 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
         let snapshot = coordinator
             .apply(SettingsPatch {
-                long_key: None,
-                long_hotkey: None,
-                hotkey: None,
                 punctuation: Some(PunctSetting::OnStrip),
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
+                ..SettingsPatch::default()
             })
             .unwrap();
         assert!(snapshot.punct_enabled && snapshot.strip_trailing_period);
@@ -625,7 +596,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: true,
             },
         )
         .unwrap();
@@ -663,7 +633,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
@@ -682,20 +651,14 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
         std::fs::write(&path, "hotkey = \"Cmd+Space\"\n").unwrap();
         let error = coordinator
             .apply(SettingsPatch {
-                long_key: None,
-                long_hotkey: None,
                 hotkey: Some("Ctrl+Space".into()),
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
+                ..SettingsPatch::default()
             })
             .unwrap_err();
         assert_eq!(error.code, "external_change");
@@ -712,7 +675,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
@@ -721,13 +683,8 @@ mod tests {
 
         let error = coordinator
             .apply(SettingsPatch {
-                long_key: None,
-                long_hotkey: None,
-                hotkey: None,
-                punctuation: None,
-                strip_trailing_period: None,
                 builtin_replace_dict: Some(true),
-                transcript_log: None,
+                ..SettingsPatch::default()
             })
             .unwrap_err();
 
@@ -749,20 +706,14 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         )
         .unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         assert!(coordinator
             .apply(SettingsPatch {
-                long_key: None,
-                long_hotkey: None,
                 hotkey: Some("Cmd+Space".into()),
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
+                ..SettingsPatch::default()
             })
             .is_err());
         assert_eq!(coordinator.snapshot().hotkey, "Alt+Space");

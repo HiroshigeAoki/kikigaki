@@ -62,6 +62,17 @@ pub enum EngineKind {
     Whisper,
 }
 
+impl EngineKind {
+    /// Returns the serialized snake_case engine name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+            Self::Whisper => "whisper",
+        }
+    }
+}
+
 /// Method used to insert transcribed text into the frontmost application.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -277,8 +288,6 @@ pub struct Capabilities {
     pub punct: bool,
     /// Whether the remote WebSocket engine is available.
     pub remote_engine: bool,
-    /// Whether the Whisper engine (whisper-rs) is compiled into this build.
-    pub whisper: bool,
     /// Whether the long dictation key is supported on this platform.
     pub long_key: bool,
 }
@@ -539,7 +548,6 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: true,
             long_key: true,
         };
         for (choice, strip) in [
@@ -616,7 +624,6 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: true,
             long_key: true,
         };
         assert!(cfg
@@ -635,7 +642,6 @@ mod tests {
                 let caps = Capabilities {
                     punct: true,
                     remote_engine: true,
-                    whisper: !available,
                     long_key: available,
                 };
                 assert_eq!(cfg.long_key_effective(caps), enabled && available);
@@ -752,7 +758,6 @@ mod tests {
             punct: true,
             remote_engine: true,
             long_key: false,
-            whisper: false,
         };
         for hotwords_score in [0.0, f32::INFINITY, f32::NAN, -1.0] {
             let mut config = Config::default();
@@ -812,7 +817,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -822,7 +826,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -832,7 +835,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_err());
         let cfg = Config {
@@ -844,7 +846,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -854,7 +855,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_err());
         assert!(Config::default()
@@ -862,7 +862,6 @@ mod tests {
                 punct: false,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_ok());
     }
@@ -876,7 +875,6 @@ mod tests {
                 punct: false,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("punct"));
@@ -885,7 +883,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_ok());
     }
@@ -901,7 +898,6 @@ mod tests {
                 punct: true,
                 remote_engine: false,
                 long_key: false,
-                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("remote-engine"));
@@ -910,7 +906,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_ok());
     }
@@ -926,7 +921,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("whisper"));
@@ -935,7 +929,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: true,
             })
             .is_err());
     }
@@ -949,7 +942,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("loopback"));
@@ -965,7 +957,6 @@ mod tests {
                     punct: true,
                     remote_engine: true,
                     long_key: false,
-                    whisper: false,
                 })
                 .is_ok(),
                 "{url}"
@@ -979,7 +970,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             })
             .is_ok());
     }
@@ -991,20 +981,17 @@ mod tests {
             punct: true,
             remote_engine: true,
             long_key: false,
-            whisper: false,
         }));
         assert!(!cfg.punct.effective(Capabilities {
             punct: false,
             remote_engine: true,
             long_key: false,
-            whisper: false,
         }));
         cfg.punct.enabled = PunctEnabled::Off;
         assert!(!cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
             long_key: false,
-            whisper: false,
         }));
 
         cfg.punct.enabled = PunctEnabled::On;
@@ -1016,7 +1003,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
             cfg.engine
         ));
@@ -1027,7 +1013,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
             cfg.engine
         ));
@@ -1039,7 +1024,6 @@ mod tests {
             punct: true,
             remote_engine: true,
             long_key: false,
-            whisper: true,
         };
         let mut cfg = Config {
             engine: EngineKind::Whisper,

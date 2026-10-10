@@ -11,6 +11,5 @@ pub fn capabilities() -> Capabilities {
         punct: cfg!(feature = "punct"),
         remote_engine: cfg!(feature = "remote-engine"),
         long_key: cfg!(all(feature = "whisper", target_os = "macos")),
-        whisper: cfg!(feature = "whisper"),
     }
 }

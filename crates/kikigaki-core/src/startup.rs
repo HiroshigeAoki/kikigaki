@@ -177,7 +177,6 @@ mod tests {
             punct: true,
             remote_engine: true,
             long_key: false,
-            whisper: false,
         };
 
         assert!(StartupPlan::from_config(&config, caps).required.is_empty());
@@ -203,7 +202,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: true,
             },
             false,
         );
@@ -233,7 +231,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
         );
         let (tx, rx) = mpsc::sync_channel(1);

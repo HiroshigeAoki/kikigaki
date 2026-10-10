@@ -315,7 +315,6 @@ mod tests {
                 punct: false,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
             false
         )
@@ -326,7 +325,6 @@ mod tests {
                 punct: true,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
             true,
         );
@@ -343,7 +341,6 @@ mod tests {
                 punct: false,
                 remote_engine: true,
                 long_key: false,
-                whisper: false,
             },
             false,
         );
@@ -359,7 +356,6 @@ mod tests {
             punct: true,
             remote_engine: true,
             long_key: false,
-            whisper: true,
         };
         let mut whisper_ids = required(EngineKind::Whisper, caps, false)
             .iter()

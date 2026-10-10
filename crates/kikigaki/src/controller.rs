@@ -205,6 +205,13 @@ impl HotkeySender {
     }
 }
 
+fn register_failed(message: String) -> UiError {
+    UiError {
+        code: "register_failed",
+        message,
+    }
+}
+
 fn busy() -> UiError {
     UiError {
         code: "busy",
@@ -380,112 +387,20 @@ fn run(
     controller_client: ControllerClient,
     poll_interval: Duration,
 ) {
-    let ControllerConfig {
-        settings,
-        capabilities,
-        models_dir,
-        bootstrap,
-        process_started_at,
-        long_hotkey_registered,
-    } = cfg;
-    let session = Session::new(SessionConfig {
-        silence_pad_ms: settings.config().silence_pad_ms,
-        final_timeout: Duration::from_millis(settings.config().final_timeout_ms),
-    });
-    let hotwords_enabled = settings.config().builtin_replace_dict;
-    let standard_engine = settings.config().engine;
-    let learned_path = settings.config().learned_file.clone();
-    let (onboarding, bootstrap_error, auto_start) = match bootstrap {
-        BootstrapOutcome::ReadyToStart => {
-            tracing::info!(outcome = "ready_to_start", "bootstrap outcome applied");
-            (None, None, true)
-        }
-        BootstrapOutcome::NeedsOnboarding(state) => {
-            tracing::info!(outcome = "needs_onboarding", "bootstrap outcome applied");
-            (Some(state), None, false)
-        }
-        BootstrapOutcome::ConfigError(error) => {
-            tracing::info!(
-                outcome = "config_error",
-                code = error.code,
-                "bootstrap outcome applied"
-            );
-            (None, Some(error), false)
-        }
-    };
-    let (learned, initial_status) = match Learned::load(learned_path.clone()) {
-        Ok(learned) => (learned, Status::Ok),
-        Err(_error) => {
-            tracing::warn!("failed to load learned rules");
-            (
-                Learned::empty(learned_path),
-                Status::Warning("学習済みの置き換えを読み込めませんでした".into()),
-            )
-        }
-    };
     let waker: Waker = Arc::new(move || controller_client.wake());
-    let supervisor_factory = Arc::clone(&engine_factory);
-    let supervisor =
-        EngineSupervisor::new(Box::new(move || supervisor_factory.build(standard_engine)))
-            .with_waker(Arc::clone(&waker));
-    let long_desired = settings.config().long_key_effective(capabilities);
-    let long_registered = long_desired && long_hotkey_registered != Some(false);
-    let mut controller = Controller {
-        settings,
-        session,
-        mic,
-        supervisor: Some(supervisor),
-        engine_factory,
-        startup,
-        long_install_factory,
-        long: None,
-        long_desired,
-        long_origin: LongOrigin::Boot,
-        long_start_latched: false,
-        long_disable_pending: false,
-        long_hotkey_registered: long_registered,
-        long_notice_under_fallback: None,
-        long_notice: (long_desired && long_hotkey_registered == Some(false))
-            .then(|| "長文キーのホットキーが無効 — 再設定してください".into()),
-        retiring: Vec::new(),
-        retiring_installs: Vec::new(),
-        standard_engine,
-        capabilities,
-        models_dir,
-        postprocess_factory,
-        waker,
-        postprocess: None,
+    let (mut controller, auto_start) = Controller::new(
+        cfg,
         sink,
         hotkeys,
         paster,
+        engine_factory,
+        mic,
+        postprocess_factory,
+        startup,
+        long_install_factory,
         clock,
-        history: History::default(),
-        learned,
-        status: initial_status,
-        onboarding,
-        bootstrap_error,
-        download_in_flight: false,
-        window_focused: false,
-        capturing_hotkey: false,
-        last_snapshot: None,
-        dirty: true,
-        revision: 0,
-        process_started_at,
-        startup_cold: false,
-        first_ready: true,
-        pending_finals: VecDeque::new(),
-        owners: HashMap::new(),
-        pending_notices: HashMap::new(),
-        retired: HashSet::new(),
-        active: None,
-        standard_disconnect_pending: false,
-        hotwords_desired: hotwords_enabled,
-        hotwords_applied: hotwords_enabled,
-        reconcile_pending: false,
-        engine_build_generation: 0,
-        postprocess_degraded: None,
-        shutting_down: false,
-    };
+        waker,
+    );
 
     if auto_start {
         match controller.startup.start() {
@@ -630,13 +545,156 @@ struct Controller {
 }
 
 impl Controller {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        cfg: ControllerConfig,
+        sink: Box<dyn ControllerEventSink>,
+        hotkeys: Box<dyn HotkeyPort>,
+        paster: Box<dyn Paster>,
+        engine_factory: Arc<dyn EngineFactory>,
+        mic: Box<dyn MicPort>,
+        postprocess_factory: Box<dyn PostprocessFactory>,
+        startup: Box<dyn StartupPort>,
+        long_install_factory: StartupPortFactory,
+        clock: Box<dyn Clock>,
+        waker: Waker,
+    ) -> (Self, bool) {
+        let ControllerConfig {
+            settings,
+            capabilities,
+            models_dir,
+            bootstrap,
+            process_started_at,
+            long_hotkey_registered,
+        } = cfg;
+        let session = Session::new(SessionConfig {
+            silence_pad_ms: settings.config().silence_pad_ms,
+            final_timeout: Duration::from_millis(settings.config().final_timeout_ms),
+        });
+        let hotwords_enabled = settings.config().builtin_replace_dict;
+        let standard_engine = settings.config().engine;
+        let learned_path = settings.config().learned_file.clone();
+        let (onboarding, bootstrap_error, auto_start) = match bootstrap {
+            BootstrapOutcome::ReadyToStart => {
+                tracing::info!(outcome = "ready_to_start", "bootstrap outcome applied");
+                (None, None, true)
+            }
+            BootstrapOutcome::NeedsOnboarding(state) => {
+                tracing::info!(outcome = "needs_onboarding", "bootstrap outcome applied");
+                (Some(state), None, false)
+            }
+            BootstrapOutcome::ConfigError(error) => {
+                tracing::info!(
+                    outcome = "config_error",
+                    code = error.code,
+                    "bootstrap outcome applied"
+                );
+                (None, Some(error), false)
+            }
+        };
+        let (learned, initial_status) = match Learned::load(learned_path.clone()) {
+            Ok(learned) => (learned, Status::Ok),
+            Err(_error) => {
+                tracing::warn!("failed to load learned rules");
+                (
+                    Learned::empty(learned_path),
+                    Status::Warning("学習済みの置き換えを読み込めませんでした".into()),
+                )
+            }
+        };
+        let supervisor_factory = Arc::clone(&engine_factory);
+        let supervisor =
+            EngineSupervisor::new(Box::new(move || supervisor_factory.build(standard_engine)))
+                .with_waker(Arc::clone(&waker));
+        let long_desired = settings.config().long_key_effective(capabilities);
+        let long_registered = long_desired && long_hotkey_registered != Some(false);
+        let controller = Self {
+            settings,
+            session,
+            mic,
+            supervisor: Some(supervisor),
+            engine_factory,
+            startup,
+            long_install_factory,
+            long: None,
+            long_desired,
+            long_origin: LongOrigin::Boot,
+            long_start_latched: false,
+            long_disable_pending: false,
+            long_hotkey_registered: long_registered,
+            long_notice_under_fallback: None,
+            long_notice: (long_desired && long_hotkey_registered == Some(false))
+                .then(|| LONG_HOTKEY_INVALID_NOTICE.into()),
+            retiring: Vec::new(),
+            retiring_installs: Vec::new(),
+            standard_engine,
+            capabilities,
+            models_dir,
+            postprocess_factory,
+            waker,
+            postprocess: None,
+            sink,
+            hotkeys,
+            paster,
+            clock,
+            history: History::default(),
+            learned,
+            status: initial_status,
+            onboarding,
+            bootstrap_error,
+            download_in_flight: false,
+            window_focused: false,
+            capturing_hotkey: false,
+            last_snapshot: None,
+            dirty: true,
+            revision: 0,
+            process_started_at,
+            startup_cold: false,
+            first_ready: true,
+            pending_finals: VecDeque::new(),
+            owners: HashMap::new(),
+            pending_notices: HashMap::new(),
+            retired: HashSet::new(),
+            active: None,
+            standard_disconnect_pending: false,
+            hotwords_desired: hotwords_enabled,
+            hotwords_applied: hotwords_enabled,
+            reconcile_pending: false,
+            engine_build_generation: 0,
+            postprocess_degraded: None,
+            shutting_down: false,
+        };
+
+        (controller, auto_start)
+    }
+
+    fn unregister_long_hotkey(&mut self) {
+        if let Err(message) = self.hotkeys.unregister(HotkeyKey::Long) {
+            tracing::warn!(%message, "unregister long hotkey");
+            self.long_notice = Some(LONG_HOTKEY_INVALID_NOTICE.into());
+        }
+    }
+
+    fn set_long_notice(&mut self, notice: Option<String>) {
+        self.long_notice = notice;
+        self.long_notice_under_fallback = None;
+        self.dirty = true;
+    }
+
+    fn cancel_generation(&mut self, gen: u64, engine: EngineKind) {
+        if let Some(supervisor) = self.supervisor_for(engine) {
+            supervisor.cancel(gen);
+            send_command(supervisor, EngineCmd::Cancel { gen });
+        }
+        self.retire_generation(gen);
+    }
+
     fn handle_command(&mut self, command: ControllerCmd) {
         if matches!(command, ControllerCmd::Wake) {
             return;
         }
         self.dirty = true;
         match command {
-            ControllerCmd::Wake => {}
             ControllerCmd::ApplySettings { patch, reply } => {
                 let result = self.apply_settings(patch);
                 let _ = reply.send(result);
@@ -699,10 +757,7 @@ impl Controller {
                     }
                     Err(message) => {
                         let _ = self.restore_capture_hotkeys();
-                        let _ = reply.send(Err(UiError {
-                            code: "register_failed",
-                            message,
-                        }));
+                        let _ = reply.send(Err(register_failed(message)));
                     }
                 }
             }
@@ -746,6 +801,7 @@ impl Controller {
                 self.publish_if_changed();
             }
             ControllerCmd::Quit => self.begin_shutdown(),
+            _ => unreachable!("Wake returned before dispatch"),
         }
     }
 
@@ -763,14 +819,10 @@ impl Controller {
                     self.status = Status::Warning("ホットキーが無効 — 再設定してください".into());
                 }
                 HotkeyKey::Long => {
-                    self.long_notice = Some(LONG_HOTKEY_INVALID_NOTICE.into());
-                    self.long_notice_under_fallback = None;
+                    self.set_long_notice(Some(LONG_HOTKEY_INVALID_NOTICE.into()));
                 }
             }
-            UiError {
-                code: "register_failed",
-                message,
-            }
+            register_failed(message)
         })
     }
 
@@ -852,12 +904,7 @@ impl Controller {
             return;
         }
         let registration = if key == HotkeyKey::Standard || self.capture_restores_long() {
-            self.hotkeys
-                .register(key, &chord)
-                .map_err(|message| UiError {
-                    code: "register_failed",
-                    message,
-                })
+            self.hotkeys.register(key, &chord).map_err(register_failed)
         } else {
             Ok(())
         };
@@ -971,7 +1018,7 @@ impl Controller {
         }
     }
 
-    fn active_is_long(&self) -> bool {
+    fn active_engine_is_whisper(&self) -> bool {
         self.active
             .and_then(|gen| self.owners.get(&gen))
             .is_some_and(|owner| owner.engine == EngineKind::Whisper)
@@ -1009,14 +1056,11 @@ impl Controller {
             return;
         };
         if let Some(worker) = &self.postprocess {
-            // Both commands go to the same FIFO, with no other producer configuring it.
-            let result = worker
-                .configure(postprocess_settings(
-                    self.settings.config(),
-                    self.capabilities,
-                    owner.engine,
-                ))
-                .and_then(|()| worker.submit(gen, message));
+            let result = worker.submit(
+                gen,
+                message,
+                postprocess_settings(self.settings.config(), self.capabilities, owner.engine),
+            );
             if let Err(error) = result {
                 tracing::error!(%error, "submit configured final for post-processing");
             }
@@ -1026,7 +1070,7 @@ impl Controller {
     }
 
     fn standard_disconnected(&mut self, outputs: &mut Vec<Output>) {
-        if self.active_is_long() {
+        if self.active_engine_is_whisper() {
             self.standard_disconnect_pending = true;
             return;
         }
@@ -1040,7 +1084,7 @@ impl Controller {
     }
 
     fn apply_standard_disconnect(&mut self) {
-        if self.standard_disconnect_pending && !self.active_is_long() {
+        if self.standard_disconnect_pending && !self.active_engine_is_whisper() {
             self.standard_disconnect_pending = false;
             let mut outputs = Vec::new();
             self.standard_disconnected(&mut outputs);
@@ -1138,20 +1182,13 @@ impl Controller {
                 .unwrap_or(&self.settings.config().long_hotkey);
             self.hotkeys
                 .register(HotkeyKey::Long, chord)
-                .map_err(|message| UiError {
-                    code: "register_failed",
-                    message,
-                })?;
+                .map_err(register_failed)?;
         }
         let snapshot = match self.settings.apply(patch) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 if newly_registered {
-                    if let Err(message) = self.hotkeys.unregister(HotkeyKey::Long) {
-                        tracing::warn!(%message, "rollback long hotkey registration");
-                        self.long_notice =
-                            Some("長文キーのホットキーが無効 — 再設定してください".into());
-                    }
+                    self.unregister_long_hotkey();
                 }
                 return Err(error);
             }
@@ -1168,7 +1205,7 @@ impl Controller {
         }
         if let Some(enabled) = requested {
             let previously_desired = self.long_desired;
-            self.long_desired = enabled && self.capabilities.long_key;
+            self.long_desired = enabled;
             self.long_disable_pending = !self.long_desired;
             if self.long_desired {
                 if newly_registered {
@@ -1208,7 +1245,7 @@ impl Controller {
             Some(index) => (self.retiring_installs.swap_remove(index).port, true),
             None => ((self.long_install_factory)(plan), false),
         };
-        self.long = Some(LongEngine {
+        let mut long = LongEngine {
             supervisor: Some(supervisor),
             install: Some(install),
             state: if self.retiring.is_empty() {
@@ -1219,24 +1256,24 @@ impl Controller {
             origin,
             installed: false,
             install_terminal: false,
-        });
+        };
+        let start_result = if adopted {
+            Ok(true)
+        } else {
+            long.install
+                .as_mut()
+                .expect("new long installer exists")
+                .start()
+        };
+        self.long = Some(long);
         if self.long_hotkey_registered {
-            self.long_notice = None;
-            self.long_notice_under_fallback = None;
+            self.set_long_notice(None);
         }
         self.dirty = true;
         if adopted {
             return;
         }
-        match self
-            .long
-            .as_mut()
-            .unwrap()
-            .install
-            .as_mut()
-            .unwrap()
-            .start()
-        {
+        match start_result {
             Ok(true) => {}
             Ok(false) => {
                 self.fail_long_install("Long engine model installation is already running".into())
@@ -1276,8 +1313,7 @@ impl Controller {
         let long = self.long.as_mut().expect("long installer exists");
         long.install_terminal = true;
         let origin = long.origin;
-        self.long_notice = Some(reason.clone());
-        self.long_notice_under_fallback = None;
+        self.set_long_notice(Some(reason.clone()));
         if origin == LongOrigin::Settings {
             if let Err(error) = self.settings.apply(SettingsPatch {
                 long_key: Some(false),
@@ -1290,12 +1326,17 @@ impl Controller {
             self.long_disable_pending = true;
             self.disable_long();
         } else {
-            self.fail_long_load(reason, None);
+            self.fail_long_load(reason, None, None);
         }
         self.dirty = true;
     }
 
-    fn fail_long_load(&mut self, reason: String, failed_model: Option<&'static str>) {
+    fn fail_long_load(
+        &mut self,
+        reason: String,
+        failed_model: Option<&'static str>,
+        notice: Option<String>,
+    ) {
         let supervisor = if let Some(long) = self.long.as_mut() {
             if failed_model.is_some() {
                 if let Some(install) = long.install.as_mut() {
@@ -1312,17 +1353,12 @@ impl Controller {
         if let Some(supervisor) = supervisor {
             self.retire_long(supervisor);
         }
-        self.long_notice = Some(reason);
-        self.long_notice_under_fallback = None;
-        self.dirty = true;
+        self.set_long_notice(Some(notice.unwrap_or(reason)));
     }
 
     fn disable_long(&mut self) {
         if self.long_hotkey_registered {
-            if let Err(message) = self.hotkeys.unregister(HotkeyKey::Long) {
-                tracing::warn!(%message, "unregister long hotkey");
-                self.long_notice = Some("長文キーのホットキーが無効 — 再設定してください".into());
-            }
+            self.unregister_long_hotkey();
             self.long_hotkey_registered = false;
         }
         self.retire_long_instance();
@@ -1358,7 +1394,7 @@ impl Controller {
             }
         }
         self.retiring = pending;
-        if self.long_disable_pending && !self.active_is_long() {
+        if self.long_disable_pending && !self.active_engine_is_whisper() {
             self.disable_long();
         }
         self.retiring_installs.retain_mut(|install| {
@@ -1394,16 +1430,15 @@ impl Controller {
                         .is_some_and(|supervisor| supervisor.sink().is_none())
             });
         if can_start {
-            let result = self
-                .long
-                .as_mut()
-                .unwrap()
-                .supervisor
-                .as_mut()
-                .unwrap()
-                .start();
+            let Some(long) = self.long.as_mut() else {
+                return;
+            };
+            let Some(supervisor) = long.supervisor.as_mut() else {
+                return;
+            };
+            let result = supervisor.start();
             if let Err(error) = result {
-                self.fail_long_load(format!("Long engine start failed — {error}"), None);
+                self.fail_long_load(format!("Long engine start failed — {error}"), None, None);
             }
         }
     }
@@ -1422,6 +1457,9 @@ impl Controller {
             let Some(event) = event else {
                 break;
             };
+            let Some(long) = self.long.as_mut() else {
+                break;
+            };
             self.dirty = true;
             match event {
                 StartupEvent::Installing {
@@ -1429,19 +1467,14 @@ impl Controller {
                     total_bytes,
                     ..
                 } => {
-                    let percent = if total_bytes == 0 {
-                        0
-                    } else {
-                        (done_bytes.saturating_mul(100) / total_bytes).min(100) as u8
-                    };
-                    self.long.as_mut().unwrap().state = if self.retiring.is_empty() {
+                    let percent = percent(done_bytes, total_bytes);
+                    long.state = if self.retiring.is_empty() {
                         LongState::Installing { percent }
                     } else {
                         LongState::Loading
                     };
                 }
                 StartupEvent::Installed(_) => {
-                    let long = self.long.as_mut().unwrap();
                     long.installed = true;
                     long.install_terminal = true;
                     long.state = LongState::Loading;
@@ -1463,10 +1496,13 @@ impl Controller {
             let Some(message) = message else {
                 break;
             };
+            let Some(long) = self.long.as_mut() else {
+                break;
+            };
             self.dirty = true;
             match message {
                 EngineMsg::Ready => {
-                    self.long.as_mut().unwrap().state = LongState::Ready;
+                    long.state = LongState::Ready;
                     // Registration warnings remain actionable even after the engine is ready.
                     if self.long_hotkey_registered {
                         self.long_notice_under_fallback = None;
@@ -1484,19 +1520,14 @@ impl Controller {
                     reason,
                     failed_model,
                 } => {
-                    if self.active_is_long() {
+                    if self.active_engine_is_whisper() {
                         let gen = self.active.unwrap();
                         outputs.extend(self.session.handle(Input::Abort { gen }, self.clock.now()));
                         // Retirement removes the supervisor; deliver cancellation before moving it.
-                        if let Some(supervisor) = self.supervisor_for(EngineKind::Whisper) {
-                            supervisor.cancel(gen);
-                            send_command(supervisor, EngineCmd::Cancel { gen });
-                        }
-                        self.retire_generation(gen);
-                        self.fail_long_load(reason, failed_model);
-                        self.long_notice = Some(LONG_FAILED_NOTICE.into());
+                        self.cancel_generation(gen, EngineKind::Whisper);
+                        self.fail_long_load(reason, failed_model, Some(LONG_FAILED_NOTICE.into()));
                     } else {
-                        self.fail_long_load(reason, failed_model);
+                        self.fail_long_load(reason, failed_model, None);
                     }
                     // Retire the entire supervisor before another poll can shut it down inline.
                     break;
@@ -1569,16 +1600,6 @@ impl Controller {
                             Some(Arc::clone(&self.waker)),
                         ) {
                             Ok(worker) => {
-                                // builtin_replace_dict was already applied via
-                                // postprocess_factory.build() above; only punct settings need
-                                // a follow-up configure() since build() hardcodes those off.
-                                if let Err(error) = worker.configure(postprocess_settings(
-                                    self.settings.config(),
-                                    self.capabilities,
-                                    self.standard_engine,
-                                )) {
-                                    tracing::warn!(%error, "configure new post-processing worker");
-                                }
                                 self.postprocess = Some(worker);
                             }
                             Err(error) => {
@@ -1774,11 +1795,7 @@ impl Controller {
                     }
                 }
                 Output::Cancel { gen } => {
-                    if let Some(supervisor) = self.supervisor_for(self.owner_engine(gen)) {
-                        supervisor.cancel(gen);
-                        send_command(supervisor, EngineCmd::Cancel { gen });
-                    }
-                    self.retire_generation(gen);
+                    self.cancel_generation(gen, self.owner_engine(gen));
                 }
                 Output::Paste(text) => {
                     let final_text = self.pending_finals.pop_front();
@@ -1807,7 +1824,7 @@ impl Controller {
                                 crate::transcript::enqueue(
                                     self.settings.config().transcript_log,
                                     self.settings.config().transcript_dir.clone(),
-                                    engine_name(self.owner_engine(gen)),
+                                    self.owner_engine(gen).as_str(),
                                     raw.clone(),
                                     text.clone(),
                                     at,
@@ -1848,7 +1865,7 @@ impl Controller {
                 }
                 Output::Record(mut row) => {
                     row.ts = metric_timestamp();
-                    row.engine = Some(engine_name(self.owner_engine(row.gen)).into());
+                    row.engine = Some(self.owner_engine(row.gen).as_str().into());
                     if !self.generation_is_in_progress(row.gen) {
                         if row.final_to_paste_ms.is_none() && !row.timeout && !row.paste_failed {
                             self.complete_notice(row.gen);
@@ -2035,14 +2052,6 @@ fn hotkey_input(
     }
 }
 
-fn engine_name(engine: EngineKind) -> &'static str {
-    match engine {
-        EngineKind::Local => "local",
-        EngineKind::Remote => "remote",
-        EngineKind::Whisper => "whisper",
-    }
-}
-
 fn is_fallback_notice(notice: &str) -> bool {
     matches!(notice, LONG_PREPARING_NOTICE | LONG_STOPPED_NOTICE)
 }
@@ -2054,13 +2063,16 @@ fn persistence_error(prefix: &str, error: anyhow::Error) -> UiError {
     }
 }
 
-fn progress_message(id: &str, done_bytes: u64, total_bytes: u64) -> String {
-    let percent = if total_bytes == 0 {
+fn percent(done: u64, total: u64) -> u8 {
+    if total == 0 {
         0
     } else {
-        done_bytes.saturating_mul(100) / total_bytes
+        (done.saturating_mul(100) / total).min(100) as u8
     }
-    .min(100);
+}
+
+fn progress_message(id: &str, done_bytes: u64, total_bytes: u64) -> String {
+    let percent = percent(done_bytes, total_bytes);
     format!("Downloading {id} … {percent}%")
 }
 
@@ -2389,13 +2401,26 @@ mod tests {
         }
     }
 
+    fn engine_states() -> Arc<Vec<(EngineKind, Arc<FakeEngineState>)>> {
+        Arc::new(Vec::from([
+            (EngineKind::Local, Arc::new(FakeEngineState::default())),
+            (EngineKind::Remote, Arc::new(FakeEngineState::default())),
+            (EngineKind::Whisper, Arc::new(FakeEngineState::default())),
+        ]))
+    }
+
+    fn engine_state(
+        states: &[(EngineKind, Arc<FakeEngineState>)],
+        kind: EngineKind,
+    ) -> Arc<FakeEngineState> {
+        Arc::clone(&states.iter().find(|(key, _)| *key == kind).unwrap().1)
+    }
+
     impl FakeEngineFactory {
         fn new(standard: Arc<FakeEngineState>) -> Self {
-            Self::from_states(Arc::new(Vec::from([
-                (EngineKind::Local, standard),
-                (EngineKind::Remote, Arc::new(FakeEngineState::default())),
-                (EngineKind::Whisper, Arc::new(FakeEngineState::default())),
-            ])))
+            let mut states = engine_states();
+            Arc::get_mut(&mut states).unwrap()[0].1 = standard;
+            Self::from_states(states)
         }
 
         fn from_states(states: Arc<Vec<(EngineKind, Arc<FakeEngineState>)>>) -> Self {
@@ -2403,7 +2428,7 @@ mod tests {
         }
 
         fn engine(&self, kind: EngineKind) -> Arc<FakeEngineState> {
-            Arc::clone(&self.states.iter().find(|(key, _)| *key == kind).unwrap().1)
+            engine_state(&self.states, kind)
         }
     }
 
@@ -2457,6 +2482,29 @@ mod tests {
         builtin: Arc<kikigaki_core::replace::Rules>,
         gate: Mutex<Option<BuildGate>>,
         punctuator: Arc<PunctuatorState>,
+    }
+
+    impl FakePostprocessFactory {
+        fn new(replace_file: PathBuf, gate: Option<BuildGate>) -> Self {
+            Self {
+                replace_file,
+                builtin: Arc::new(kikigaki_core::replace::builtin_rules().unwrap()),
+                gate: Mutex::new(gate),
+                punctuator: Arc::new(PunctuatorState::default()),
+            }
+        }
+    }
+
+    fn fake_long_install_factory(state: Arc<StartupState>) -> StartupPortFactory {
+        Box::new(move |plan| {
+            state.plans.lock().unwrap().push(plan.clone());
+            Box::new(FakeStartup {
+                rescans: VecDeque::new(),
+                required: plan.required,
+                state: Arc::clone(&state),
+                owns_install_lock: false,
+            })
+        })
     }
 
     impl PostprocessFactory for FakePostprocessFactory {
@@ -2599,7 +2647,7 @@ mod tests {
 
     impl Harness {
         fn engine(&self, kind: EngineKind) -> Arc<FakeEngineState> {
-            Arc::clone(&self.engines.iter().find(|(key, _)| *key == kind).unwrap().1)
+            engine_state(&self.engines, kind)
         }
 
         fn stop(&mut self) -> bool {
@@ -2758,11 +2806,7 @@ mod tests {
         let metrics_path = temp.path().join("metrics.jsonl");
         let models_dir = temp.path().join("models");
         std::fs::write(&replace_file, "").unwrap();
-        let engine_name = match engine_kind {
-            EngineKind::Local => "local",
-            EngineKind::Remote => "remote",
-            EngineKind::Whisper => "whisper",
-        };
+        let engine_name = engine_kind.as_str();
         std::fs::write(
             &config_path,
             format!(
@@ -2775,7 +2819,6 @@ mod tests {
             punct: true,
             remote_engine: true,
             long_key: true,
-            whisper: true,
         };
         let settings = SettingsCoordinator::load(config_path, capabilities).unwrap();
         let (client, rx, hotkey, hotkey_rx) = client_channels();
@@ -2790,14 +2833,11 @@ mod tests {
             ..PasteState::default()
         });
         let mic = Arc::new(MicState::default());
-        let punctuator = Arc::new(PunctuatorState::default());
+        let postprocess_factory = FakePostprocessFactory::new(replace_file, gate);
+        let punctuator = Arc::clone(&postprocess_factory.punctuator);
         let startup = Arc::new(StartupState::default());
         let long_startup = Arc::new(StartupState::default());
-        let engines = Arc::new(Vec::from([
-            (EngineKind::Local, Arc::new(FakeEngineState::default())),
-            (EngineKind::Remote, Arc::new(FakeEngineState::default())),
-            (EngineKind::Whisper, Arc::new(FakeEngineState::default())),
-        ]));
+        let engines = engine_states();
         engines
             .iter()
             .find(|(key, _)| *key == engine_kind)
@@ -2810,7 +2850,6 @@ mod tests {
         for state in engines.iter().map(|(_, state)| state) {
             state.enabled.store(builtin_replace_dict, Ordering::Relaxed);
         }
-        let long_startup_for_factory = Arc::clone(&long_startup);
         let (handle, _exited) = spawn_with_poll_interval(
             ControllerConfig {
                 settings,
@@ -2828,12 +2867,7 @@ mod tests {
             Box::new(FakePaster(Arc::clone(&pastes))),
             Arc::new(FakeEngineFactory::from_states(Arc::clone(&engines))),
             Box::new(FakeMic(Arc::clone(&mic))),
-            Box::new(FakePostprocessFactory {
-                replace_file,
-                builtin: Arc::new(kikigaki_core::replace::builtin_rules().unwrap()),
-                gate: Mutex::new(gate),
-                punctuator: Arc::clone(&punctuator),
-            }),
+            Box::new(postprocess_factory),
             Box::new(FakeStartup {
                 rescans: rescans.into(),
                 required: vec![
@@ -2843,19 +2877,7 @@ mod tests {
                 state: Arc::clone(&startup),
                 owns_install_lock: false,
             }),
-            Box::new(move |plan| {
-                long_startup_for_factory
-                    .plans
-                    .lock()
-                    .unwrap()
-                    .push(plan.clone());
-                Box::new(FakeStartup {
-                    rescans: VecDeque::new(),
-                    required: plan.required,
-                    state: Arc::clone(&long_startup_for_factory),
-                    owns_install_lock: false,
-                })
-            }),
+            fake_long_install_factory(Arc::clone(&long_startup)),
             Box::new(FakeClock(clock)),
             poll_interval,
         );
@@ -2899,105 +2921,45 @@ mod tests {
             let path = temp.path().join("config.toml");
             let replace_file = temp.path().join("replace.toml");
             std::fs::write(&replace_file, "").unwrap();
-            std::fs::write(&path, format!("long_key = {enabled}\nreplace_file = {:?}\nmetrics_path = {:?}\ntranscript_dir = {:?}\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"), temp.path().join("transcripts"))).unwrap();
+            std::fs::write(&path, format!("long_key = {enabled}\nreplace_file = {:?}\nmetrics_path = {:?}\ntranscript_dir = {:?}\nlearned_file = {:?}\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"), temp.path().join("transcripts"), temp.path().join("learned.toml"))).unwrap();
             let capabilities = Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: !capable,
                 long_key: capable,
             };
             let settings = SettingsCoordinator::load(path, capabilities).unwrap();
-            let engines = Arc::new(Vec::from([
-                (EngineKind::Local, Arc::new(FakeEngineState::default())),
-                (EngineKind::Remote, Arc::new(FakeEngineState::default())),
-                (EngineKind::Whisper, Arc::new(FakeEngineState::default())),
-            ]));
+            let engines = engine_states();
             let factory: Arc<dyn EngineFactory> =
                 Arc::new(FakeEngineFactory::from_states(Arc::clone(&engines)));
-            let standard_factory = Arc::clone(&factory);
             let hotkeys = Arc::new(HotkeyState::default());
             let startup = Arc::new(StartupState::default());
             let long_startup = Arc::new(StartupState::default());
-            let long_factory_state = Arc::clone(&long_startup);
             let pastes = Arc::new(PasteState::default());
-            let controller = Controller {
-                settings,
-                session: Session::new(SessionConfig {
-                    silence_pad_ms: 500,
-                    final_timeout: Duration::from_secs(3),
-                }),
-                mic: Box::new(FakeMic(Arc::new(MicState::default()))),
-                supervisor: Some(EngineSupervisor::new(Box::new(move || {
-                    standard_factory.build(EngineKind::Local)
-                }))),
-                engine_factory: factory,
-                startup: Box::new(FakeStartup {
+            let (controller, _) = Controller::new(
+                ControllerConfig {
+                    settings,
+                    capabilities,
+                    models_dir: temp.path().join("models"),
+                    bootstrap: BootstrapOutcome::ReadyToStart,
+                    process_started_at: Instant::now(),
+                    long_hotkey_registered: None,
+                },
+                Box::new(FakeSink(SinkState::default())),
+                Box::new(ScriptedHotkeys(Arc::clone(&hotkeys))),
+                Box::new(FakePaster(Arc::clone(&pastes))),
+                factory,
+                Box::new(FakeMic(Arc::new(MicState::default()))),
+                Box::new(FakePostprocessFactory::new(replace_file, None)),
+                Box::new(FakeStartup {
                     rescans: VecDeque::new(),
                     required: Vec::new(),
                     state: Arc::clone(&startup),
                     owns_install_lock: false,
                 }),
-                long_install_factory: Box::new(move |plan| {
-                    long_factory_state.plans.lock().unwrap().push(plan.clone());
-                    Box::new(FakeStartup {
-                        rescans: VecDeque::new(),
-                        required: plan.required,
-                        state: Arc::clone(&long_factory_state),
-                        owns_install_lock: false,
-                    })
-                }),
-                long: None,
-                long_desired: enabled && capable,
-                long_origin: LongOrigin::Boot,
-                long_start_latched: false,
-                long_disable_pending: false,
-                long_hotkey_registered: enabled && capable,
-                long_notice: None,
-                long_notice_under_fallback: None,
-                retiring: Vec::new(),
-                retiring_installs: Vec::new(),
-                standard_engine: EngineKind::Local,
-                capabilities,
-                models_dir: temp.path().join("models"),
-                postprocess_factory: Box::new(FakePostprocessFactory {
-                    replace_file,
-                    builtin: Arc::new(kikigaki_core::replace::builtin_rules().unwrap()),
-                    gate: Mutex::new(None),
-                    punctuator: Arc::new(PunctuatorState::default()),
-                }),
-                waker: Arc::new(|| {}),
-                postprocess: None,
-                sink: Box::new(FakeSink(SinkState::default())),
-                hotkeys: Box::new(ScriptedHotkeys(Arc::clone(&hotkeys))),
-                paster: Box::new(FakePaster(Arc::clone(&pastes))),
-                clock: Box::new(RealClock),
-                history: History::default(),
-                learned: Learned::empty(temp.path().join("learned.toml")),
-                status: Status::Ok,
-                onboarding: None,
-                bootstrap_error: None,
-                download_in_flight: false,
-                window_focused: false,
-                capturing_hotkey: false,
-                last_snapshot: None,
-                dirty: true,
-                revision: 0,
-                process_started_at: Instant::now(),
-                startup_cold: false,
-                first_ready: true,
-                pending_finals: VecDeque::new(),
-                owners: HashMap::new(),
-                pending_notices: HashMap::new(),
-                retired: HashSet::new(),
-                active: None,
-                standard_disconnect_pending: false,
-                hotwords_desired: false,
-                hotwords_applied: false,
-                reconcile_pending: false,
-                engine_build_generation: 0,
-                postprocess_degraded: None,
-                shutting_down: false,
-            };
+                fake_long_install_factory(Arc::clone(&long_startup)),
+                Box::new(RealClock),
+                Arc::new(|| {}),
+            );
             Self {
                 controller,
                 engines,
@@ -3010,7 +2972,7 @@ mod tests {
         }
 
         fn engine(&self, kind: EngineKind) -> Arc<FakeEngineState> {
-            Arc::clone(&self.engines.iter().find(|(key, _)| *key == kind).unwrap().1)
+            engine_state(&self.engines, kind)
         }
 
         fn turn(&mut self) {
@@ -3187,7 +3149,11 @@ mod tests {
         fn assert_no_submission(h: &mut LifecycleHarness) {
             let worker = h.controller.postprocess.as_ref().unwrap();
             worker
-                .submit(u64::MAX, final_message(u64::MAX, "barrier"))
+                .submit(
+                    u64::MAX,
+                    final_message(u64::MAX, "barrier"),
+                    kikigaki_core::postprocess::PostprocessSettings::default(),
+                )
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
             loop {
@@ -4691,7 +4657,7 @@ mod tests {
         let snapshot = latest(&harness).unwrap();
         assert_eq!(
             snapshot.status.message.as_deref(),
-            Some("長文キーのホットキーが無効 — 再設定してください")
+            Some(LONG_HOTKEY_INVALID_NOTICE)
         );
         assert!(snapshot.status.long_hotkey.is_none());
         assert_eq!(harness.long_startup.plans.lock().unwrap().len(), 1);
@@ -4945,13 +4911,8 @@ mod tests {
             .client
             .send_and_wait(|reply| ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
-                    long_key: None,
-                    long_hotkey: None,
-                    hotkey: None,
-                    punctuation: None,
-                    strip_trailing_period: None,
                     builtin_replace_dict: Some(enabled),
-                    transcript_log: None,
+                    ..SettingsPatch::default()
                 },
                 reply,
             })
@@ -5944,13 +5905,8 @@ mod tests {
     fn apply_hotkey(client: &ControllerClient, chord: &str) -> Result<SettingsSnapshot, UiError> {
         client.send_and_wait(|reply| ControllerCmd::ApplySettings {
             patch: SettingsPatch {
-                long_key: None,
-                long_hotkey: None,
                 hotkey: Some(chord.into()),
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
+                ..SettingsPatch::default()
             },
             reply,
         })
@@ -5977,13 +5933,8 @@ mod tests {
             .tx
             .send(ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
-                    long_key: None,
-                    long_hotkey: None,
                     hotkey: Some("Alt+A".into()),
-                    punctuation: None,
-                    strip_trailing_period: None,
-                    builtin_replace_dict: None,
-                    transcript_log: None,
+                    ..SettingsPatch::default()
                 },
                 reply: a_tx,
             })
@@ -5993,13 +5944,8 @@ mod tests {
             .tx
             .send(ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
-                    long_key: None,
-                    long_hotkey: None,
                     hotkey: Some("Alt+B".into()),
-                    punctuation: None,
-                    strip_trailing_period: None,
-                    builtin_replace_dict: None,
-                    transcript_log: None,
+                    ..SettingsPatch::default()
                 },
                 reply: b_tx,
             })
@@ -6245,7 +6191,7 @@ mod tests {
                     );
                     assert_eq!(
                         h.controller.long_notice.as_deref(),
-                        Some("長文キーのホットキーが無効 — 再設定してください")
+                        Some(LONG_HOTKEY_INVALID_NOTICE)
                     );
                     assert_eq!(
                         h.controller.snapshot().status.message.as_deref(),
@@ -6447,13 +6393,8 @@ mod tests {
             .client
             .send_and_wait(|reply| ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
-                    long_key: None,
-                    long_hotkey: None,
-                    hotkey: None,
-                    punctuation: None,
-                    strip_trailing_period: None,
                     builtin_replace_dict: Some(true),
-                    transcript_log: None,
+                    ..SettingsPatch::default()
                 },
                 reply,
             })
@@ -6495,13 +6436,8 @@ mod tests {
             .client
             .send_and_wait(|reply| ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
-                    long_key: None,
-                    long_hotkey: None,
-                    hotkey: None,
-                    punctuation: None,
-                    strip_trailing_period: None,
                     builtin_replace_dict: Some(true),
-                    transcript_log: None,
+                    ..SettingsPatch::default()
                 },
                 reply,
             })
@@ -6568,13 +6504,7 @@ mod tests {
                 .tx
                 .try_send(ControllerCmd::ApplySettings {
                     patch: SettingsPatch {
-                        long_key: None,
-                        long_hotkey: None,
-                        hotkey: None,
-                        punctuation: None,
-                        strip_trailing_period: None,
-                        builtin_replace_dict: None,
-                        transcript_log: None,
+                        ..SettingsPatch::default()
                     },
                     reply,
                 })

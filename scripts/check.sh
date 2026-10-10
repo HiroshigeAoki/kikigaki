@@ -43,3 +43,18 @@ cargo test -p kikigaki --lib --no-default-features --features remote-engine
 
 echo "== no default features (punct off) =="
 cargo test -p kikigaki-core -p kikigaki-engine -p kikigaki --lib --no-default-features
+
+echo "== whisper feature: engine crate compiles and its feature-independent tests still pass =="
+cargo clippy -p kikigaki-engine --features whisper --lib -- -D warnings
+cargo test -p kikigaki-engine --features whisper --lib
+
+echo "== whisper feature: app lib compiles and tests pass (isolated: no punct; shell.rs factory arm is macOS-only) =="
+cargo clippy -p kikigaki --lib --no-default-features --features whisper -- -D warnings
+cargo test -p kikigaki --lib --no-default-features --features whisper
+
+echo "== whisper feature: the shipped Mac combination links too (default punct + whisper) =="
+cargo test -p kikigaki --lib --features whisper
+
+echo "== whisper feature: hotword-eval's --engine whisper code path compiles and its own tests pass =="
+cargo clippy -p kikigaki-engine --bin hotword-eval --features whisper -- -D warnings
+cargo test -p kikigaki-engine --bin hotword-eval --features whisper

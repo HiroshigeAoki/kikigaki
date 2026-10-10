@@ -10,5 +10,6 @@ pub fn capabilities() -> Capabilities {
     Capabilities {
         punct: cfg!(feature = "punct"),
         remote_engine: cfg!(feature = "remote-engine"),
+        whisper: cfg!(feature = "whisper"),
     }
 }

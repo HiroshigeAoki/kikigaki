@@ -42,4 +42,4 @@ ssh "$HOST" "export PATH=\$HOME/.cargo/bin:/opt/homebrew/bin:\$PATH; \
     security unlock-keychain -p \"\${KIKIGAKI_KEYCHAIN_PASSWORD:?set KIKIGAKI_KEYCHAIN_PASSWORD (see 1Password)}\" ~/Library/Keychains/kikigaki.keychain-db && \
     SIGN_CFG='{\"bundle\":{\"macOS\":{\"signingIdentity\":\"kikigaki\"}}}'; echo 'mac: signing with identity kikigaki'; \
   else SIGN_CFG='{}'; echo 'mac: identity kikigaki not found, ad-hoc signing (TCC grants reset per build)'; fi && \
-  cargo tauri build --bundles app --config \"\$SIGN_CFG\" -- --locked --features devtools 2>&1 | tail -40"
+  cargo tauri build --bundles app --config \"\$SIGN_CFG\" -- --locked --features devtools,whisper-metal 2>&1 | tail -40"

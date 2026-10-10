@@ -145,12 +145,15 @@ def render(destination):
     master.save(destination / icns, format="ICNS", append_images=[
         resize_rgba(master, (size, size)) for size in (16, 32, 64, 128, 256, 512)
     ])
-    # Pillow 12.3 omits the 16px 1x entry; add standard icp4 and rebuild the TOC.
+    # Pillow 12.3 omits the 16px and 32px 1x entries (iconutil's icon_16x16 / icon_32x32);
+    # add the standard icp4 / icp5 and rebuild the TOC.
     path = destination / icns
     entries = icns_entries(path.read_bytes())
-    small = io.BytesIO()
-    resize_rgba(master, (16, 16)).save(small, format="PNG", optimize=False, compress_level=9)
-    entries.append((b"icp4", small.getvalue()))
+    for tag, size in ((b"icp4", 16), (b"icp5", 32)):
+        small = io.BytesIO()
+        resize_rgba(master, (size, size)).save(small, format="PNG", optimize=False,
+                                               compress_level=9)
+        entries.append((tag, small.getvalue()))
     toc = b"".join(struct.pack(">4sI", tag, len(payload) + 8) for tag, payload in entries)
     chunks = struct.pack(">4sI", b"TOC ", len(toc) + 8) + toc
     chunks += b"".join(struct.pack(">4sI", tag, len(payload) + 8) + payload

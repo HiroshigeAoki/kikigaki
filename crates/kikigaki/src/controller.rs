@@ -1,6 +1,6 @@
 //! Tauri-free push-to-talk controller and its injected platform ports.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -435,6 +435,7 @@ fn run(
         long_start_latched: false,
         long_disable_pending: false,
         long_hotkey_registered: long_registered,
+        long_notice_under_fallback: None,
         long_notice: (long_desired && long_hotkey_registered == Some(false))
             .then(|| "長文キーのホットキーが無効 — 再設定してください".into()),
         retiring: Vec::new(),
@@ -463,8 +464,12 @@ fn run(
         process_started_at,
         startup_cold: false,
         first_ready: true,
-        pending_finals: HashMap::new(),
-        active_generation: 0,
+        pending_finals: VecDeque::new(),
+        owners: HashMap::new(),
+        pending_notices: HashMap::new(),
+        retired: HashSet::new(),
+        active: None,
+        standard_disconnect_pending: false,
         hotwords_desired: hotwords_enabled,
         hotwords_applied: hotwords_enabled,
         reconcile_pending: false,
@@ -502,19 +507,31 @@ fn run(
         }
         controller.reconcile_hotwords(&mut outputs);
         controller.handle_startup_events(&mut outputs);
-        controller.handle_postprocess_events(&mut outputs);
         controller.handle_engine_messages(&mut outputs);
-        controller.handle_long_events();
+        controller.handle_long_events(&mut outputs);
+        controller.handle_postprocess_events(&mut outputs);
         outputs.extend(
             controller
                 .session
                 .handle(Input::Tick, controller.clock.now()),
         );
         controller.execute_outputs(std::mem::take(&mut outputs));
+        controller.apply_standard_disconnect();
         controller.reconcile_long();
         controller.publish_if_changed();
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+struct Owner {
+    key: HotkeyKey,
+    engine: EngineKind,
+}
+
+const LONG_PREPARING_NOTICE: &str = "長文エンジン準備中のため標準で認識しました";
+const LONG_STOPPED_NOTICE: &str = "長文エンジンが停止中のため標準で認識しました";
+const LONG_FAILED_NOTICE: &str = "長文エンジンが停止しました — 設定から再試行できます";
+const PASTE_FAILED_NOTICE: &str = "Accessibility permission denied — System Settings › Privacy";
 
 #[derive(Debug)]
 enum LongState {
@@ -559,6 +576,8 @@ struct Controller {
     long_disable_pending: bool,
     long_hotkey_registered: bool,
     long_notice: Option<String>,
+    // Preserve a failure while a completed fallback is shown until the next press.
+    long_notice_under_fallback: Option<String>,
     retiring: Vec<std::thread::JoinHandle<()>>,
     retiring_installs: Vec<RetiringInstall>,
     standard_engine: EngineKind,
@@ -585,8 +604,13 @@ struct Controller {
     process_started_at: Instant,
     startup_cold: bool,
     first_ready: bool,
-    pending_finals: HashMap<u64, (String, String)>,
-    active_generation: u64,
+    pending_finals: VecDeque<(u64, String, String)>,
+    owners: HashMap<u64, Owner>,
+    pending_notices: HashMap<u64, String>,
+    // Tombstones protect this turn; after pruning, a missing owner rejects later finals.
+    retired: HashSet<u64>,
+    active: Option<u64>,
+    standard_disconnect_pending: bool,
     hotwords_desired: bool,
     hotwords_applied: bool,
     reconcile_pending: bool,
@@ -763,16 +787,163 @@ impl Controller {
     }
 
     fn handle_hotkey_edge(&mut self, edge: HotkeyEdge, outputs: &mut Vec<Output>) {
-        let Some(input) = hotkey_input(
-            edge,
-            self.window_focused,
-            self.capturing_hotkey,
-            self.standard_engine,
-        ) else {
+        let (key, pressed) = match edge {
+            HotkeyEdge::Pressed(key) => (key, true),
+            HotkeyEdge::Released(key) => (key, false),
+        };
+        let active_owner = self.active.and_then(|gen| self.owners.get(&gen)).copied();
+        if !pressed && active_owner.is_none_or(|owner| owner.key != key) {
+            return;
+        }
+        let mut notice = None;
+        let engine = if !pressed {
+            active_owner.unwrap().engine
+        } else if self.session.state() == State::Disconnected
+            || key == HotkeyKey::Standard
+            || self.long_disable_pending
+        {
+            self.standard_engine
+        } else {
+            match self.long.as_ref().map(|long| &long.state) {
+                Some(LongState::Ready) => EngineKind::Whisper,
+                Some(LongState::Installing { .. } | LongState::Loading) => {
+                    notice = Some(LONG_PREPARING_NOTICE.to_owned());
+                    self.standard_engine
+                }
+                Some(LongState::Failed { .. }) => {
+                    notice = Some(LONG_STOPPED_NOTICE.to_owned());
+                    self.standard_engine
+                }
+                None => return,
+            }
+        };
+        let Some(input) = hotkey_input(edge, self.window_focused, self.capturing_hotkey, engine)
+        else {
             return;
         };
         self.dirty = true;
-        outputs.extend(self.session.handle(input, self.clock.now()));
+        if pressed && self.long_notice.as_deref().is_some_and(is_fallback_notice) {
+            self.long_notice = self.long_notice_under_fallback.take();
+        }
+        let edge_outputs = self.session.handle(input, self.clock.now());
+        // Bind each edge's Begin before another edge or engine message can be handled.
+        for output in &edge_outputs {
+            match output {
+                Output::Cancel { gen } => self.retire_generation(*gen),
+                Output::Begin { gen } => {
+                    self.owners.insert(*gen, Owner { key, engine });
+                    if let Some(notice) = notice.take() {
+                        self.pending_notices.insert(*gen, notice);
+                    }
+                    self.active = Some(*gen);
+                }
+                _ => {}
+            }
+        }
+        outputs.extend(edge_outputs);
+    }
+
+    fn generation_is_in_progress(&self, gen: u64) -> bool {
+        // Segment pastes can drain after release; the end Final still owns this generation.
+        self.active == Some(gen)
+            && matches!(self.session.state(), State::Recording | State::Finalizing)
+    }
+
+    fn retire_generation(&mut self, gen: u64) {
+        self.retired.insert(gen);
+        if self.active == Some(gen) {
+            self.active = None;
+        }
+    }
+
+    fn active_is_long(&self) -> bool {
+        self.active
+            .and_then(|gen| self.owners.get(&gen))
+            .is_some_and(|owner| owner.engine == EngineKind::Whisper)
+    }
+
+    fn owner_engine(&self, gen: u64) -> EngineKind {
+        self.owners.get(&gen).map_or_else(
+            || {
+                tracing::warn!(gen, "missing utterance owner; using standard engine");
+                self.standard_engine
+            },
+            |owner| owner.engine,
+        )
+    }
+
+    fn supervisor_for(&self, engine: EngineKind) -> Option<&EngineSupervisor> {
+        if engine == EngineKind::Whisper {
+            self.long.as_ref().and_then(|long| long.supervisor.as_ref())
+        } else {
+            self.supervisor.as_ref()
+        }
+    }
+
+    fn submit_final(&self, engine: EngineKind, message: EngineMsg) {
+        let EngineMsg::Final { gen, .. } = &message else {
+            return;
+        };
+        let gen = *gen;
+        let Some(owner) = self
+            .owners
+            .get(&gen)
+            .filter(|owner| owner.engine == engine && !self.retired.contains(&gen))
+        else {
+            tracing::debug!(gen, ?engine, "dropping final without a live matching owner");
+            return;
+        };
+        if let Some(worker) = &self.postprocess {
+            // Both commands go to the same FIFO, with no other producer configuring it.
+            let result = worker
+                .configure(postprocess_settings(
+                    self.settings.config(),
+                    self.capabilities,
+                    owner.engine,
+                ))
+                .and_then(|()| worker.submit(gen, message));
+            if let Err(error) = result {
+                tracing::error!(%error, "submit configured final for post-processing");
+            }
+        } else {
+            tracing::error!(gen, "post-processing is unavailable");
+        }
+    }
+
+    fn standard_disconnected(&mut self, outputs: &mut Vec<Output>) {
+        if self.active_is_long() {
+            self.standard_disconnect_pending = true;
+            return;
+        }
+        if let Some(gen) = self.active {
+            self.retire_generation(gen);
+        }
+        outputs.extend(
+            self.session
+                .handle(Input::EngineDisconnected, self.clock.now()),
+        );
+    }
+
+    fn apply_standard_disconnect(&mut self) {
+        if self.standard_disconnect_pending && !self.active_is_long() {
+            self.standard_disconnect_pending = false;
+            let mut outputs = Vec::new();
+            self.standard_disconnected(&mut outputs);
+            self.execute_outputs(outputs);
+        }
+    }
+
+    fn complete_notice(&mut self, gen: u64) {
+        if let Some(notice) = self.pending_notices.remove(&gen) {
+            if self
+                .long_notice
+                .as_deref()
+                .is_some_and(|notice| !is_fallback_notice(notice))
+            {
+                self.long_notice_under_fallback = self.long_notice.take();
+            }
+            self.long_notice = Some(notice);
+        }
     }
 
     fn reconcile_hotwords(&mut self, outputs: &mut Vec<Output>) {
@@ -820,10 +991,7 @@ impl Controller {
                 self.engine_factory.set_hotwords_enabled(previously_applied);
                 self.mic.stop();
                 self.status = Status::EngineFailed(format!("Engine restart failed — {error}"));
-                outputs.extend(
-                    self.session
-                        .handle(Input::EngineDisconnected, self.clock.now()),
-                );
+                self.standard_disconnected(outputs);
             }
         }
         self.dirty = true;
@@ -876,13 +1044,6 @@ impl Controller {
         self.hotwords_desired = snapshot.builtin_replace_dict;
         self.reconcile_pending = self.hotwords_desired != self.hotwords_applied;
         if let Some(worker) = self.postprocess.as_ref() {
-            if let Err(error) = worker.configure(postprocess_settings(
-                self.settings.config(),
-                self.capabilities,
-                self.standard_engine,
-            )) {
-                tracing::warn!(%error, "configure post-processing");
-            }
             if let Err(error) = worker.set_builtin_enabled(snapshot.builtin_replace_dict) {
                 tracing::warn!(%error, "configure builtin replacement dictionary");
                 self.postprocess_degraded = Some("内蔵置換辞書を反映できませんでした".into());
@@ -946,6 +1107,7 @@ impl Controller {
         });
         if self.long_hotkey_registered {
             self.long_notice = None;
+            self.long_notice_under_fallback = None;
         }
         self.dirty = true;
         if adopted {
@@ -1000,6 +1162,7 @@ impl Controller {
         long.install_terminal = true;
         let origin = long.origin;
         self.long_notice = Some(reason.clone());
+        self.long_notice_under_fallback = None;
         if origin == LongOrigin::Settings {
             if let Err(error) = self.settings.apply(SettingsPatch {
                 long_key: Some(false),
@@ -1035,6 +1198,7 @@ impl Controller {
             self.retire_long(supervisor);
         }
         self.long_notice = Some(reason);
+        self.long_notice_under_fallback = None;
         self.dirty = true;
     }
 
@@ -1079,8 +1243,7 @@ impl Controller {
             }
         }
         self.retiring = pending;
-        if self.long_disable_pending {
-            // Task 6 adds the owner check here; long edges are still dropped in this task.
+        if self.long_disable_pending && !self.active_is_long() {
             self.disable_long();
         }
         self.retiring_installs.retain_mut(|install| {
@@ -1130,8 +1293,8 @@ impl Controller {
         }
     }
 
-    fn handle_long_events(&mut self) {
-        if !self.long_desired {
+    fn handle_long_events(&mut self, outputs: &mut Vec<Output>) {
+        if !self.long_desired && !self.long_disable_pending {
             return;
         }
         loop {
@@ -1187,18 +1350,44 @@ impl Controller {
             };
             self.dirty = true;
             match message {
-                EngineMsg::Ready => self.long.as_mut().unwrap().state = LongState::Ready,
+                EngineMsg::Ready => {
+                    self.long.as_mut().unwrap().state = LongState::Ready;
+                    // Registration warnings remain actionable even after the engine is ready.
+                    if self.long_hotkey_registered {
+                        self.long_notice_under_fallback = None;
+                    }
+                    if self.long_hotkey_registered
+                        && self
+                            .long_notice
+                            .as_deref()
+                            .is_some_and(|notice| !is_fallback_notice(notice))
+                    {
+                        self.long_notice = None;
+                    }
+                }
                 EngineMsg::Disconnected {
                     reason,
                     failed_model,
                 } => {
-                    self.fail_long_load(reason, failed_model);
+                    if self.active_is_long() {
+                        let gen = self.active.unwrap();
+                        outputs.extend(self.session.handle(Input::Abort { gen }, self.clock.now()));
+                        // Retirement removes the supervisor; deliver cancellation before moving it.
+                        if let Some(supervisor) = self.supervisor_for(EngineKind::Whisper) {
+                            supervisor.cancel(gen);
+                            send_command(supervisor, EngineCmd::Cancel { gen });
+                        }
+                        self.retire_generation(gen);
+                        self.fail_long_load(reason, failed_model);
+                        self.long_notice = Some(LONG_FAILED_NOTICE.into());
+                    } else {
+                        self.fail_long_load(reason, failed_model);
+                    }
                     // Retire the entire supervisor before another poll can shut it down inline.
                     break;
                 }
-                EngineMsg::Final { gen, .. } => {
-                    // Routing and owner validation arrive in Task 6.
-                    tracing::warn!(gen, "ignoring long final without utterance routing");
+                message @ EngineMsg::Final { .. } => {
+                    self.submit_final(EngineKind::Whisper, message)
                 }
             }
         }
@@ -1254,10 +1443,7 @@ impl Controller {
                         }
                     });
                     if !engine_started {
-                        outputs.extend(
-                            self.session
-                                .handle(Input::EngineDisconnected, self.clock.now()),
-                        );
+                        self.standard_disconnected(outputs);
                         continue;
                     }
                     if self.postprocess.is_none() {
@@ -1288,10 +1474,7 @@ impl Controller {
                                 if let Some(supervisor) = self.supervisor.as_mut() {
                                     supervisor.shutdown();
                                 }
-                                outputs.extend(
-                                    self.session
-                                        .handle(Input::EngineDisconnected, self.clock.now()),
-                                );
+                                self.standard_disconnected(outputs);
                             }
                         }
                     }
@@ -1319,10 +1502,7 @@ impl Controller {
                             }
                         }
                     }
-                    outputs.extend(
-                        self.session
-                            .handle(Input::EngineDisconnected, self.clock.now()),
-                    );
+                    self.standard_disconnected(outputs);
                 }
             }
         }
@@ -1338,16 +1518,21 @@ impl Controller {
                 break;
             };
             self.dirty = true;
-            self.pending_finals.insert(
-                processed.gen,
-                (processed.raw.clone(), processed.text.clone()),
-            );
-            self.pending_finals
-                .retain(|generation, _| *generation >= self.active_generation);
-            outputs.extend(self.session.handle(
+            if self.retired.contains(&processed.gen) || !self.owners.contains_key(&processed.gen) {
+                continue;
+            }
+            let final_outputs = self.session.handle(
                 Input::Engine(Event::Final(to_protocol_final(&processed))),
                 self.clock.now(),
-            ));
+            );
+            if final_outputs
+                .iter()
+                .any(|output| matches!(output, Output::Paste(_)))
+            {
+                self.pending_finals
+                    .push_back((processed.gen, processed.raw, processed.text));
+            }
+            outputs.extend(final_outputs);
         }
     }
 
@@ -1392,6 +1577,7 @@ impl Controller {
                             self.first_ready = false;
                         }
                         self.status = Status::Ok;
+                        self.standard_disconnect_pending = false;
                         if !self.long_start_latched {
                             self.long_start_latched = true;
                             if self.long_desired {
@@ -1401,14 +1587,8 @@ impl Controller {
                     }
                     Input::Engine(Event::Ready { sr: SAMPLE_RATE })
                 }
-                final_message @ EngineMsg::Final { gen, .. } => {
-                    if let Some(worker) = self.postprocess.as_ref() {
-                        if let Err(error) = worker.submit(gen, final_message) {
-                            tracing::error!(%error, gen, "submit final for post-processing");
-                        }
-                    } else {
-                        tracing::error!(gen, "post-processing is unavailable");
-                    }
+                message @ EngineMsg::Final { .. } => {
+                    self.submit_final(self.standard_engine, message);
                     continue;
                 }
                 EngineMsg::Disconnected {
@@ -1423,7 +1603,8 @@ impl Controller {
                     } else {
                         Status::EngineFailed(reason)
                     };
-                    Input::EngineDisconnected
+                    self.standard_disconnected(outputs);
+                    continue;
                 }
             };
             outputs.extend(self.session.handle(input, self.clock.now()));
@@ -1432,27 +1613,40 @@ impl Controller {
 
     fn execute_outputs(&mut self, outputs: Vec<Output>) {
         let mut pending = VecDeque::from(outputs);
+        let mut mic_gen = None;
         while let Some(output) = pending.pop_front() {
             self.dirty = true;
             match output {
                 Output::Begin { gen } => {
-                    self.active_generation = gen;
-                    if let Some(supervisor) = self.supervisor.as_ref() {
+                    mic_gen = Some(gen);
+                    if let Some(supervisor) = self.supervisor_for(self.owner_engine(gen)) {
                         send_command(supervisor, EngineCmd::Begin { gen });
                     }
                 }
                 Output::StartMic => {
-                    let sink = self.supervisor.as_ref().and_then(EngineSupervisor::sink);
+                    let sink = mic_gen
+                        .and_then(|gen| self.supervisor_for(self.owner_engine(gen)))
+                        .and_then(EngineSupervisor::sink);
                     if let Some(sink) = sink {
                         let permission_denied = microphone_permission_denied();
-                        if permission_denied {
+                        let standard_failed = matches!(
+                            self.status,
+                            Status::StartupFailed(_) | Status::EngineFailed(_)
+                        );
+                        if permission_denied && !standard_failed {
                             self.status = Status::Warning(MICROPHONE_PERMISSION_DENIED.into());
                         }
                         if let Err(error) = self.mic.start(sink) {
-                            self.status =
-                                Status::Warning(format!("Microphone unavailable — {error}"));
+                            tracing::warn!(%error, "microphone unavailable");
+                            if !standard_failed {
+                                self.status =
+                                    Status::Warning(format!("Microphone unavailable — {error}"));
+                            }
                         } else if !permission_denied
-                            && !matches!(&self.status, Status::Installing(_))
+                            && !matches!(
+                                &self.status,
+                                Status::Installing(_) | Status::EngineFailed(_)
+                            )
                         {
                             self.status.clear_transient();
                         }
@@ -1460,43 +1654,53 @@ impl Controller {
                 }
                 Output::StopMic => self.mic.stop(),
                 Output::EndUtterance { gen, pad_ms } => {
-                    if let Some(supervisor) = self.supervisor.as_ref() {
+                    if let Some(supervisor) = self.supervisor_for(self.owner_engine(gen)) {
                         send_command(supervisor, EngineCmd::End { gen, pad_ms });
                     }
                 }
                 Output::Cancel { gen } => {
-                    if let Some(supervisor) = self.supervisor.as_ref() {
+                    if let Some(supervisor) = self.supervisor_for(self.owner_engine(gen)) {
                         supervisor.cancel(gen);
                         send_command(supervisor, EngineCmd::Cancel { gen });
                     }
-                    self.pending_finals.remove(&gen);
+                    self.retire_generation(gen);
                 }
                 Output::Paste(text) => {
+                    let final_text = self.pending_finals.pop_front();
+                    let final_gen = final_text.as_ref().map(|(gen, _, _)| *gen);
+                    if final_gen.is_some_and(|gen| self.retired.contains(&gen)) {
+                        // Discard the corresponding pending metrics row as well as the paste.
+                        self.session.paste_failed(self.clock.now());
+                        continue;
+                    }
                     let text_len = text.chars().count();
                     let deadline = self.clock.now() + PASTE_TIMEOUT;
                     match self.paster.paste(text, deadline) {
                         Ok(()) => {
                             tracing::info!(outcome = "ok", text_len, "paste completed");
-                            if !matches!(&self.status, Status::Installing(_)) {
+                            if !matches!(
+                                &self.status,
+                                Status::Installing(_) | Status::EngineFailed(_)
+                            ) {
                                 self.status.clear_transient();
                             }
-                            if let Some((raw, text)) =
-                                self.pending_finals.remove(&self.active_generation)
-                            {
+                            if let Some((gen, raw, text)) = final_text {
+                                if !self.generation_is_in_progress(gen) {
+                                    self.complete_notice(gen);
+                                }
                                 let at = Utc::now();
                                 crate::transcript::enqueue(
                                     self.settings.config().transcript_log,
                                     self.settings.config().transcript_dir.clone(),
-                                    match self.standard_engine {
-                                        EngineKind::Local => "local",
-                                        EngineKind::Remote => "remote",
-                                        EngineKind::Whisper => "whisper",
-                                    },
+                                    engine_name(self.owner_engine(gen)),
                                     raw.clone(),
                                     text.clone(),
                                     at,
                                 );
                                 self.history.push(raw, text, at);
+                                if !self.generation_is_in_progress(gen) {
+                                    self.retire_generation(gen);
+                                }
                             }
                             pending.extend(self.session.pasted(self.clock.now()));
                         }
@@ -1512,17 +1716,30 @@ impl Controller {
                             };
                             tracing::info!(outcome, text_len, "paste completed");
                             tracing::error!(%error, "paste failed");
-                            self.status = Status::Warning(
-                                "Accessibility permission denied — System Settings › Privacy"
-                                    .into(),
-                            );
-                            self.pending_finals.remove(&self.active_generation);
+                            if !matches!(
+                                self.status,
+                                Status::StartupFailed(_) | Status::EngineFailed(_)
+                            ) {
+                                self.status = Status::Warning(PASTE_FAILED_NOTICE.into());
+                            }
+                            if let Some(gen) =
+                                final_gen.filter(|gen| !self.generation_is_in_progress(*gen))
+                            {
+                                self.retire_generation(gen);
+                            }
                             pending.extend(self.session.paste_failed(self.clock.now()));
                         }
                     }
                 }
                 Output::Record(mut row) => {
                     row.ts = metric_timestamp();
+                    row.engine = Some(engine_name(self.owner_engine(row.gen)).into());
+                    if !self.generation_is_in_progress(row.gen) {
+                        if row.final_to_paste_ms.is_none() && !row.timeout && !row.paste_failed {
+                            self.complete_notice(row.gen);
+                        }
+                        self.retire_generation(row.gen);
+                    }
                     append_metric(self.settings.config(), metrics::MetricRow::Utterance(row));
                 }
                 Output::SetState(_) => {}
@@ -1553,6 +1770,11 @@ impl Controller {
                 }
             }
         }
+        // Record and transcript enqueue above must still see owners retired during this drain.
+        self.owners.retain(|gen, _| !self.retired.contains(gen));
+        self.pending_notices
+            .retain(|gen, _| !self.retired.contains(gen));
+        self.retired.clear();
     }
 
     fn snapshot(&self) -> UiSnapshot {
@@ -1615,6 +1837,9 @@ impl Controller {
                 }
                 _ => self.status.clone(),
             };
+        }
+        if self.status.message() == Some(PASTE_FAILED_NOTICE) {
+            return self.status.clone();
         }
         if let Some(notice) = &self.long_notice {
             return Status::Warning(notice.clone());
@@ -1686,16 +1911,25 @@ fn hotkey_input(
     edge: HotkeyEdge,
     window_focused: bool,
     capturing_hotkey: bool,
-    standard_engine: EngineKind,
+    engine: EngineKind,
 ) -> Option<Input> {
     match edge {
-        HotkeyEdge::Pressed(HotkeyKey::Long) | HotkeyEdge::Released(HotkeyKey::Long) => None,
-        HotkeyEdge::Pressed(HotkeyKey::Standard) if window_focused || capturing_hotkey => None,
-        HotkeyEdge::Pressed(HotkeyKey::Standard) => Some(Input::Pressed),
-        HotkeyEdge::Released(HotkeyKey::Standard) => Some(Input::Released {
-            engine: standard_engine,
-        }),
+        HotkeyEdge::Pressed(_) if window_focused || capturing_hotkey => None,
+        HotkeyEdge::Pressed(_) => Some(Input::Pressed),
+        HotkeyEdge::Released(_) => Some(Input::Released { engine }),
     }
+}
+
+fn engine_name(engine: EngineKind) -> &'static str {
+    match engine {
+        EngineKind::Local => "local",
+        EngineKind::Remote => "remote",
+        EngineKind::Whisper => "whisper",
+    }
+}
+
+fn is_fallback_notice(notice: &str) -> bool {
+    matches!(notice, LONG_PREPARING_NOTICE | LONG_STOPPED_NOTICE)
 }
 
 fn persistence_error(prefix: &str, error: anyhow::Error) -> UiError {
@@ -1777,12 +2011,12 @@ mod tests {
     use crate::status::{BootstrapError, OnboardingState};
 
     #[test]
-    fn hotkey_input_drops_long_edges_until_routing_exists() {
+    fn hotkey_input_handles_both_keys_with_shared_suppression() {
         for edge in [
             HotkeyEdge::Pressed(HotkeyKey::Long),
             HotkeyEdge::Released(HotkeyKey::Long),
         ] {
-            assert!(hotkey_input(edge, false, false, EngineKind::Local).is_none());
+            assert!(hotkey_input(edge, false, false, EngineKind::Local).is_some());
         }
     }
 
@@ -2550,7 +2784,7 @@ mod tests {
             let path = temp.path().join("config.toml");
             let replace_file = temp.path().join("replace.toml");
             std::fs::write(&replace_file, "").unwrap();
-            std::fs::write(&path, format!("long_key = {enabled}\nreplace_file = {:?}\nmetrics_path = {:?}\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"))).unwrap();
+            std::fs::write(&path, format!("long_key = {enabled}\nreplace_file = {:?}\nmetrics_path = {:?}\ntranscript_dir = {:?}\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"), temp.path().join("transcripts"))).unwrap();
             let capabilities = Capabilities {
                 punct: true,
                 remote_engine: true,
@@ -2604,6 +2838,7 @@ mod tests {
                 long_disable_pending: false,
                 long_hotkey_registered: enabled && capable,
                 long_notice: None,
+                long_notice_under_fallback: None,
                 retiring: Vec::new(),
                 retiring_installs: Vec::new(),
                 standard_engine: EngineKind::Local,
@@ -2635,8 +2870,12 @@ mod tests {
                 process_started_at: Instant::now(),
                 startup_cold: false,
                 first_ready: true,
-                pending_finals: HashMap::new(),
-                active_generation: 0,
+                pending_finals: VecDeque::new(),
+                owners: HashMap::new(),
+                pending_notices: HashMap::new(),
+                retired: HashSet::new(),
+                active: None,
+                standard_disconnect_pending: false,
                 hotwords_desired: false,
                 hotwords_applied: false,
                 reconcile_pending: false,
@@ -2664,10 +2903,11 @@ mod tests {
             let mut outputs = Vec::new();
             c.reconcile_hotwords(&mut outputs);
             c.handle_startup_events(&mut outputs);
-            c.handle_postprocess_events(&mut outputs);
             c.handle_engine_messages(&mut outputs);
-            c.handle_long_events();
+            c.handle_long_events(&mut outputs);
+            c.handle_postprocess_events(&mut outputs);
             c.execute_outputs(outputs);
+            c.apply_standard_disconnect();
             c.reconcile_long();
         }
 
@@ -2761,6 +3001,1005 @@ mod tests {
                 thread::yield_now();
             }
             assert_eq!(self.controller.session.state(), State::Idle);
+        }
+    }
+
+    mod routing_tests {
+        use super::*;
+
+        const PREPARING: &str = "長文エンジン準備中のため標準で認識しました";
+        const STOPPED: &str = "長文エンジンが停止中のため標準で認識しました";
+        const FAILED: &str = "長文エンジンが停止しました — 設定から再試行できます";
+
+        struct AudioMic;
+        impl MicPort for AudioMic {
+            fn start(&mut self, sink: AudioSink) -> anyhow::Result<()> {
+                sink.send(EngineCmd::Audio(vec![0.25]))?;
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+
+        fn ready() -> (LifecycleHarness, Receiver<()>) {
+            let mut h = LifecycleHarness::new(false, true);
+            let (tx, rx) = mpsc::channel();
+            h.controller.waker = Arc::new(move || {
+                let _ = tx.send(());
+            });
+            h.controller.mic = Box::new(AudioMic);
+            h.ready_long();
+            (h, rx)
+        }
+
+        fn edges(h: &mut LifecycleHarness, edges: impl IntoIterator<Item = HotkeyEdge>) {
+            let mut outputs = Vec::new();
+            for edge in edges {
+                h.controller.handle_hotkey_edge(edge, &mut outputs);
+            }
+            h.controller.execute_outputs(outputs);
+        }
+
+        fn utterance(h: &mut LifecycleHarness, key: HotkeyKey) {
+            edges(h, [HotkeyEdge::Pressed(key), HotkeyEdge::Released(key)]);
+            assert_eq!(h.controller.session.state(), State::Finalizing);
+        }
+
+        fn finish(
+            h: &mut LifecycleHarness,
+            rx: &Receiver<()>,
+            kind: EngineKind,
+            gen: u64,
+            text: &str,
+        ) {
+            h.engine(kind).send(final_message(gen, text));
+            h.turn();
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("final was not processed");
+            h.turn();
+        }
+
+        fn commands(h: &LifecycleHarness, kind: EngineKind) -> Vec<EngineCmd> {
+            h.engine(kind)
+                .command_receivers
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|rx| rx.lock().unwrap().try_iter().collect::<Vec<_>>())
+                .collect()
+        }
+
+        // A sentinel traverses the worker's FIFO and proves every earlier submission was drained.
+        fn assert_no_submission(h: &mut LifecycleHarness) {
+            let worker = h.controller.postprocess.as_ref().unwrap();
+            worker
+                .submit(u64::MAX, final_message(u64::MAX, "barrier"))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(result) = worker.try_recv() {
+                    assert_eq!(
+                        result.gen,
+                        u64::MAX,
+                        "a rejected final reached postprocessing"
+                    );
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+        }
+
+        fn rows(h: &LifecycleHarness) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&h.controller.settings.config().metrics_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|row| row["kind"] == "utterance")
+                .collect()
+        }
+
+        fn transcripts(h: &LifecycleHarness) -> Vec<serde_json::Value> {
+            transcripts_with_count(h, 1)
+        }
+
+        fn transcripts_with_count(h: &LifecycleHarness, count: usize) -> Vec<serde_json::Value> {
+            let dir = &h.controller.settings.config().transcript_dir;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let rows: Vec<_> = std::fs::read_dir(dir)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                    .flat_map(|body| {
+                        body.lines()
+                            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                if rows.len() >= count {
+                    return rows;
+                }
+                assert!(Instant::now() < deadline, "transcript was not written");
+                thread::yield_now();
+            }
+        }
+
+        mod review_fix {
+            use super::*;
+
+            fn enable_transcripts(h: &mut LifecycleHarness) {
+                h.controller
+                    .apply_settings(SettingsPatch {
+                        transcript_log: Some(true),
+                        ..SettingsPatch::default()
+                    })
+                    .unwrap();
+            }
+
+            #[test]
+            fn standard_multi_segment_utterance_pastes_every_segment_and_the_end_final() {
+                let (mut h, rx) = ready();
+                enable_transcripts(&mut h);
+                edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+                for (index, text) in ["first", "second"].into_iter().enumerate() {
+                    finish(&mut h, &rx, EngineKind::Local, 1, text);
+                    assert_eq!(h.controller.session.state(), State::Recording);
+                    assert_eq!(h.controller.active, Some(1));
+                    assert!(!h.controller.retired.contains(&1));
+                    assert_eq!(h.controller.owners[&1].engine, EngineKind::Local);
+                    assert_eq!(transcripts_with_count(&h, index + 1).len(), index + 1);
+                }
+                edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Standard)]);
+                assert_eq!(h.controller.session.state(), State::Finalizing);
+                finish(&mut h, &rx, EngineKind::Local, 1, "end");
+                assert_eq!(
+                    *h.pastes.attempts.lock().unwrap(),
+                    ["first", "second", "end"]
+                );
+                let metrics = rows(&h);
+                assert_eq!(metrics.len(), 3);
+                assert!(metrics.iter().all(|row| row["gen"] == 1
+                    && row["engine"] == "local"
+                    && row["paste_failed"] == false));
+                assert!(metrics[0]["since_press_ms"].is_number());
+                assert!(metrics[1]["since_press_ms"].is_number());
+                assert!(metrics[2]["release_to_final_ms"].is_number());
+                let transcript = transcripts_with_count(&h, 3);
+                assert_eq!(
+                    transcript
+                        .iter()
+                        .map(|row| row["text"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["first", "second", "end"]
+                );
+                assert!(transcript.iter().all(|row| row["engine"] == "local"));
+                assert_eq!(h.controller.session.state(), State::Idle);
+                assert!(h.controller.active.is_none());
+                assert!(h.controller.owners.is_empty());
+                h.engine(EngineKind::Local).send(final_message(1, "late"));
+                h.turn();
+                assert_no_submission(&mut h);
+            }
+
+            #[test]
+            fn queued_mid_utterance_pastes_remain_live_if_release_precedes_output_drain() {
+                let (mut h, rx) = ready();
+                edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+                for text in ["first", "second"] {
+                    h.engine(EngineKind::Local).send(final_message(1, text));
+                }
+                let mut outputs = Vec::new();
+                h.controller.handle_engine_messages(&mut outputs);
+                for _ in 0..2 {
+                    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                }
+                h.controller.handle_postprocess_events(&mut outputs);
+                h.controller
+                    .handle_hotkey_edge(HotkeyEdge::Released(HotkeyKey::Standard), &mut outputs);
+                h.controller.execute_outputs(outputs);
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["first", "second"]);
+                assert_eq!(h.controller.session.state(), State::Finalizing);
+                assert_eq!(h.controller.active, Some(1));
+                assert_eq!(rows(&h).len(), 2);
+                finish(&mut h, &rx, EngineKind::Local, 1, "end");
+                assert_eq!(
+                    *h.pastes.attempts.lock().unwrap(),
+                    ["first", "second", "end"]
+                );
+                assert_eq!(rows(&h).len(), 3);
+                assert_eq!(h.controller.session.state(), State::Idle);
+                assert!(h.controller.active.is_none());
+            }
+
+            #[test]
+            fn mid_utterance_paste_failure_does_not_drop_later_segments() {
+                struct FirstPasteFails {
+                    state: Arc<PasteState>,
+                    first: AtomicBool,
+                }
+                impl Paster for FirstPasteFails {
+                    fn paste(&self, text: String, _deadline: Instant) -> Result<(), String> {
+                        self.state.attempts.lock().unwrap().push(text);
+                        if self.first.swap(false, Ordering::Relaxed) {
+                            Err("scripted paste failure".into())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+                let (mut h, rx) = ready();
+                enable_transcripts(&mut h);
+                h.controller.paster = Box::new(FirstPasteFails {
+                    state: Arc::clone(&h.pastes),
+                    first: AtomicBool::new(true),
+                });
+                edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+                finish(&mut h, &rx, EngineKind::Local, 1, "failed segment");
+                assert_eq!(h.controller.session.state(), State::Recording);
+                assert_eq!(h.controller.active, Some(1));
+                assert_eq!(h.controller.status.message(), Some(PASTE_FAILED_NOTICE));
+                assert_eq!(rows(&h)[0]["paste_failed"], true);
+                finish(&mut h, &rx, EngineKind::Local, 1, "later segment");
+                assert_eq!(transcripts_with_count(&h, 1)[0]["text"], "later segment");
+                edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Standard)]);
+                finish(&mut h, &rx, EngineKind::Local, 1, "end");
+                assert_eq!(
+                    *h.pastes.attempts.lock().unwrap(),
+                    ["failed segment", "later segment", "end"]
+                );
+                let metrics = rows(&h);
+                assert_eq!(
+                    metrics
+                        .iter()
+                        .map(|row| row["paste_failed"].as_bool().unwrap())
+                        .collect::<Vec<_>>(),
+                    [true, false, false]
+                );
+                assert!(metrics.iter().all(|row| row["engine"] == "local"));
+                assert_eq!(transcripts_with_count(&h, 2).len(), 2);
+                assert_eq!(h.controller.history.list().len(), 2);
+                assert_eq!(h.controller.session.state(), State::Idle);
+                assert!(h.controller.owners.is_empty());
+            }
+
+            #[test]
+            fn fallback_long_press_with_mid_utterance_segments_pastes_all_and_moves_notice_at_end()
+            {
+                for end in ["end", ""] {
+                    let (mut h, rx) = ready();
+                    h.controller.long.as_mut().unwrap().state = LongState::Loading;
+                    edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Long)]);
+                    for text in ["first", "", "second"] {
+                        finish(&mut h, &rx, EngineKind::Local, 1, text);
+                        assert_eq!(h.controller.session.state(), State::Recording);
+                        assert!(
+                            h.controller.long_notice.is_none(),
+                            "fallback notice must wait for the end"
+                        );
+                        assert_eq!(h.controller.pending_notices[&1], PREPARING);
+                        assert_eq!(h.controller.active, Some(1));
+                    }
+                    edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Long)]);
+                    assert_eq!(h.controller.session.state(), State::Finalizing);
+                    assert!(h.controller.long_notice.is_none());
+                    finish(&mut h, &rx, EngineKind::Local, 1, end);
+                    let mut expected = vec!["first", "second"];
+                    if !end.is_empty() {
+                        expected.push(end);
+                    }
+                    assert_eq!(*h.pastes.attempts.lock().unwrap(), expected);
+                    assert_eq!(rows(&h).len(), 4);
+                    assert!(rows(&h).iter().all(|row| row["engine"] == "local"));
+                    assert!(commands(&h, EngineKind::Whisper).is_empty());
+                    assert_eq!(h.controller.long_notice.as_deref(), Some(PREPARING));
+                    assert!(h.controller.pending_notices.is_empty());
+                    assert!(h.controller.active.is_none());
+                    assert!(h.controller.owners.is_empty());
+                    assert_eq!(h.controller.session.state(), State::Idle);
+                }
+            }
+
+            #[test]
+            fn repress_in_finalizing_after_mid_utterance_segments_cancels_and_begins_new() {
+                let (mut h, rx) = ready();
+                edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+                for text in ["first", "second"] {
+                    finish(&mut h, &rx, EngineKind::Local, 1, text);
+                }
+                edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Standard)]);
+                assert_eq!(h.controller.session.state(), State::Finalizing);
+                edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Long)]);
+                assert_eq!(*h.engine(EngineKind::Local).canceled.lock().unwrap(), [1]);
+                assert_eq!(h.controller.active, Some(2));
+                assert_eq!(h.controller.owners[&2].engine, EngineKind::Whisper);
+                assert!(!h.controller.owners.contains_key(&1));
+                assert_eq!(
+                    commands(&h, EngineKind::Local),
+                    [
+                        EngineCmd::Begin { gen: 1 },
+                        EngineCmd::Audio(vec![0.25]),
+                        EngineCmd::End {
+                            gen: 1,
+                            pad_ms: 500
+                        },
+                        EngineCmd::Cancel { gen: 1 }
+                    ]
+                );
+                assert_eq!(
+                    commands(&h, EngineKind::Whisper),
+                    [EngineCmd::Begin { gen: 2 }, EngineCmd::Audio(vec![0.25])]
+                );
+                edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Long)]);
+                finish(&mut h, &rx, EngineKind::Whisper, 2, "new utterance");
+                assert_eq!(
+                    *h.pastes.attempts.lock().unwrap(),
+                    ["first", "second", "new utterance"]
+                );
+                assert_eq!(
+                    rows(&h)
+                        .iter()
+                        .map(|row| row["engine"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["local", "local", "whisper"]
+                );
+                h.engine(EngineKind::Local)
+                    .send(final_message(1, "canceled end"));
+                h.turn();
+                assert_no_submission(&mut h);
+            }
+        }
+
+        #[test]
+        fn standard_key_routes_begin_audio_end_to_standard() {
+            let (mut h, _) = ready();
+            utterance(&mut h, HotkeyKey::Standard);
+            assert_eq!(
+                commands(&h, EngineKind::Local),
+                [
+                    EngineCmd::Begin { gen: 1 },
+                    EngineCmd::Audio(vec![0.25]),
+                    EngineCmd::End {
+                        gen: 1,
+                        pad_ms: 500
+                    }
+                ]
+            );
+            assert!(commands(&h, EngineKind::Whisper).is_empty());
+        }
+
+        #[test]
+        fn long_key_routes_to_whisper_when_ready() {
+            let (mut h, _) = ready();
+            utterance(&mut h, HotkeyKey::Long);
+            assert_eq!(
+                commands(&h, EngineKind::Whisper),
+                [
+                    EngineCmd::Begin { gen: 1 },
+                    EngineCmd::Audio(vec![0.25]),
+                    EngineCmd::End {
+                        gen: 1,
+                        pad_ms: 500
+                    }
+                ]
+            );
+            assert!(commands(&h, EngineKind::Local).is_empty());
+        }
+
+        fn fallback(state: LongState, notice: &str, text: &str) {
+            let (mut h, rx) = ready();
+            h.controller.long.as_mut().unwrap().state = state;
+            utterance(&mut h, HotkeyKey::Long);
+            assert_ne!(
+                h.controller.snapshot().status.message.as_deref(),
+                Some(notice)
+            );
+            finish(&mut h, &rx, EngineKind::Local, 1, text);
+            assert_eq!(
+                h.controller.snapshot().status.message.as_deref(),
+                Some(notice)
+            );
+            assert!(commands(&h, EngineKind::Whisper).is_empty());
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+            assert_ne!(
+                h.controller.snapshot().status.message.as_deref(),
+                Some(notice)
+            );
+        }
+
+        #[test]
+        fn long_key_falls_back_while_installing() {
+            fallback(LongState::Installing { percent: 20 }, PREPARING, "fallback");
+        }
+        #[test]
+        fn long_key_falls_back_while_loading() {
+            fallback(LongState::Loading, PREPARING, "fallback");
+        }
+        #[test]
+        fn long_key_falls_back_while_failed() {
+            fallback(
+                LongState::Failed {
+                    reason: "failed".into(),
+                },
+                STOPPED,
+                "fallback",
+            );
+        }
+        #[test]
+        fn fallback_notice_survives_empty_result() {
+            fallback(LongState::Loading, PREPARING, "");
+        }
+
+        #[test]
+        fn rejected_press_leaves_no_route() {
+            let mut h = LifecycleHarness::new(true, true);
+            h.boot(true);
+            edges(
+                &mut h,
+                [
+                    HotkeyEdge::Pressed(HotkeyKey::Long),
+                    HotkeyEdge::Released(HotkeyKey::Long),
+                ],
+            );
+            assert_eq!(h.controller.session.state(), State::Disconnected);
+            assert!(commands(&h, EngineKind::Local).is_empty());
+            h.engine(EngineKind::Local).send(EngineMsg::Ready);
+            h.turn();
+            h.engine(EngineKind::Local)
+                .send(final_message(1, "rejected"));
+            h.turn();
+            assert_no_submission(&mut h);
+        }
+
+        #[test]
+        fn other_key_press_during_recording_is_ignored() {
+            let (mut h, _) = ready();
+            edges(
+                &mut h,
+                [
+                    HotkeyEdge::Pressed(HotkeyKey::Long),
+                    HotkeyEdge::Pressed(HotkeyKey::Standard),
+                ],
+            );
+            assert_eq!(h.controller.session.state(), State::Recording);
+            assert!(commands(&h, EngineKind::Local).is_empty());
+            assert_eq!(commands(&h, EngineKind::Whisper).len(), 2);
+        }
+
+        #[test]
+        fn only_the_starting_keys_release_ends_the_utterance() {
+            for key in [HotkeyKey::Standard, HotkeyKey::Long] {
+                let (mut h, _) = ready();
+                let other = if key == HotkeyKey::Standard {
+                    HotkeyKey::Long
+                } else {
+                    HotkeyKey::Standard
+                };
+                edges(
+                    &mut h,
+                    [HotkeyEdge::Pressed(key), HotkeyEdge::Released(other)],
+                );
+                assert_eq!(h.controller.session.state(), State::Recording);
+                edges(&mut h, [HotkeyEdge::Released(key)]);
+                assert_eq!(h.controller.session.state(), State::Finalizing);
+            }
+        }
+
+        #[test]
+        fn repress_in_finalizing_on_other_key_cancels_old_owner_and_begins_new() {
+            let (mut h, _) = ready();
+            utterance(&mut h, HotkeyKey::Long);
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+            assert_eq!(*h.engine(EngineKind::Whisper).canceled.lock().unwrap(), [1]);
+            assert_eq!(
+                commands(&h, EngineKind::Local),
+                [EngineCmd::Begin { gen: 2 }, EngineCmd::Audio(vec![0.25])]
+            );
+        }
+
+        #[test]
+        fn batched_press_release_repress_routes_each_gen_to_its_owner() {
+            let (mut h, _) = ready();
+            edges(
+                &mut h,
+                [
+                    HotkeyEdge::Pressed(HotkeyKey::Standard),
+                    HotkeyEdge::Released(HotkeyKey::Standard),
+                    HotkeyEdge::Pressed(HotkeyKey::Long),
+                ],
+            );
+            assert_eq!(
+                commands(&h, EngineKind::Local),
+                [
+                    EngineCmd::Begin { gen: 1 },
+                    EngineCmd::Audio(vec![0.25]),
+                    EngineCmd::End {
+                        gen: 1,
+                        pad_ms: 500
+                    },
+                    EngineCmd::Cancel { gen: 1 }
+                ]
+            );
+            assert_eq!(
+                commands(&h, EngineKind::Whisper),
+                [EngineCmd::Begin { gen: 2 }, EngineCmd::Audio(vec![0.25])]
+            );
+        }
+
+        #[test]
+        fn record_and_transcript_read_owner_before_prune() {
+            let (mut h, rx) = ready();
+            h.controller
+                .apply_settings(SettingsPatch {
+                    transcript_log: Some(true),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
+            utterance(&mut h, HotkeyKey::Long);
+            finish(&mut h, &rx, EngineKind::Whisper, 1, "owner");
+            assert_eq!(rows(&h)[0]["engine"], "whisper");
+            assert_eq!(transcripts(&h)[0]["engine"], "whisper");
+            assert!(h.controller.owners.is_empty());
+            assert!(h.controller.active.is_none());
+            h.engine(EngineKind::Whisper).send(final_message(1, "late"));
+            h.turn();
+            assert_no_submission(&mut h);
+        }
+
+        #[test]
+        fn standard_disconnect_in_recording_prunes_owner_and_clears_active() {
+            let (mut h, _) = ready();
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+            h.engine(EngineKind::Local).send(EngineMsg::Disconnected {
+                reason: "standard failed".into(),
+                failed_model: None,
+            });
+            h.turn();
+            assert_eq!(h.controller.session.state(), State::Disconnected);
+            assert!(h.controller.owners.is_empty());
+            assert!(h.controller.active.is_none());
+            assert!(rows(&h).is_empty());
+            h.engine(EngineKind::Local).send(final_message(1, "late"));
+            h.turn();
+            assert_no_submission(&mut h);
+        }
+
+        #[test]
+        fn long_press_while_disable_pending_falls_back() {
+            let (mut h, _) = ready();
+            utterance(&mut h, HotkeyKey::Long);
+            h.apply(false).unwrap();
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Long)]);
+            h.turn();
+            assert_eq!(
+                commands(&h, EngineKind::Local),
+                [EngineCmd::Begin { gen: 2 }, EngineCmd::Audio(vec![0.25])]
+            );
+            assert!(h.controller.long_notice.is_none());
+            assert!(h.controller.long.is_none());
+        }
+
+        #[test]
+        fn final_from_non_owner_supervisor_is_dropped() {
+            for key in [HotkeyKey::Standard, HotkeyKey::Long] {
+                let (mut h, _) = ready();
+                utterance(&mut h, key);
+                let other = if key == HotkeyKey::Standard {
+                    EngineKind::Whisper
+                } else {
+                    EngineKind::Local
+                };
+                h.engine(other).send(final_message(1, "wrong engine"));
+                h.turn();
+                assert_no_submission(&mut h);
+                assert_eq!(h.controller.session.state(), State::Finalizing);
+            }
+        }
+
+        #[test]
+        fn late_final_after_cancel_timeout_disable_retry_is_dropped() {
+            let (mut h, _) = ready();
+            utterance(&mut h, HotkeyKey::Long);
+            edges(
+                &mut h,
+                [
+                    HotkeyEdge::Pressed(HotkeyKey::Standard),
+                    HotkeyEdge::Released(HotkeyKey::Standard),
+                ],
+            );
+            h.engine(EngineKind::Whisper)
+                .send(final_message(1, "canceled"));
+            h.turn();
+            assert_no_submission(&mut h);
+            let outputs = h
+                .controller
+                .session
+                .handle(Input::Tick, Instant::now() + Duration::from_secs(10));
+            h.controller.execute_outputs(outputs);
+            h.engine(EngineKind::Local)
+                .send(final_message(2, "timeout"));
+            h.turn();
+            assert_no_submission(&mut h);
+            h.apply(false).unwrap();
+            h.turn();
+            h.await_retirement();
+            h.apply(true).unwrap();
+            h.turn();
+            h.disconnected(None);
+            h.retry().unwrap();
+            h.await_retirement();
+            h.turn();
+            h.engine(EngineKind::Whisper)
+                .send(final_message(1, "old instance"));
+            h.turn();
+            assert_no_submission(&mut h);
+            assert!(h.pastes.attempts.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn finals_use_their_engines_postprocess_settings() {
+            use crate::settings::PunctSetting;
+            for (choice, local, long) in [
+                (PunctSetting::Off, "甲、乙", "甲乙"),
+                (PunctSetting::On, "甲、乙。", "甲、乙。"),
+                (PunctSetting::OnStrip, "甲、乙", "甲、乙"),
+            ] {
+                let (mut h, rx) = ready();
+                h.controller
+                    .apply_settings(SettingsPatch {
+                        punctuation: Some(choice),
+                        ..SettingsPatch::default()
+                    })
+                    .unwrap();
+                // Keep both generations' accepted messages in the FIFO before draining results.
+                let mut outputs = Vec::new();
+                for (gen, key, kind, raw) in [
+                    (1, HotkeyKey::Standard, EngineKind::Local, "甲、乙"),
+                    (2, HotkeyKey::Long, EngineKind::Whisper, "甲、乙。"),
+                    (3, HotkeyKey::Standard, EngineKind::Local, "甲、乙"),
+                ] {
+                    h.controller
+                        .handle_hotkey_edge(HotkeyEdge::Pressed(key), &mut outputs);
+                    h.engine(kind).send(final_message(gen, raw));
+                    h.controller.handle_engine_messages(&mut outputs);
+                    h.controller.handle_long_events(&mut outputs);
+                    // Session accepts the processed final and becomes Idle, but outputs stay queued.
+                    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    h.controller
+                        .handle_hotkey_edge(HotkeyEdge::Released(key), &mut outputs);
+                    h.controller.handle_postprocess_events(&mut outputs);
+                }
+                h.controller.execute_outputs(outputs);
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), [local, long, local]);
+                assert_eq!(
+                    rows(&h)
+                        .iter()
+                        .map(|row| row["engine"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["local", "whisper", "local"]
+                );
+            }
+        }
+
+        #[test]
+        fn long_disconnect_in_recording_aborts_and_standard_still_works() {
+            for closed in [false, true] {
+                let (mut h, rx) = ready();
+                edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Long)]);
+                if closed {
+                    h.engine(EngineKind::Whisper)
+                        .event_senders
+                        .lock()
+                        .unwrap()
+                        .clear();
+                    h.turn();
+                } else {
+                    h.disconnected(None);
+                }
+                assert_eq!(h.controller.session.state(), State::Idle);
+                assert_eq!(h.controller.long_notice.as_deref(), Some(FAILED));
+                assert!(rows(&h).is_empty());
+                utterance(&mut h, HotkeyKey::Standard);
+                finish(&mut h, &rx, EngineKind::Local, 2, "works");
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["works"]);
+                assert_eq!(h.controller.long_notice.as_deref(), Some(FAILED));
+            }
+        }
+
+        #[test]
+        fn long_disconnect_in_finalizing_aborts() {
+            let (mut h, _) = ready();
+            utterance(&mut h, HotkeyKey::Long);
+            h.disconnected(None);
+            assert_eq!(h.controller.session.state(), State::Idle);
+            assert_eq!(*h.engine(EngineKind::Whisper).canceled.lock().unwrap(), [1]);
+            assert!(rows(&h).is_empty());
+        }
+
+        #[test]
+        fn standard_disconnect_during_long_utterance_defers_session_disconnect() {
+            let (mut h, rx) = ready();
+            utterance(&mut h, HotkeyKey::Long);
+            h.engine(EngineKind::Local).send(EngineMsg::Disconnected {
+                reason: "standard failed".into(),
+                failed_model: None,
+            });
+            h.turn();
+            assert_eq!(h.controller.session.state(), State::Finalizing);
+            assert_eq!(
+                h.controller.status,
+                Status::EngineFailed("standard failed".into())
+            );
+            finish(&mut h, &rx, EngineKind::Whisper, 1, "long completes");
+            assert_eq!(*h.pastes.attempts.lock().unwrap(), ["long completes"]);
+            assert_eq!(h.controller.session.state(), State::Disconnected);
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Long)]);
+            h.turn();
+            assert_eq!(h.controller.session.state(), State::Idle);
+        }
+
+        #[test]
+        fn disable_during_long_utterance_defers_until_retired() {
+            let (mut h, rx) = ready();
+            utterance(&mut h, HotkeyKey::Long);
+            h.apply(false).unwrap();
+            h.turn();
+            assert!(!h.controller.settings.config().long_key);
+            assert!(h.controller.long.is_some());
+            assert!(h.hotkeys.unregistered.lock().unwrap().is_empty());
+            finish(
+                &mut h,
+                &rx,
+                EngineKind::Whisper,
+                1,
+                "complete before disable",
+            );
+            assert!(h.controller.long.is_none());
+            assert_eq!(*h.hotkeys.unregistered.lock().unwrap(), [HotkeyKey::Long]);
+            assert_eq!(
+                *h.pastes.attempts.lock().unwrap(),
+                ["complete before disable"]
+            );
+        }
+
+        #[test]
+        fn released_carries_whisper_engine_for_long_utterances() {
+            let (mut h, _) = ready();
+            let press = Instant::now();
+            h.controller.clock = Box::new(FakeClock(Some(press)));
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Long)]);
+            h.controller.clock = Box::new(FakeClock(Some(press + Duration::from_secs(24))));
+            edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Long)]);
+            let outputs = h
+                .controller
+                .session
+                .handle(Input::Tick, press + Duration::from_millis(27_500));
+            assert!(
+                outputs.is_empty(),
+                "Whisper timeout must include half the audio duration"
+            );
+            assert_eq!(h.controller.session.state(), State::Finalizing);
+        }
+
+        #[test]
+        fn extra_standard_failure_precedes_mic_failure_on_batched_long_start() {
+            struct FailingMic;
+            impl MicPort for FailingMic {
+                fn start(&mut self, _sink: AudioSink) -> anyhow::Result<()> {
+                    anyhow::bail!("mic failed")
+                }
+                fn stop(&mut self) {}
+            }
+            let (mut h, _) = ready();
+            h.controller.mic = Box::new(FailingMic);
+            let mut outputs = Vec::new();
+            h.controller
+                .handle_hotkey_edge(HotkeyEdge::Pressed(HotkeyKey::Long), &mut outputs);
+            h.engine(EngineKind::Local).send(EngineMsg::Disconnected {
+                reason: "standard failed".into(),
+                failed_model: None,
+            });
+            h.controller.handle_engine_messages(&mut outputs);
+            h.controller.execute_outputs(outputs);
+            assert_eq!(
+                h.controller.status,
+                Status::EngineFailed("standard failed".into())
+            );
+            assert!(h.controller.standard_disconnect_pending);
+            assert_eq!(h.controller.session.state(), State::Recording);
+        }
+
+        #[test]
+        fn extra_multiple_processed_finals_in_one_turn_keep_recording_owner() {
+            let (mut h, rx) = ready();
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Long)]);
+            for text in ["first", "second"] {
+                h.engine(EngineKind::Whisper).send(final_message(1, text));
+            }
+            let mut outputs = Vec::new();
+            h.controller.handle_long_events(&mut outputs);
+            for _ in 0..2 {
+                rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+            h.controller.handle_postprocess_events(&mut outputs);
+            h.controller.execute_outputs(outputs);
+            assert_eq!(*h.pastes.attempts.lock().unwrap(), ["first", "second"]);
+            assert_eq!(rows(&h).len(), 2);
+            assert_eq!(h.controller.active, Some(1));
+            assert_eq!(h.controller.session.state(), State::Recording);
+            assert!(!h.controller.retired.contains(&1));
+        }
+
+        #[test]
+        fn extra_early_final_keeps_owner_and_starting_key_stops_the_mic() {
+            let (mut h, rx) = ready();
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Long)]);
+            finish(&mut h, &rx, EngineKind::Whisper, 1, "early");
+            assert_eq!(h.controller.active, Some(1));
+            finish(&mut h, &rx, EngineKind::Whisper, 1, "another segment");
+            edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Long)]);
+            assert_eq!(h.controller.session.state(), State::Finalizing);
+            finish(&mut h, &rx, EngineKind::Whisper, 1, "");
+            assert_eq!(
+                *h.pastes.attempts.lock().unwrap(),
+                ["early", "another segment"]
+            );
+            assert_eq!(h.controller.session.state(), State::Idle);
+            assert!(h.controller.active.is_none());
+            assert!(h.controller.owners.is_empty());
+            assert!(commands(&h, EngineKind::Whisper)
+                .iter()
+                .any(|cmd| matches!(cmd, EngineCmd::End { gen: 1, .. })));
+        }
+
+        #[test]
+        fn extra_processed_final_after_abort_is_dropped() {
+            let (mut h, rx) = ready();
+            utterance(&mut h, HotkeyKey::Long);
+            h.engine(EngineKind::Whisper)
+                .send(final_message(1, "queued before abort"));
+            h.turn();
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            h.disconnected(None);
+            h.turn();
+            assert!(h.pastes.attempts.lock().unwrap().is_empty());
+            assert!(rows(&h).is_empty());
+        }
+
+        #[test]
+        fn extra_fallback_notice_temporarily_covers_failure_then_restores_it() {
+            let (mut h, rx) = ready();
+            h.disconnected(None);
+            utterance(&mut h, HotkeyKey::Long);
+            finish(&mut h, &rx, EngineKind::Local, 1, "fallback after failure");
+            assert_eq!(h.controller.long_notice.as_deref(), Some(STOPPED));
+            edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+            assert_eq!(h.controller.long_notice.as_deref(), Some("long failed"));
+        }
+
+        #[test]
+        fn extra_long_failure_during_fallback_does_not_abort_standard() {
+            let (mut h, rx) = ready();
+            h.controller.long.as_mut().unwrap().state = LongState::Loading;
+            utterance(&mut h, HotkeyKey::Long);
+            h.disconnected(None);
+            assert_eq!(h.controller.session.state(), State::Finalizing);
+            finish(&mut h, &rx, EngineKind::Local, 1, "fallback survives");
+            assert_eq!(*h.pastes.attempts.lock().unwrap(), ["fallback survives"]);
+        }
+
+        #[test]
+        fn extra_both_keys_obey_focus_and_capture_suppression() {
+            for key in [HotkeyKey::Standard, HotkeyKey::Long] {
+                for focused in [false, true] {
+                    let (mut h, _) = ready();
+                    h.controller.window_focused = focused;
+                    h.controller.capturing_hotkey = !focused;
+                    edges(&mut h, [HotkeyEdge::Pressed(key)]);
+                    assert!(h.controller.owners.is_empty());
+                    assert_eq!(h.controller.session.state(), State::Idle);
+                }
+            }
+        }
+
+        #[test]
+        fn extra_paste_failure_warning_precedes_fallback_and_engine_notices() {
+            let (mut h, rx) = ready();
+            h.controller.long.as_mut().unwrap().state = LongState::Loading;
+            h.controller.paster = Box::new(FakePaster(Arc::new(PasteState {
+                reject_late: true,
+                ..PasteState::default()
+            })));
+            h.controller.clock =
+                Box::new(FakeClock(Some(Instant::now() - Duration::from_secs(10))));
+            utterance(&mut h, HotkeyKey::Long);
+            finish(&mut h, &rx, EngineKind::Local, 1, "failed paste");
+            h.controller.long_notice = Some("long failed".into());
+            assert_eq!(
+                h.controller.snapshot().status.message.as_deref(),
+                Some(PASTE_FAILED_NOTICE)
+            );
+            assert!(h.controller.owners.is_empty());
+            assert_eq!(rows(&h)[0]["paste_failed"], true);
+        }
+
+        #[test]
+        fn extra_postprocess_fifo_alternates_engine_settings_back_to_back() {
+            use crate::settings::PunctSetting;
+            for (choice, local, long) in [
+                (PunctSetting::Off, "甲、乙", "甲乙"),
+                (PunctSetting::On, "甲、乙。", "甲、乙。"),
+                (PunctSetting::OnStrip, "甲、乙", "甲、乙"),
+            ] {
+                let (mut h, _) = ready();
+                h.controller
+                    .apply_settings(SettingsPatch {
+                        punctuation: Some(choice),
+                        ..SettingsPatch::default()
+                    })
+                    .unwrap();
+                for (gen, engine, text) in [
+                    (10, EngineKind::Local, "甲、乙"),
+                    (11, EngineKind::Whisper, "甲、乙。"),
+                    (12, EngineKind::Local, "甲、乙"),
+                ] {
+                    h.controller.owners.insert(
+                        gen,
+                        Owner {
+                            key: HotkeyKey::Standard,
+                            engine,
+                        },
+                    );
+                    h.controller.submit_final(engine, final_message(gen, text));
+                }
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let mut texts = Vec::new();
+                while texts.len() < 3 {
+                    if let Some(result) = h.controller.postprocess.as_ref().unwrap().try_recv() {
+                        texts.push(result.text);
+                    }
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+                assert_eq!(texts, [local, long, local]);
+            }
+        }
+
+        #[test]
+        fn transcript_and_metrics_record_owner_engine() {
+            for (state, key, kind, expected) in [
+                (
+                    LongState::Ready,
+                    HotkeyKey::Long,
+                    EngineKind::Whisper,
+                    "whisper",
+                ),
+                (
+                    LongState::Loading,
+                    HotkeyKey::Long,
+                    EngineKind::Local,
+                    "local",
+                ),
+                (
+                    LongState::Ready,
+                    HotkeyKey::Standard,
+                    EngineKind::Local,
+                    "local",
+                ),
+            ] {
+                let (mut h, rx) = ready();
+                h.controller.long.as_mut().unwrap().state = state;
+                h.controller
+                    .apply_settings(SettingsPatch {
+                        transcript_log: Some(true),
+                        ..SettingsPatch::default()
+                    })
+                    .unwrap();
+                utterance(&mut h, key);
+                finish(&mut h, &rx, kind, 1, "metadata");
+                assert_eq!(rows(&h)[0]["engine"], expected);
+                assert_eq!(transcripts(&h)[0]["engine"], expected);
+            }
         }
     }
 
@@ -3228,7 +4467,7 @@ mod tests {
             .unwrap()
             .push_back(StartupEvent::Failed("download failed".into()));
         // Retire the failed port without running reconciliation first.
-        h.controller.handle_long_events();
+        h.controller.handle_long_events(&mut Vec::new());
         h.long_startup.hold_starts.store(false, Ordering::Relaxed);
         h.apply(true).unwrap();
         h.turn();
@@ -3810,12 +5049,25 @@ mod tests {
     fn crash_postprocess_worker(harness: &Harness) {
         harness.punctuator.panic.store(true, Ordering::Relaxed);
         harness
+            .hotkey
+            .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
+        wait_snapshot(harness, |snapshot| snapshot.status.state == "recording");
+        harness
             .engine(EngineKind::Local)
-            .send(final_message(999, "crash"));
+            .send(final_message(1, "crash"));
         harness.client.wake();
         for _ in 0..300 {
             if harness.punctuator.panicked.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(10));
+                harness
+                    .engine(EngineKind::Local)
+                    .send(EngineMsg::Disconnected {
+                        reason: "test worker cleanup".into(),
+                        failed_model: None,
+                    });
+                harness.engine(EngineKind::Local).send(EngineMsg::Ready);
+                harness.client.wake();
+                wait_snapshot(harness, |snapshot| snapshot.status.state == "idle");
                 return;
             }
             thread::sleep(Duration::from_millis(10));

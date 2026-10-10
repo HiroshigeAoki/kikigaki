@@ -2,6 +2,48 @@
 set -euo pipefail
 cd "$(dirname -- "$0")/.."
 
+echo "== Tauri command registration consistency =="
+python3 - <<'PY'
+import json
+import re
+from pathlib import Path
+
+app = Path("crates/kikigaki")
+
+def arrays(path, pattern):
+    # Ignore comments so a commented-out registration cannot satisfy the gate.
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", path.read_text(), flags=re.S)
+    matches = re.findall(pattern, source, flags=re.S)
+    if not matches:
+        raise SystemExit(f"FAIL: no command registration array found in {path}")
+    return "\n".join(matches)
+
+handlers = set(re.findall(r"\b[a-z][a-z0-9_]*\b", arrays(
+    app / "src/shell.rs", r"generate_handler!\s*\[([^\]]*)\]")))
+manifest = set(re.findall(r'"([a-z][a-z0-9_]*)"', arrays(
+    app / "build.rs", r"\bcommands\s*\(\s*&\s*\[([^\]]*)\]")))
+permissions = set(json.loads((app / "capabilities/settings.json").read_text())["permissions"])
+if not handlers:
+    raise SystemExit("FAIL: generate_handler! contains no commands")
+errors = []
+for command in sorted(handlers):
+    if command not in manifest:
+        errors.append(f"FAIL: {command} missing from crates/kikigaki/build.rs commands manifest")
+    permission = "allow-" + command.replace("_", "-")
+    if permission not in permissions:
+        errors.append(f"FAIL: {permission} missing from crates/kikigaki/capabilities/settings.json")
+if errors:
+    raise SystemExit("\n".join(errors))
+print(f"PASS: {len(handlers)} handler commands have manifest and settings capability entries")
+PY
+
+echo "== settings JavaScript syntax =="
+if command -v node >/dev/null 2>&1; then
+  node --check crates/kikigaki/ui/settings.js
+else
+  echo "SKIP: node is unavailable; settings.js syntax check not run"
+fi
+
 echo "== builtin dictionary generator self-test =="
 if command -v python3 >/dev/null 2>&1; then
   python3 scripts/gen-dict/gen_builtin_dict.py --self-test

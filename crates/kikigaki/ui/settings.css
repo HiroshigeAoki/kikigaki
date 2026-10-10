@@ -73,7 +73,7 @@ input:focus-visible {
   gap: 14px;
 }
 
-.scene[hidden] { display: none; }
+[hidden] { display: none !important; }
 
 .status {
   display: flex;
@@ -367,6 +367,14 @@ section.group {
 .status-small {
   flex: none;
   font-size: 12px;
+}
+
+.long-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--ink-2);
 }
 
 .ok { color: var(--ok); }

@@ -22,7 +22,12 @@ let appliedRevision = -1;
 let bufferedEvents = [];
 let hydrated = false;
 let currentSnapshot = null;
-let capturingHotkey = false;
+let capturing = null;
+let capturePending = null;
+let captureEnding = false;
+let captureCancelled = false;
+let longKeyPending = false;
+let retryLongPending = false;
 let autostartPending = false;
 let builtinReplaceDictPending = false;
 let transcriptLogPending = false;
@@ -62,8 +67,8 @@ function statusMainText(status) {
   }
 }
 
-function renderChord(chord) {
-  const container = document.getElementById('hkKbd');
+function renderChord(key, chord) {
+  const container = document.getElementById(key === 'long' ? 'longHkKbd' : 'hkKbd');
   container.replaceChildren();
   for (const part of chord.split('+').filter(Boolean)) {
     const key = document.createElement('kbd');
@@ -82,39 +87,44 @@ function applyStatus(status) {
   }
   document.getElementById('statusMain').textContent = statusMainText(status);
   document.getElementById('statusSub').textContent = status.message || `${status.hotkey} を押している間だけ聞き取ります`;
-  let punctuation;
-  if (status.engine_punctuates) {
-    punctuation = `自動（文末の「。」を${status.strip_trailing_period ? '省く' : '残す'}）`;
-  } else {
-    const strip = status.punct_enabled && status.strip_trailing_period ? '（文末の「。」は除く）' : '';
-    punctuation = `${status.punct_enabled ? 'on' : 'off'}${strip}`;
-  }
-  document.getElementById('statusHint').textContent = `${status.engine} · 句読点 ${punctuation}`;
-  renderChord(status.hotkey);
+  const strip = status.punct_enabled && status.strip_trailing_period ? '（文末の「。」は除く）' : '';
+  document.getElementById('statusHint').textContent = `句読点 ${status.punct_enabled ? 'on' : 'off'}${strip}`;
+  renderChord('standard', status.hotkey);
+  if (status.long_hotkey) renderChord('long', status.long_hotkey);
 }
 
 function applyPunctSeg(settings) {
-  const value = !settings.punct_enabled ? 'off' : settings.strip_trailing_period ? 'on_strip' : 'on';
   for (const button of document.querySelectorAll('#punctSeg button')) {
-    const engineControl = button.dataset.punctMode === 'engine';
-    button.hidden = engineControl !== settings.engine_punctuates;
-    const pressed = engineControl
-      ? button.dataset.strip === String(settings.strip_trailing_period)
-      : button.dataset.value === value;
-    button.setAttribute('aria-pressed', String(pressed));
+    button.setAttribute('aria-pressed', String(button.dataset.value === settings.punct_choice));
   }
-  document.getElementById('punctNote').textContent = settings.engine_punctuates
-    ? '高性能では句読点は自動で入ります'
-    : '「、」「。」を自動で入れます。チャット欄などでは文末の「。」だけ省けます';
 }
 
-function applyEngineSeg(settings) {
-  document.getElementById('engineRow').hidden = !settings.whisper_available;
-  const switching = settings.engine !== settings.active_engine;
-  for (const button of document.querySelectorAll('#engineSeg button')) {
-    button.setAttribute('aria-pressed', String(button.dataset.value === settings.engine));
-    button.disabled = switching;
+function applyHotkeys(settings) {
+  document.getElementById('longHkRow').hidden = !settings.long_key;
+  document.getElementById('longHkNote').hidden = !settings.long_key;
+  renderChord('standard', settings.hotkey);
+  renderChord('long', settings.long_hotkey);
+  updateCaptureControls();
+}
+
+function applyLongKey(settings) {
+  document.getElementById('longKeyRow').hidden = !settings.long_available;
+  const control = document.getElementById('longKeySwitch');
+  control.setAttribute('aria-checked', String(settings.long_key));
+  control.disabled = longKeyPending || !settings.long_available || Boolean(capturing || capturePending || captureEnding);
+  const state = settings.long_state;
+  document.getElementById('longStateRow').hidden = !settings.long_key || !state;
+  let text = '';
+  switch (state && state.kind) {
+    case 'installing': text = `ダウンロード中 ${state.percent}%`; break;
+    case 'loading': text = '準備中…'; break;
+    case 'ready': text = '準備完了'; break;
+    case 'failed': text = '停止中'; break;
   }
+  document.getElementById('longState').textContent = text;
+  const retry = document.getElementById('retryLongEngineButton');
+  retry.hidden = !settings.long_key || !state || state.kind !== 'failed';
+  retry.disabled = retryLongPending || longKeyPending;
 }
 
 function applyBuiltinReplaceDict(settings) {
@@ -247,7 +257,8 @@ function showOnboarding(state) {
 function applySnapshot(snapshot) {
   currentSnapshot = snapshot;
   applyStatus(snapshot.status);
-  applyEngineSeg(snapshot.settings);
+  applyHotkeys(snapshot.settings);
+  applyLongKey(snapshot.settings);
   applyPunctSeg(snapshot.settings);
   applyBuiltinReplaceDict(snapshot.settings);
   applyTranscriptLog(snapshot.settings);
@@ -294,89 +305,141 @@ function showInlineError(element, error, isError = true) {
   inlineErrors.set(anchor, { note, timer });
 }
 
-const hotkeyButton = document.getElementById('hkButton');
-const hotkeyNote = document.getElementById('hkNote');
+const hotkeyControls = {
+  standard: { button: document.getElementById('hkButton'), note: document.getElementById('hkNote'), cap: document.getElementById('hkCap') },
+  long: { button: document.getElementById('longHkButton'), note: document.getElementById('longHkNote'), cap: document.getElementById('longHkCap') },
+};
+
+function updateCaptureControls() {
+  for (const [key, control] of Object.entries(hotkeyControls)) {
+    control.button.disabled = Boolean((capturePending && capturePending !== key) || captureEnding || (capturing && capturing !== key) || longKeyPending
+      || (key === 'long' && currentSnapshot && !currentSnapshot.settings.long_available));
+  }
+  if (currentSnapshot) applyLongKey(currentSnapshot.settings);
+}
 
 function finishHotkeyCaptureUi() {
-  capturingHotkey = false;
-  hotkeyButton.classList.remove('recording');
-  document.getElementById('hkCap').textContent = '変更';
+  if (!capturing) return;
+  const control = hotkeyControls[capturing];
+  capturing = null;
+  control.button.classList.remove('recording');
+  control.cap.textContent = '変更';
 }
 
-async function cancelHotkeyCapture() {
-  if (!capturingHotkey) return;
+async function endHotkeyCapture(key, newChord) {
+  captureEnding = true;
   finishHotkeyCaptureUi();
+  updateCaptureControls();
+  const control = hotkeyControls[key];
   try {
-    const settings = await invoke('end_hotkey_capture', { newChord: null });
+    const settings = await invoke('end_hotkey_capture', { key, newChord });
     cacheSettings(settings);
-    renderChord(settings.hotkey);
+    applyHotkeys(settings);
+    if (newChord) control.note.textContent = '保存しました。すぐに使えます。';
   } catch (error) {
-    hotkeyNote.textContent = errorMessage(error);
-    if (currentSnapshot) renderChord(currentSnapshot.settings.hotkey);
+    control.note.textContent = errorMessage(error);
+    if (currentSnapshot) applyHotkeys(currentSnapshot.settings);
+  } finally {
+    captureEnding = false;
+    updateCaptureControls();
   }
 }
 
-hotkeyButton.addEventListener('click', async () => {
-  if (capturingHotkey) return;
-  try {
-    await invoke('begin_hotkey_capture');
-    capturingHotkey = true;
-    hotkeyButton.classList.add('recording');
-    document.getElementById('hkCap').textContent = 'キーを押してください…';
-    hotkeyButton.focus();
-  } catch (error) {
-    hotkeyNote.textContent = errorMessage(error);
-  }
-});
-
-hotkeyButton.addEventListener('keydown', async (event) => {
-  if (!capturingHotkey) return;
-  event.preventDefault();
-  if (event.key === 'Escape') {
-    await cancelHotkeyCapture();
+async function cancelHotkeyCapture(key) {
+  if (capturePending === key) {
+    captureCancelled = true;
     return;
   }
-  if (MODIFIER_NAMES.includes(event.key)) return;
-  const modifiers = MODIFIER_NAMES.filter((name) => event.getModifierState(name));
-  if (modifiers.length === 0) {
-    hotkeyNote.textContent = '修飾キーを 1 つ以上含めてください。';
-    return;
-  }
-  const key = event.code === 'Space' ? 'Space' : event.key.length === 1 ? event.key.toUpperCase() : event.key;
-  const chord = [...modifiers.map((name) => MODIFIER_SYMBOLS[name]), key].join('+');
-  finishHotkeyCaptureUi();
-  try {
-    const settings = await invoke('end_hotkey_capture', { newChord: chord });
-    cacheSettings(settings);
-    renderChord(settings.hotkey);
-    hotkeyNote.textContent = '保存しました。すぐに使えます。';
-  } catch (error) {
-    hotkeyNote.textContent = errorMessage(error);
-    if (currentSnapshot) renderChord(currentSnapshot.settings.hotkey);
-  }
-});
+  if (capturing === key) await endHotkeyCapture(key, null);
+}
 
-hotkeyButton.addEventListener('blur', () => {
-  void cancelHotkeyCapture();
-});
-
-for (const button of document.querySelectorAll('#engineSeg button')) {
-  button.addEventListener('click', async () => {
-    if (button.disabled) return;
-    const buttons = [...document.querySelectorAll('#engineSeg button')];
-    for (const control of buttons) control.disabled = true;
+for (const [key, control] of Object.entries(hotkeyControls)) {
+  control.button.addEventListener('click', async () => {
+    if (control.button.disabled || capturing || capturePending || captureEnding) return;
+    capturePending = key;
+    captureCancelled = false;
+    updateCaptureControls();
     try {
-      const settings = await invoke('apply_settings', { patch: { engine: button.dataset.value } });
-      cacheSettings(settings);
-      applyEngineSeg(settings);
+      await invoke('begin_hotkey_capture', { key });
+      capturing = key;
+      capturePending = null;
+      updateCaptureControls();
+      if (captureCancelled) {
+        await cancelHotkeyCapture(key);
+      } else {
+        control.button.classList.add('recording');
+        control.cap.textContent = 'キーを押してください…';
+        control.button.focus();
+      }
     } catch (error) {
-      if (currentSnapshot) applyEngineSeg(currentSnapshot.settings);
-      showInlineError(document.getElementById('engineSeg'), error);
+      control.note.textContent = errorMessage(error);
     } finally {
-      if (currentSnapshot) applyEngineSeg(currentSnapshot.settings);
+      capturePending = null;
+      updateCaptureControls();
     }
   });
+
+  control.button.addEventListener('keydown', async (event) => {
+    if (capturing !== key) return;
+    event.preventDefault();
+    if (event.key === 'Escape') {
+      await cancelHotkeyCapture(key);
+      return;
+    }
+    if (MODIFIER_NAMES.includes(event.key)) return;
+    const modifiers = MODIFIER_NAMES.filter((name) => event.getModifierState(name));
+    if (modifiers.length === 0) {
+      control.note.textContent = '修飾キーを 1 つ以上含めてください。';
+      return;
+    }
+    const chordKey = event.code === 'Space' ? 'Space' : event.key.length === 1 ? event.key.toUpperCase() : event.key;
+    const chord = [...modifiers.map((name) => MODIFIER_SYMBOLS[name]), chordKey].join('+');
+    await endHotkeyCapture(key, chord);
+  });
+
+  control.button.addEventListener('blur', () => {
+    void cancelHotkeyCapture(key);
+  });
 }
+
+// Window focus can disappear before the begin command has replied.
+window.addEventListener('blur', () => {
+  const key = capturing || capturePending;
+  if (key) void cancelHotkeyCapture(key);
+});
+
+document.getElementById('longKeySwitch').addEventListener('click', async (event) => {
+  const control = event.currentTarget;
+  if (control.disabled || longKeyPending) return;
+  const enabled = control.getAttribute('aria-checked') !== 'true';
+  longKeyPending = true;
+  updateCaptureControls();
+  try {
+    const settings = await invoke('apply_settings', { patch: { longKey: enabled } });
+    cacheSettings(settings);
+    applyHotkeys(settings);
+  } catch (error) {
+    showInlineError(control, error);
+  } finally {
+    longKeyPending = false;
+    updateCaptureControls();
+  }
+});
+
+document.getElementById('retryLongEngineButton').addEventListener('click', async (event) => {
+  const control = event.currentTarget;
+  if (control.disabled || retryLongPending) return;
+  retryLongPending = true;
+  if (currentSnapshot) applyLongKey(currentSnapshot.settings);
+  try {
+    await invoke('retry_long_engine');
+  } catch (error) {
+    showInlineError(control, error);
+  } finally {
+    retryLongPending = false;
+    if (currentSnapshot) applyLongKey(currentSnapshot.settings);
+  }
+});
 
 for (const button of document.querySelectorAll('#punctSeg button')) {
   button.addEventListener('click', async () => {
@@ -384,9 +447,7 @@ for (const button of document.querySelectorAll('#punctSeg button')) {
     const buttons = [...document.querySelectorAll('#punctSeg button')];
     for (const control of buttons) control.disabled = true;
     try {
-      const patch = button.dataset.punctMode === 'engine'
-        ? { stripTrailingPeriod: button.dataset.strip === 'true' }
-        : { punctuation: button.dataset.value };
+      const patch = { punctuation: button.dataset.value };
       const settings = await invoke('apply_settings', { patch });
       cacheSettings(settings);
       applyPunctSeg(settings);

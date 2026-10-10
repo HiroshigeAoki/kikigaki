@@ -17,6 +17,7 @@
     "allow-request-microphone-access",
     "allow-start-download",
     "allow-retry-download",
+    "allow-retry-long-engine",
     "allow-list-history",
     "allow-clear-history",
     "allow-quit"

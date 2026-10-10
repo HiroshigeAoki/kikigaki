@@ -75,6 +75,7 @@ pub fn run() -> anyhow::Result<()> {
                 request_microphone_access,
                 start_download,
                 retry_download,
+                retry_long_engine,
                 list_history,
                 clear_history,
                 quit,
@@ -1059,6 +1060,15 @@ async fn retry_download(
     state
         .client
         .send_and_wait(|reply| crate::controller::ControllerCmd::RetryDownload { reply })
+}
+
+#[tauri::command]
+async fn retry_long_engine(
+    state: tauri::State<'_, Arc<ShellState>>,
+) -> Result<(), crate::status::UiError> {
+    state
+        .client
+        .send_and_wait(|reply| crate::controller::ControllerCmd::RetryLongEngine { reply })
 }
 
 #[tauri::command]

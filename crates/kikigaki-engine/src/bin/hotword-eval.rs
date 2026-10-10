@@ -24,12 +24,13 @@ use kikigaki_engine::sherpa::build_vad;
 use kikigaki_engine::sherpa::{build_recognizer, build_recognizer_with_hotwords};
 #[cfg(feature = "whisper")]
 use kikigaki_engine::whisper_engine::{transcribe_utterance, DecodeCancel};
+use kikigaki_engine::whisper_guard::AudioCtxPolicy;
 #[cfg(feature = "whisper")]
 use kikigaki_engine::whisper_recognizer::build_whisper_recognizer;
 use serde::Serialize;
 
 const DEFAULT_HOTWORDS_SCORE: f32 = 1.5;
-const USAGE: &str = "usage: hotword-eval --models-dir D --manifest M.tsv [--manifest M.tsv ...] --wavs-dir W --out R.jsonl [--engine {reazon|whisper}] [--hotwords-file F --bpe-vocab V] [--hotwords-score S] [--num-threads N]";
+const USAGE: &str = "usage: hotword-eval --models-dir D --manifest M.tsv [--manifest M.tsv ...] --wavs-dir W --out R.jsonl [--engine {reazon|whisper}] [--whisper-audio-ctx POLICY] [--hotwords-file F --bpe-vocab V] [--hotwords-score S] [--num-threads N]";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +50,7 @@ struct Args {
     hotwords_score: Option<f32>,
     num_threads: u32,
     engine: EvalEngine,
+    whisper_audio_ctx: Option<AudioCtxPolicy>,
 }
 
 enum EvalRecognizer {
@@ -111,6 +113,7 @@ struct RunMetadata {
     manifest_sha256: Vec<String>,
     git_head: String,
     model_dir: String,
+    whisper_audio_ctx: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -180,7 +183,8 @@ fn run() -> anyhow::Result<()> {
                     Arc::new(AtomicBool::new(false)),
                     DecodeCancel::new(),
                 )
-                .context("build Whisper recognizer")?;
+                .context("build Whisper recognizer")?
+                .with_audio_ctx_policy(args.whisper_audio_ctx.unwrap_or_default());
                 EvalRecognizer::Whisper {
                     vad: Box::new(vad),
                     recognizer: Box::new(recognizer),
@@ -216,6 +220,10 @@ fn run() -> anyhow::Result<()> {
             EvalEngine::Whisper => WHISPER_MODEL_ID,
         }
         .to_owned(),
+        whisper_audio_ctx: match args.engine {
+            EvalEngine::Whisper => Some(args.whisper_audio_ctx.unwrap_or_default().to_string()),
+            EvalEngine::Reazon => None,
+        },
     };
     writer
         .write_all(json_line(&header)?.as_bytes())
@@ -477,6 +485,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
     let mut hotwords_score = None;
     let mut num_threads = 1;
     let mut engine = None;
+    let mut whisper_audio_ctx = None;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
@@ -508,6 +517,13 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
                 };
                 set_once(&mut engine, value, flag)?;
             }
+            "--whisper-audio-ctx" => {
+                let value = take_utf8(&mut arguments, flag)?;
+                let policy = value
+                    .parse::<AudioCtxPolicy>()
+                    .map_err(|error| anyhow!("invalid {flag} value {value:?}: {error}"))?;
+                set_once(&mut whisper_audio_ctx, policy, flag)?;
+            }
             "--num-threads" => {
                 let value = take_utf8(&mut arguments, flag)?;
                 num_threads = value
@@ -534,6 +550,8 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
         );
         #[cfg(not(feature = "whisper"))]
         bail!("--engine whisper requires hotword-eval to be built with the whisper feature");
+    } else if whisper_audio_ctx.is_some() {
+        bail!("--whisper-audio-ctx requires --engine whisper");
     }
     match (&hotwords_file, &bpe_vocab) {
         (Some(_), None) => bail!("--hotwords-file requires --bpe-vocab\n{USAGE}"),
@@ -553,6 +571,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
         hotwords_score,
         num_threads,
         engine,
+        whisper_audio_ctx,
     })
 }
 
@@ -747,11 +766,12 @@ mod tests {
             manifest_sha256: vec!["abc".into(), "def".into()],
             git_head: "012345".into(),
             model_dir: "reazonspeech-ja-en-2025-01-17".into(),
+            whisper_audio_ctx: None,
         };
 
         assert_eq!(
             json_line(&header).unwrap(),
-            "{\"condition\":\"B\",\"hotwords_file_sha256\":null,\"hotwords_line_count\":null,\"hotwords_score\":null,\"bpe_vocab_sha256\":null,\"bpe_vocab_line_count\":null,\"num_threads\":1,\"manifest_sha256\":[\"abc\",\"def\"],\"git_head\":\"012345\",\"model_dir\":\"reazonspeech-ja-en-2025-01-17\"}\n"
+            "{\"condition\":\"B\",\"hotwords_file_sha256\":null,\"hotwords_line_count\":null,\"hotwords_score\":null,\"bpe_vocab_sha256\":null,\"bpe_vocab_line_count\":null,\"num_threads\":1,\"manifest_sha256\":[\"abc\",\"def\"],\"git_head\":\"012345\",\"model_dir\":\"reazonspeech-ja-en-2025-01-17\",\"whisper_audio_ctx\":null}\n"
         );
     }
 
@@ -768,12 +788,33 @@ mod tests {
             manifest_sha256: vec!["manifest-hash".into()],
             git_head: "012345".into(),
             model_dir: "model-id".into(),
+            whisper_audio_ctx: None,
         };
 
         assert_eq!(
             json_line(&header).unwrap(),
-            "{\"condition\":\"D\",\"hotwords_file_sha256\":\"hotwords-hash\",\"hotwords_line_count\":242,\"hotwords_score\":2.0,\"bpe_vocab_sha256\":\"vocab-hash\",\"bpe_vocab_line_count\":2000,\"num_threads\":3,\"manifest_sha256\":[\"manifest-hash\"],\"git_head\":\"012345\",\"model_dir\":\"model-id\"}\n"
+            "{\"condition\":\"D\",\"hotwords_file_sha256\":\"hotwords-hash\",\"hotwords_line_count\":242,\"hotwords_score\":2.0,\"bpe_vocab_sha256\":\"vocab-hash\",\"bpe_vocab_line_count\":2000,\"num_threads\":3,\"manifest_sha256\":[\"manifest-hash\"],\"git_head\":\"012345\",\"model_dir\":\"model-id\",\"whisper_audio_ctx\":null}\n"
         );
+    }
+
+    #[test]
+    fn serializes_whisper_audio_ctx_in_header() {
+        let header = RunMetadata {
+            condition: "W",
+            hotwords_file_sha256: None,
+            hotwords_line_count: None,
+            hotwords_score: None,
+            bpe_vocab_sha256: None,
+            bpe_vocab_line_count: None,
+            num_threads: 1,
+            manifest_sha256: vec!["manifest-hash".into()],
+            git_head: "012345".into(),
+            model_dir: "whisper-model".into(),
+            whisper_audio_ctx: Some("scaled:1000:128".into()),
+        };
+
+        let serialized = json_line(&header).unwrap();
+        assert!(serialized.contains("\"whisper_audio_ctx\":\"scaled:1000:128\""));
     }
 
     #[test]
@@ -853,6 +894,37 @@ mod tests {
     }
 
     #[test]
+    fn whisper_audio_ctx_rejects_reazon_and_bad_values() {
+        let required = [
+            "--models-dir",
+            "models",
+            "--manifest",
+            "manifest.tsv",
+            "--wavs-dir",
+            "wavs",
+            "--out",
+            "result.jsonl",
+        ];
+        let incompatible = parse_args(
+            required
+                .into_iter()
+                .chain(["--whisper-audio-ctx", "full"])
+                .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(incompatible.to_string().contains("--engine whisper"));
+
+        let invalid = parse_args(
+            required
+                .into_iter()
+                .chain(["--engine", "whisper", "--whisper-audio-ctx", "1501"])
+                .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("--whisper-audio-ctx"));
+    }
+
+    #[test]
     fn num_threads_defaults_to_one_and_can_be_overridden() {
         let required = [
             "--models-dir",
@@ -922,6 +994,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.engine, EvalEngine::Whisper);
+    }
+
+    #[cfg(feature = "whisper")]
+    #[test]
+    fn whisper_audio_ctx_is_accepted_with_whisper() {
+        let args = parse_args(
+            [
+                "--models-dir",
+                "models",
+                "--manifest",
+                "manifest.tsv",
+                "--wavs-dir",
+                "wavs",
+                "--out",
+                "result.jsonl",
+                "--engine",
+                "whisper",
+                "--whisper-audio-ctx",
+                "scaled:250:64",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.whisper_audio_ctx,
+            Some(AudioCtxPolicy::Scaled {
+                pad_ms: 250,
+                min: 64,
+            })
+        );
     }
 
     #[test]

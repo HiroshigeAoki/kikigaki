@@ -12,7 +12,7 @@ use whisper_rs::{
 
 use crate::local::Recognizer;
 use crate::whisper_engine::DecodeCancel;
-use crate::whisper_guard::audio_ctx_for;
+use crate::whisper_guard::AudioCtxPolicy;
 
 struct AbortState {
     shutdown: Arc<AtomicBool>,
@@ -43,6 +43,7 @@ pub struct WhisperRecognizer {
     context: WhisperContext,
     state: Option<WhisperState>,
     abort_state: Box<AbortState>,
+    audio_ctx_policy: AudioCtxPolicy,
 }
 
 impl WhisperRecognizer {
@@ -71,7 +72,14 @@ impl WhisperRecognizer {
                 shutdown,
                 decode_cancel,
             }),
+            audio_ctx_policy: AudioCtxPolicy::default(),
         })
+    }
+
+    /// Overrides the default short-clip audio context selection.
+    pub fn with_audio_ctx_policy(mut self, policy: AudioCtxPolicy) -> Self {
+        self.audio_ctx_policy = policy;
+        self
     }
 
     fn ensure_state(&mut self) -> Option<&mut WhisperState> {
@@ -96,7 +104,7 @@ impl Recognizer for WhisperRecognizer {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(Some("ja"));
         params.set_no_context(true);
-        if let Some(audio_ctx) = audio_ctx_for(duration_ms) {
+        if let Some(audio_ctx) = self.audio_ctx_policy.audio_ctx(duration_ms) {
             params.set_audio_ctx(audio_ctx);
         }
         params.set_print_progress(false);

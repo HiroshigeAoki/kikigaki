@@ -31,10 +31,13 @@ HEADER_KEYS = {
     "model_dir",
 }
 RESULT_KEYS = {"id", "ref", "hyp", "decode_ms"}
-# Optional provenance fields written by the eval CLI since the bbpe amendment
-# (synthesized-vocab sha256 + line count). Tolerated but not required, so
-# fixtures and pre-amendment result files stay valid.
-OPTIONAL_HEADER_KEYS = {"bpe_vocab_sha256", "bpe_vocab_line_count"}
+# Optional experiment metadata written by newer eval CLI versions. Tolerated but
+# not required, so fixtures and older result files stay valid.
+OPTIONAL_HEADER_KEYS = {
+    "bpe_vocab_sha256",
+    "bpe_vocab_line_count",
+    "whisper_audio_ctx",
+}
 
 
 class ScoringError(RuntimeError):

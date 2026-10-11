@@ -468,17 +468,15 @@ impl crate::controller::MicPort for crate::mic::Mic {
 
 struct TrayViewModel {
     tooltip: String,
-    icon_rgba: Vec<u8>,
+    mark: crate::tray::TrayMark,
 }
 
 fn build_tray(app: &tauri::App, handle: &AppHandle) -> tauri::Result<()> {
     let tray_handle = handle.clone();
+    let initial = crate::tray::initial_mark();
     tauri::tray::TrayIconBuilder::with_id("main")
-        .icon(
-            app.default_window_icon()
-                .expect("bundle icon missing")
-                .clone(),
-        )
+        .icon(tauri::image::Image::from_bytes(initial.png)?)
+        .icon_as_template(initial.template)
         .tooltip("kikigaki — 起動中")
         .on_tray_icon_event(move |_tray, event| {
             if let tauri::tray::TrayIconEvent::Click {
@@ -508,8 +506,9 @@ fn build_tray(app: &tauri::App, handle: &AppHandle) -> tauri::Result<()> {
 fn apply_tray_view_model(app: &AppHandle, model: TrayViewModel) {
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_tooltip(Some(&model.tooltip));
-        let icon = tauri::image::Image::new_owned(model.icon_rgba, 22, 22);
-        let _ = tray.set_icon(Some(icon));
+        if let Ok(image) = tauri::image::Image::from_bytes(model.mark.png) {
+            let _ = tray.set_icon_with_as_template(Some(image), model.mark.template);
+        }
     }
 }
 
@@ -533,7 +532,7 @@ fn tray_view_model(snapshot: &crate::status::UiSnapshot) -> TrayViewModel {
         .unwrap_or_else(|| crate::tray::tooltip(state, phase).to_owned());
     TrayViewModel {
         tooltip,
-        icon_rgba: crate::tray::icon_rgba(state, phase),
+        mark: crate::tray::mark(state, phase),
     }
 }
 

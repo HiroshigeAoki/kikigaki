@@ -88,7 +88,7 @@ function applyStatus(status) {
   document.getElementById('statusMain').textContent = statusMainText(status);
   document.getElementById('statusSub').textContent = status.message || `${status.hotkey} を押している間だけ聞き取ります`;
   const strip = status.punct_enabled && status.strip_trailing_period ? '（文末の「。」は除く）' : '';
-  document.getElementById('statusHint').textContent = `句読点 ${status.punct_enabled ? 'on' : 'off'}${strip}`;
+  document.getElementById('statusHint').textContent = `両方のキー: 句読点 ${status.punct_enabled ? 'on' : 'off'}${strip}`;
   renderChord('standard', status.hotkey);
   if (status.long_hotkey) renderChord('long', status.long_hotkey);
 }

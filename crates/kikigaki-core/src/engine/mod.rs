@@ -133,9 +133,17 @@ pub struct AudioSink {
     tx: SyncSender<EngineCmd>,
     dropped: Arc<AtomicU64>,
     warned: Arc<AtomicBool>,
+    mirror: Option<Box<AudioSink>>,
 }
 
 impl AudioSink {
+    /// Mirrors audio once without letting mirror backpressure or closure affect the primary.
+    /// Control commands are sent only to the primary engine.
+    pub fn mirrored(mut primary: Self, mirror: Self) -> Self {
+        primary.mirror = Some(Box::new(mirror));
+        primary
+    }
+
     /// Enqueues a command while applying audio-drop and bounded control retry policy.
     ///
     /// Audio is attempted once and silently dropped on backpressure. Control commands retry
@@ -147,8 +155,9 @@ impl AudioSink {
             self.warned.store(false, Ordering::Relaxed);
         }
 
-        if matches!(cmd, EngineCmd::Audio(_)) {
-            return match self.tx.try_send(cmd) {
+        if let EngineCmd::Audio(audio) = &cmd {
+            let mirrored_audio = self.mirror.as_ref().map(|_| audio.clone());
+            let result = match self.tx.try_send(cmd) {
                 Ok(()) => Ok(()),
                 Err(TrySendError::Full(_)) => {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -159,6 +168,10 @@ impl AudioSink {
                 }
                 Err(TrySendError::Disconnected(_)) => Err(SinkError::Closed),
             };
+            if let Some((mirror, audio)) = self.mirror.as_ref().zip(mirrored_audio) {
+                let _ = mirror.send(EngineCmd::Audio(audio));
+            }
+            return result;
         }
 
         let deadline = Instant::now() + CONTROL_RETRY;
@@ -195,6 +208,7 @@ fn channel_with_capacity(capacity: usize) -> (AudioSink, Receiver<EngineCmd>) {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
             warned: Arc::new(AtomicBool::new(false)),
+            mirror: None,
         },
         rx,
     )
@@ -491,6 +505,31 @@ mod tests {
         assert!(!shutdown.load(Ordering::Relaxed));
         closed.shutdown();
         assert!(shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn mirrored_sink_mirror_backpressure_never_drops_primary() {
+        let (primary, primary_rx) = channel_with_capacity(4);
+        let (mirror, mirror_rx) = channel_with_capacity(1);
+        mirror.send(EngineCmd::Audio(vec![9.0])).unwrap();
+        let sink = AudioSink::mirrored(primary.clone(), mirror.clone());
+        sink.send(EngineCmd::Audio(vec![0.1])).unwrap();
+        assert_eq!(primary_rx.try_recv().unwrap(), EngineCmd::Audio(vec![0.1]));
+        assert_eq!(primary.take_dropped(), 0);
+        assert_eq!(mirror.take_dropped(), 1);
+        assert_eq!(mirror_rx.try_recv().unwrap(), EngineCmd::Audio(vec![9.0]));
+        sink.send(EngineCmd::Begin { gen: 1 }).unwrap();
+        assert_eq!(primary_rx.try_recv().unwrap(), EngineCmd::Begin { gen: 1 });
+        assert!(
+            mirror_rx.try_recv().is_err(),
+            "controls must not be mirrored"
+        );
+        sink.send(EngineCmd::Audio(vec![0.2])).unwrap();
+        assert_eq!(primary_rx.try_recv().unwrap(), EngineCmd::Audio(vec![0.2]));
+        assert_eq!(mirror_rx.try_recv().unwrap(), EngineCmd::Audio(vec![0.2]));
+        drop(mirror_rx);
+        assert_eq!(sink.send(EngineCmd::Audio(vec![0.3])), Ok(()));
+        assert_eq!(primary_rx.try_recv().unwrap(), EngineCmd::Audio(vec![0.3]));
     }
 
     #[test]

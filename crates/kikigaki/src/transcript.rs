@@ -10,12 +10,13 @@ use serde::Serialize;
 struct Transcript<'a> {
     at: String,
     engine: &'a str,
+    routed: &'a str,
     raw: &'a str,
     text: &'a str,
 }
 
-fn append(dir: &Path, engine: &str, raw: &str, text: &str, at: DateTime<Utc>) {
-    if let Err(error) = append_inner(dir, engine, raw, text, at) {
+fn append(dir: &Path, engine: &str, routed: &str, raw: &str, text: &str, at: DateTime<Utc>) {
+    if let Err(error) = append_inner(dir, engine, routed, raw, text, at) {
         tracing::warn!(%error, path = %dir.display(), "write transcript log");
     }
 }
@@ -24,18 +25,20 @@ pub fn enqueue(
     enabled: bool,
     dir: std::path::PathBuf,
     engine: &'static str,
+    routed: &'static str,
     raw: String,
     text: String,
     at: DateTime<Utc>,
 ) {
     if enabled {
-        std::thread::spawn(move || append(&dir, engine, &raw, &text, at));
+        std::thread::spawn(move || append(&dir, engine, routed, &raw, &text, at));
     }
 }
 
 fn append_inner(
     dir: &Path,
     engine: &str,
+    routed: &str,
     raw: &str,
     text: &str,
     at: DateTime<Utc>,
@@ -61,6 +64,7 @@ fn append_inner(
         &Transcript {
             at: at.to_rfc3339_opts(SecondsFormat::Millis, true),
             engine,
+            routed,
             raw,
             text,
         },
@@ -78,8 +82,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("transcripts");
         let at = "2026-10-11T01:02:03Z".parse().unwrap();
-        append(&dir, "whisper", "raw", "final", at);
-        append(&dir, "whisper", "raw2", "final2", at);
+        append(&dir, "whisper", "auto_long", "raw", "final", at);
+        append(&dir, "whisper", "auto_long", "raw2", "final2", at);
         let path = dir.join(
             at.with_timezone(&Local)
                 .format("%Y-%m-%d.jsonl")
@@ -89,6 +93,7 @@ mod tests {
         assert_eq!(lines.lines().count(), 2);
         let row: serde_json::Value = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
         assert_eq!(row["engine"], "whisper");
+        assert_eq!(row["routed"], "auto_long");
         assert_eq!(row["raw"], "raw");
         assert_eq!(row["text"], "final");
         assert_eq!(row["at"], "2026-10-11T01:02:03.000Z");
@@ -101,7 +106,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("transcripts");
         let at = Utc::now();
-        append(&dir, "local", "raw", "text", at);
+        append(&dir, "local", "standard", "raw", "text", at);
         let path = dir.join(
             at.with_timezone(&Local)
                 .format("%Y-%m-%d.jsonl")
@@ -122,7 +127,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("not-a-directory");
         std::fs::write(&file, "occupied").unwrap();
-        append(&file, "local", "raw", "text", Utc::now());
+        append(&file, "local", "standard", "raw", "text", Utc::now());
     }
 
     #[test]
@@ -133,6 +138,7 @@ mod tests {
             false,
             dir.clone(),
             "local",
+            "standard",
             "raw".into(),
             "text".into(),
             Utc::now(),

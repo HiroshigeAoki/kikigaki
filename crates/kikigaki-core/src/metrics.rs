@@ -5,6 +5,29 @@ use std::path::Path;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// How an utterance was routed relative to its hotkey's normal engine.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Routing {
+    /// Normal hotkey routing without automatic promotion.
+    Standard,
+    /// A standard recording promoted to Whisper at release.
+    AutoLong,
+    /// A promoted recording completed using the standard engine's fallback.
+    AutoLongFallback,
+}
+
+impl Routing {
+    /// Returns the routing name used in metrics and transcript logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::AutoLong => "auto_long",
+            Self::AutoLongFallback => "auto_long_fallback",
+        }
+    }
+}
+
 /// Latency and transcript metadata for one utterance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Utterance {
@@ -36,6 +59,9 @@ pub struct Utterance {
     /// Serving engine, filled by the controller; absent in legacy rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
+    /// Auto-routing decision, filled by the controller; absent in legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed: Option<Routing>,
     /// Number of characters in normalized output text.
     pub chars: usize,
     /// Language code reported by hayamimi.
@@ -144,6 +170,7 @@ mod tests {
             dropped_chunks: 2,
             gen: 4,
             engine: None,
+            routed: None,
             chars: 5,
             lang: "ja".into(),
             timeout: false,
@@ -174,6 +201,7 @@ mod tests {
         assert_eq!(row.dropped_chunks, 0);
         assert_eq!(row.gen, 0);
         assert_eq!(row.engine, None);
+        assert_eq!(row.routed, None);
     }
 
     #[test]

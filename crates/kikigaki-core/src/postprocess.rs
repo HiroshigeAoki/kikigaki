@@ -7,7 +7,7 @@ use crate::engine::{join_workers, EngineMsg, SinkError, Waker};
 use crate::protocol;
 use crate::punct::nfkc;
 use crate::replace::{ReplaceFile, Rules};
-use crate::text::{strip_touten_kuten, strip_trailing_period};
+use crate::text::{strip_trailing_period, strip_whisper_punct};
 
 /// Adds punctuation to transcription text.
 pub trait Punctuator: Send {
@@ -31,7 +31,8 @@ pub struct PostprocessSettings {
     pub punct_enabled: bool,
     /// Whether to remove one trailing Japanese or ASCII period.
     pub strip_trailing_period: bool,
-    /// Whether to remove Japanese commas and periods from engine output.
+    /// Whether to strip Whisper punctuation and whitespace outside ASCII words
+    /// after normalization and replacement, before local punctuation.
     pub strip_engine_punct: bool,
 }
 
@@ -124,7 +125,7 @@ impl Pipeline {
         let normalized = nfkc(raw.trim());
         let replaced = self.effective.apply(&normalized);
         let replaced = if self.settings.strip_engine_punct {
-            strip_touten_kuten(&replaced)
+            strip_whisper_punct(&replaced)
         } else {
             replaced
         };
@@ -424,7 +425,30 @@ mod tests {
             false,
             Arc::new(Rules::default()),
         );
-        assert_eq!(pipeline.run("ＡＢＣ､｡，．").text, "置換語,.");
+        assert_eq!(pipeline.run("ＡＢＣ､｡？?，．").text, "置換語,.");
+    }
+
+    #[test]
+    fn whisper_spaces_are_stripped_before_punctuation() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (_temp, replace) = replace_file("");
+        let mut pipeline = Pipeline::new(
+            replace,
+            Box::new(RecordingPunctuator(Arc::clone(&seen))),
+            PostprocessSettings {
+                punct_enabled: true,
+                strip_engine_punct: true,
+                ..PostprocessSettings::default()
+            },
+            Arc::new(Rules::default()),
+            false,
+            Arc::new(Rules::default()),
+        );
+        pipeline.run("他の確認事項を出してください あともすでに mac には");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["他の確認事項を出してくださいあともすでにmacには"]
+        );
     }
 
     #[test]

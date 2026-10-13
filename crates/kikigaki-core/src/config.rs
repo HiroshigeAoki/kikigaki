@@ -423,12 +423,12 @@ impl Config {
         self.long_key && caps.long_key
     }
 
-    /// Returns whether the selected engine already punctuates its own output, making local
-    /// punctuation redundant (and, for Whisper, actively wrong to layer on top of).
+    /// Returns whether engine punctuation is retained instead of running local punctuation.
+    /// Whisper punctuation is stripped so both local engines use the same punctuator.
     pub fn engine_punctuates(&self, engine: EngineKind) -> bool {
         match engine {
             EngineKind::Remote => self.remote.server_punctuates,
-            EngineKind::Whisper => true,
+            EngineKind::Whisper => false,
             EngineKind::Local => false,
         }
     }
@@ -458,8 +458,7 @@ pub fn postprocess_settings(
     crate::postprocess::PostprocessSettings {
         punct_enabled: punct_effective(config, caps, engine),
         strip_trailing_period: config.strip_trailing_period,
-        strip_engine_punct: engine == EngineKind::Whisper
-            && config.punct.enabled == PunctEnabled::Off,
+        strip_engine_punct: engine == EngineKind::Whisper,
     }
 }
 
@@ -543,7 +542,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn postprocess_settings_per_engine_matches_d6() {
+    fn postprocess_settings_per_engine_matches_shared_punctuation() {
         use crate::postprocess::PostprocessSettings;
         let caps = Capabilities {
             punct: true,
@@ -565,9 +564,9 @@ mod tests {
                 assert_eq!(
                     postprocess_settings(&cfg, caps, engine),
                     PostprocessSettings {
-                        punct_enabled: engine == EngineKind::Local && choice != PunctEnabled::Off,
+                        punct_enabled: engine != EngineKind::Remote && choice != PunctEnabled::Off,
                         strip_trailing_period: strip,
-                        strip_engine_punct: whisper && choice == PunctEnabled::Off,
+                        strip_engine_punct: whisper,
                     }
                 );
             }
@@ -578,7 +577,14 @@ mod tests {
             );
         }
         let cfg = Config::default();
-        assert!(!postprocess_settings(&cfg, caps, EngineKind::Whisper).strip_engine_punct);
+        assert!(postprocess_settings(&cfg, caps, EngineKind::Whisper).strip_engine_punct);
+        let no_punct = Capabilities {
+            punct: false,
+            ..caps
+        };
+        let settings = postprocess_settings(&cfg, no_punct, EngineKind::Whisper);
+        assert!(settings.strip_engine_punct);
+        assert!(!settings.punct_enabled);
         assert!(postprocess_settings(&cfg, caps, EngineKind::Local).punct_enabled);
     }
 
@@ -1019,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn whisper_engine_always_suppresses_local_punctuation() {
+    fn whisper_engine_uses_local_punctuation_choice() {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
@@ -1030,7 +1036,7 @@ mod tests {
             ..Config::default()
         };
         cfg.punct.enabled = PunctEnabled::On;
-        assert!(!punct_effective(&cfg, caps, cfg.engine));
+        assert!(punct_effective(&cfg, caps, cfg.engine));
         cfg.punct.enabled = PunctEnabled::Off;
         assert!(!punct_effective(&cfg, caps, cfg.engine));
     }

@@ -1228,7 +1228,11 @@ impl Controller {
             EngineKind::Whisper,
             self.models_dir.clone(),
             self.capabilities,
-            false,
+            kikigaki_core::config::punct_effective(
+                self.settings.config(),
+                self.capabilities,
+                EngineKind::Whisper,
+            ),
         );
         let factory = Arc::clone(&self.engine_factory);
         let supervisor =
@@ -3722,8 +3726,8 @@ mod tests {
             use crate::settings::PunctSetting;
             for (choice, local, long) in [
                 (PunctSetting::Off, "甲、乙", "甲乙"),
-                (PunctSetting::On, "甲、乙。", "甲、乙。"),
-                (PunctSetting::OnStrip, "甲、乙", "甲、乙"),
+                (PunctSetting::On, "甲、乙。", "甲乙。"),
+                (PunctSetting::OnStrip, "甲、乙", "甲乙"),
             ] {
                 let (mut h, rx) = ready();
                 h.controller
@@ -4009,8 +4013,8 @@ mod tests {
             use crate::settings::PunctSetting;
             for (choice, local, long) in [
                 (PunctSetting::Off, "甲、乙", "甲乙"),
-                (PunctSetting::On, "甲、乙。", "甲、乙。"),
-                (PunctSetting::OnStrip, "甲、乙", "甲、乙"),
+                (PunctSetting::On, "甲、乙。", "甲乙。"),
+                (PunctSetting::OnStrip, "甲、乙", "甲乙"),
             ] {
                 let (mut h, _) = ready();
                 h.controller
@@ -4164,6 +4168,24 @@ mod tests {
         let plans = h.long_startup.plans.lock().unwrap();
         assert_eq!(plans[0].engine, EngineKind::Whisper);
         assert!(!plans[0]
+            .required
+            .iter()
+            .any(|model| model.id == "mojicast-punct"));
+    }
+
+    #[test]
+    fn long_startup_requires_shared_punctuation_model_when_enabled() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.boot(false);
+        h.controller
+            .apply_settings(SettingsPatch {
+                punctuation: Some(crate::settings::PunctSetting::On),
+                long_key: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        let plans = h.long_startup.plans.lock().unwrap();
+        assert!(plans[0]
             .required
             .iter()
             .any(|model| model.id == "mojicast-punct"));

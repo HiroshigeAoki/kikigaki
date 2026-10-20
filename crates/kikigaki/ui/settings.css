@@ -13,6 +13,8 @@
   --ok: #2f8a4f;
   --rec: #c9432a;
   --loading: #8a7f6f;
+  --warning: #b7791f;
+  --error: #c9432a;
   --key: #f1efea;
   --key-line: #c8c3ba;
   --font: -apple-system, "Hiragino Sans", system-ui, sans-serif;
@@ -35,6 +37,8 @@
     --ok: #5fbf7f;
     --rec: #e4674c;
     --loading: #a19684;
+    --warning: #e5ad50;
+    --error: #f07862;
     --key: #3a3631;
     --key-line: #5a544b;
   }
@@ -101,6 +105,8 @@ input:focus-visible {
 }
 
 .dot.load { background: var(--loading); }
+.dot.warn { background: var(--warning); }
+.dot.err { background: var(--error); }
 
 @keyframes pulse {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--rec) 55%, transparent); }

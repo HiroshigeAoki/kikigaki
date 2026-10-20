@@ -84,9 +84,13 @@ function applyStatus(status) {
     dot.classList.add('rec');
   } else if (status.phase !== 'ready') {
     dot.classList.add('load');
+  } else if (status.level === 'warning') {
+    dot.classList.add('warn');
+  } else if (status.level === 'error') {
+    dot.classList.add('err');
   }
   document.getElementById('statusMain').textContent = statusMainText(status);
-  document.getElementById('statusSub').textContent = status.message || `${status.hotkey} を押している間だけ聞き取ります`;
+  document.getElementById('statusSub').textContent = `${status.hotkey} を押している間だけ聞き取ります`;
   const strip = status.punct_enabled && status.strip_trailing_period ? '（文末の「。」は除く）' : '';
   document.getElementById('statusHint').textContent = `両方のキー: 句読点 ${status.punct_enabled ? 'on' : 'off'}${strip}`;
   renderChord('standard', status.hotkey);
@@ -122,6 +126,7 @@ function applyLongKey(settings) {
     case 'failed': text = '停止中'; break;
   }
   document.getElementById('longState').textContent = text;
+  document.getElementById('longState').title = state && state.kind === 'failed' ? state.message : '';
   const retry = document.getElementById('retryLongEngineButton');
   retry.hidden = !settings.long_key || !state || state.kind !== 'failed';
   retry.disabled = retryLongPending || longKeyPending;

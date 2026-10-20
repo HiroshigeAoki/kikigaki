@@ -455,6 +455,8 @@ struct Owner {
 const LONG_HOTKEY_INVALID_NOTICE: &str = "長文キーのホットキーが無効 — 再設定してください";
 const LONG_PREPARING_NOTICE: &str = "長文エンジン準備中のため標準で認識しました";
 const LONG_STOPPED_NOTICE: &str = "長文エンジンが停止中のため標準で認識しました";
+const LONG_INSTALL_FAILED_NOTICE: &str =
+    "長文キーのモデルを準備できませんでした — もう一度お試しください";
 const LONG_FAILED_NOTICE: &str = "長文エンジンが停止しました — 設定から再試行できます";
 const PASTE_FAILED_NOTICE: &str = "Accessibility permission denied — System Settings › Privacy";
 
@@ -1314,23 +1316,25 @@ impl Controller {
     }
 
     fn fail_long_install(&mut self, reason: String) {
+        tracing::warn!(%reason, "long engine install failed");
         let long = self.long.as_mut().expect("long installer exists");
         long.install_terminal = true;
         let origin = long.origin;
-        self.set_long_notice(Some(reason.clone()));
+        self.set_long_notice(Some(LONG_INSTALL_FAILED_NOTICE.into()));
         if origin == LongOrigin::Settings {
             if let Err(error) = self.settings.apply(SettingsPatch {
                 long_key: Some(false),
                 ..SettingsPatch::default()
             }) {
                 tracing::error!(code = error.code, message = %error.message, "failed to compensate long key installation failure");
-                self.long_notice = Some(format!("{reason} / {}", error.message));
+                self.long_notice =
+                    Some(format!("{LONG_INSTALL_FAILED_NOTICE} / {}", error.message));
             }
             self.long_desired = false;
             self.long_disable_pending = true;
             self.disable_long();
         } else {
-            self.fail_long_load(reason, None, None);
+            self.fail_long_load(reason, None, Some(LONG_INSTALL_FAILED_NOTICE.into()));
         }
         self.dirty = true;
     }
@@ -1341,6 +1345,7 @@ impl Controller {
         failed_model: Option<&'static str>,
         notice: Option<String>,
     ) {
+        tracing::warn!(%reason, failed_model = ?failed_model, "long engine failed");
         let supervisor = if let Some(long) = self.long.as_mut() {
             if failed_model.is_some() {
                 if let Some(install) = long.install.as_mut() {
@@ -1357,7 +1362,7 @@ impl Controller {
         if let Some(supervisor) = supervisor {
             self.retire_long(supervisor);
         }
-        self.set_long_notice(Some(notice.unwrap_or(reason)));
+        self.set_long_notice(Some(notice.unwrap_or_else(|| LONG_FAILED_NOTICE.into())));
     }
 
     fn disable_long(&mut self) {
@@ -1927,6 +1932,7 @@ impl Controller {
             status: UiStatus {
                 state: state_name(self.session.state()),
                 phase: phase_name(status.phase(phase)),
+                level: status.level(),
                 message: status.message().map(str::to_owned),
                 hotkey: settings.hotkey.clone(),
                 punct_enabled: settings.punct_enabled,
@@ -3959,7 +3965,10 @@ mod tests {
             finish(&mut h, &rx, EngineKind::Local, 1, "fallback after failure");
             assert_eq!(h.controller.long_notice.as_deref(), Some(STOPPED));
             edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
-            assert_eq!(h.controller.long_notice.as_deref(), Some("long failed"));
+            assert_eq!(
+                h.controller.long_notice.as_deref(),
+                Some(LONG_FAILED_NOTICE)
+            );
         }
 
         #[test]
@@ -4210,7 +4219,7 @@ mod tests {
         h.turn();
         assert_eq!(
             h.controller.snapshot().status.message.as_deref(),
-            Some("long failed")
+            Some(LONG_FAILED_NOTICE)
         );
         h.controller.status = Status::StartupFailed("standard failed".into());
         assert_eq!(
@@ -4287,6 +4296,36 @@ mod tests {
     }
 
     #[test]
+    fn long_failure_card_is_friendly_and_serializes_effective_severity() {
+        let mut h = LifecycleHarness::new(true, true);
+        h.boot(false);
+        h.controller
+            .fail_long_load("raw model IO failure".into(), Some("whisper"), None);
+        assert!(matches!(&h.controller.long.as_ref().unwrap().state,
+            LongState::Failed { reason } if reason == "raw model IO failure"));
+        let snapshot = h.controller.snapshot();
+        assert_eq!(snapshot.status.message.as_deref(), Some(LONG_FAILED_NOTICE));
+        assert_eq!(
+            serde_json::to_value(&snapshot.status).unwrap()["level"],
+            "warning"
+        );
+        for (status, level) in [
+            (Status::Ok, "ok"),
+            (Status::Installing("progress".into()), "ok"),
+            (Status::Warning("warning".into()), "warning"),
+            (Status::StartupFailed("startup".into()), "error"),
+            (Status::EngineFailed("engine".into()), "error"),
+        ] {
+            h.controller.long_notice = None;
+            h.controller.status = status;
+            assert_eq!(
+                serde_json::to_value(h.controller.snapshot().status).unwrap()["level"],
+                level
+            );
+        }
+    }
+
+    #[test]
     fn enable_install_failure_reverts_long_key_and_unregisters() {
         let mut h = LifecycleHarness::new(false, true);
         h.boot(false);
@@ -4301,7 +4340,10 @@ mod tests {
         assert!(!h.controller.settings.config().long_key);
         assert_eq!(*h.hotkeys.unregistered.lock().unwrap(), [HotkeyKey::Long]);
         assert!(h.controller.long.is_none());
-        assert_eq!(h.controller.long_notice.as_deref(), Some("download failed"));
+        assert_eq!(
+            h.controller.long_notice.as_deref(),
+            Some("長文キーのモデルを準備できませんでした — もう一度お試しください")
+        );
         assert_eq!(h.controller.session.state(), State::Idle);
     }
 
@@ -4520,7 +4562,10 @@ mod tests {
         assert_eq!(h.long_startup.plans.lock().unwrap().len(), 1);
         assert!(!h.controller.settings.config().long_key);
         assert!(h.controller.long.is_none());
-        assert_eq!(h.controller.long_notice.as_deref(), Some("download failed"));
+        assert_eq!(
+            h.controller.long_notice.as_deref(),
+            Some("長文キーのモデルを準備できませんでした — もう一度お試しください")
+        );
     }
 
     #[test]

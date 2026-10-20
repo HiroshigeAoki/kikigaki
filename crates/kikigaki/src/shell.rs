@@ -369,6 +369,11 @@ fn default_snapshot(
         revision: 0,
         status: crate::status::UiStatus {
             state: "disconnected",
+            level: if bootstrap_error.is_some() {
+                "error"
+            } else {
+                "ok"
+            },
             phase,
             message: bootstrap_error.as_ref().map(|error| error.message.clone()),
             hotkey: settings_snapshot.hotkey.clone(),

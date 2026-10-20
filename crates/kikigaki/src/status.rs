@@ -4,6 +4,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UiStatus {
     pub state: &'static str,
+    pub level: &'static str,
     pub phase: &'static str,
     pub message: Option<String>,
     pub hotkey: String,
@@ -103,6 +104,15 @@ pub enum Status {
 }
 
 impl Status {
+    /// Severity of the effective status shown in the settings card.
+    pub fn level(&self) -> &'static str {
+        match self {
+            Self::Warning(_) => "warning",
+            Self::StartupFailed(_) | Self::EngineFailed(_) => "error",
+            Self::Ok | Self::Installing(_) => "ok",
+        }
+    }
+
     /// Returns the message shown by the tray, if any.
     pub fn message(&self) -> Option<&str> {
         match self {

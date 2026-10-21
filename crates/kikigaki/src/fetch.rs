@@ -133,4 +133,15 @@ mod tests {
         assert!(fetcher.fetch(&url, &mut Vec::new(), &mut |_| {}).is_err());
         server.join().unwrap();
     }
+
+    #[test]
+    fn embedded_roots_exclude_compromised_emsign_ecc_g3() {
+        // eMudhra's emSign ECC Root CA - G3 hierarchy had an intermediate key
+        // compromised (Mozilla bug 2083449); webpki-roots 1.0.10 dropped it.
+        let compromised = b"emSign ECC Root CA - G3";
+        assert!(!webpki_roots::TLS_SERVER_ROOTS.iter().any(|anchor| anchor
+            .subject
+            .windows(compromised.len())
+            .any(|w| w == compromised)));
+    }
 }

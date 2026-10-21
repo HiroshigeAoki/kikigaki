@@ -1031,12 +1031,13 @@ mod tests {
     fn end_final_contains_only_trailing_segments() {
         let events = run_with_fakes(
             Box::new(FlushVad {
-                inner: FakeVad::new(8, Arc::new(AtomicBool::new(false))),
+                inner: FakeVad::new(16, Arc::new(AtomicBool::new(false))),
             }),
             Box::new(FakeRecognizer),
             [
                 EngineCmd::Begin { gen: 1 },
-                EngineCmd::Audio(vec![0.5; 8 * 512]),
+                // 512 ms of real audio, well above the End filter's min_speech_ms.
+                EngineCmd::Audio(vec![0.5; 16 * 512]),
                 EngineCmd::End { gen: 1, pad_ms: 0 },
             ],
         );

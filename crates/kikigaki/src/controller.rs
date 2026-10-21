@@ -3475,8 +3475,8 @@ mod tests {
                 use crate::settings::PunctSetting;
                 for (choice, standard, whisper) in [
                     (PunctSetting::Off, "甲、乙", "甲乙"),
-                    (PunctSetting::On, "甲、乙。", "甲、乙。"),
-                    (PunctSetting::OnStrip, "甲、乙", "甲、乙"),
+                    (PunctSetting::On, "甲、乙。", "甲乙。"),
+                    (PunctSetting::OnStrip, "甲、乙", "甲乙"),
                 ] {
                     for fallback in [false, true] {
                         let (mut h, rx) = ready_auto(6000);

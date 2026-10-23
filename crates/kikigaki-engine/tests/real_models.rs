@@ -58,6 +58,56 @@ fn transcribe_test_ja_1_golden() {
     );
 }
 
+#[cfg(feature = "whisper")]
+#[test]
+fn whisper_transcribes_test_ja_1_without_crashing() {
+    let Some(dir) = std::env::var_os("KIKIGAKI_MODELS_DIR") else {
+        // Soft-skip on developer machines without cached models. Required real-model runs set
+        // `KIKIGAKI_REQUIRE_REAL_MODELS=1` (any non-empty value) to turn this into a hard failure.
+        if std::env::var_os("KIKIGAKI_REQUIRE_REAL_MODELS").is_some() {
+            panic!(
+                "KIKIGAKI_MODELS_DIR is unset but KIKIGAKI_REQUIRE_REAL_MODELS=1 — this run must \
+                 have the real Whisper model available, not skip it"
+            );
+        }
+        eprintln!("SKIPPED: models missing (KIKIGAKI_MODELS_DIR unset)");
+        return;
+    };
+    let samples = load_wav_16k("test_ja_1.wav");
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let decode_cancel = kikigaki_engine::whisper_engine::DecodeCancel::new();
+    let mut recognizer = kikigaki_engine::whisper_recognizer::build_whisper_recognizer(
+        &PathBuf::from(dir),
+        false,
+        Arc::clone(&shutdown),
+        decode_cancel,
+    )
+    .unwrap();
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    let abort_started = Instant::now();
+    assert!(
+        recognizer.transcribe(&samples).is_none(),
+        "shutdown should abort transcription"
+    );
+    assert!(
+        abort_started.elapsed() < Duration::from_secs(30),
+        "shutdown abort took {:?}",
+        abort_started.elapsed()
+    );
+
+    shutdown.store(false, std::sync::atomic::Ordering::Relaxed);
+    let text = recognizer
+        .transcribe(&samples)
+        .expect("recognizer returned no result");
+    eprintln!("Whisper transcription: {text:?}");
+    assert!(
+        !text.trim().is_empty(),
+        "expected non-empty transcription, got {text:?}"
+    );
+    // Deliberately not asserting exact text here (unlike the Reazon golden test): the
+    // hotword-eval harness measures Whisper's output against the full 45-wav evaluation set.
+}
+
 #[test]
 fn production_hotword_path_biases_known_eval_wav() {
     let Some(models_dir) = real_models_dir() else {

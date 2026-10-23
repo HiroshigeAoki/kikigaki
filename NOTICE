@@ -7,6 +7,8 @@ This product includes or uses the following upstream software and model artifact
   https://github.com/k2-fsa/sherpa-onnx
 - ONNX Runtime, MIT License
   https://github.com/microsoft/onnxruntime
+- whisper.cpp / ggml (via whisper-rs), MIT License
+  https://github.com/ggerganov/whisper.cpp
 - ReazonSpeech zipformer model, Apache License 2.0
   https://research.reazon.jp/projects/ReazonSpeech/
 - Silero VAD, MIT License
@@ -41,9 +43,10 @@ approved.tsv hashes.
 Static-library inventory
 ------------------------
 
-The sherpa-onnx 1.13.6 osx-arm64 and linux-aarch64 static archives contain the same library
-inventory. The upstream archives contain headers and static libraries, but no LICENSE or NOTICE
-files.
+The app links the static libraries below. The sherpa-onnx 1.13.6 osx-arm64 and linux-aarch64
+archives contain the same sherpa-related inventory; those upstream archives contain headers and
+static libraries, but no LICENSE or NOTICE files. whisper-rs builds the whisper.cpp/ggml libraries
+from its vendored source.
 
 | Library | Upstream | License |
 | --- | --- | --- |
@@ -55,6 +58,7 @@ files.
 | libsherpa-onnx-portaudio_static.a | PortAudio | MIT-style PortAudio license |
 | libpiper_phonemize.a, libucd.a | rhasspy/piper-phonemize | MIT |
 | libespeak-ng.a | espeak-ng | GPL-3.0-or-later |
+| libwhisper.a, libggml*.a | ggerganov/whisper.cpp, ggml | MIT |
 
 Bundled license texts
 ----------------------

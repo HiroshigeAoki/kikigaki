@@ -12,14 +12,12 @@
     "allow-set-launch-at-login",
     "allow-retry-bootstrap",
     "allow-open-config",
+    "allow-open-transcript-dir",
     "allow-open-settings-pane",
     "allow-request-microphone-access",
     "allow-start-download",
     "allow-retry-download",
     "allow-list-history",
-    "allow-preview-correction",
-    "allow-remember-correction",
-    "allow-delete-learned-rule",
     "allow-clear-history",
     "allow-quit"
   ]

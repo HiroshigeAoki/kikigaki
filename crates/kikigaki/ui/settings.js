@@ -73,11 +73,9 @@ function statusMainText(status) {
 function renderChord(key, chord) {
   const container = document.getElementById(key === 'long' ? 'longHkKbd' : 'hkKbd');
   container.replaceChildren();
-  for (const part of [formatChord(chord)]) {
-    const key = document.createElement('kbd');
-    key.textContent = part;
-    container.appendChild(key);
-  }
+  const cap = document.createElement('kbd');
+  cap.textContent = formatChord(chord);
+  container.appendChild(cap);
 }
 
 function applyStatus(status) {

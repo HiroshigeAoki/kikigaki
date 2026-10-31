@@ -75,7 +75,7 @@ test('HISTORY_PAGE is twenty', () => {
   assert.equal(f.HISTORY_PAGE, 20);
 });
 
- test('formatChord canonicalizes symbols and readable physical keys, preserving invalid input', () => {
+test('formatChord canonicalizes symbols and readable physical keys, preserving invalid input', () => {
   for (const [input, expected] of [
     ['Alt+Ctrl+K', '⌃⌥K'], ['Ctrl+Alt+Space', '⌃⌥Space'],
     ['Alt+BracketLeft', '⌥['], ['Cmd+Shift+Alt+Ctrl+ArrowRight', '⌃⌥⇧⌘→'],

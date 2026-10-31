@@ -199,8 +199,7 @@ section.group {
 .row > .hk,
 .row > .seg,
 .row > .switch,
-.row > .btn,
-.row > .status-small {
+.row > .btn {
   flex-shrink: 0;
   margin-left: auto;
 }
@@ -394,19 +393,6 @@ section.group {
   padding: 22px 14px;
   color: var(--ink-3);
   text-align: center;
-}
-
-.status-small {
-  flex: none;
-  font-size: 12px;
-}
-
-.long-state {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 6px;
-  color: var(--ink-2);
 }
 
 .ok { color: var(--ok); }

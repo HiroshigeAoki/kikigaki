@@ -38,13 +38,53 @@
     };
   }
 
+  const MODIFIERS = ['Ctrl', 'Alt', 'Shift', 'Cmd'];
+  const SYMBOLS = ['⌃', '⌥', '⇧', '⌘'];
+  const KEY_LABELS = {
+    BracketLeft: '[', BracketRight: ']', Backquote: '`', Backslash: '\\',
+    Comma: ',', Equal: '=', Minus: '-', Period: '.', Quote: "'", Semicolon: ';', Slash: '/',
+    ArrowLeft: '←', ArrowUp: '↑', ArrowRight: '→', ArrowDown: '↓',
+  };
+
+  function formatChord(chord) {
+    if (typeof chord !== 'string' || !chord) return chord;
+    const parts = chord.split('+');
+    const key = parts.pop();
+    if (!key || MODIFIERS.includes(key) || parts.some((part) => !MODIFIERS.includes(part))
+      || new Set(parts).size !== parts.length
+      || !(/^[A-Za-z0-9]$|^Space$|^F(?:[1-9]|1[0-2])$|^(?:Enter|Tab|Escape|Backspace|Delete|Home|End|PageUp|PageDown|Insert)$/.test(key)
+        || Object.hasOwn(KEY_LABELS, key))) return chord;
+    return MODIFIERS.map((name, i) => parts.includes(name) ? SYMBOLS[i] : '').join('')
+      + (KEY_LABELS[key] || key);
+  }
+
+  function longStateView(state, retrying) {
+    if (retrying) return { tone: 'busy', text: '再試行中…', percent: null };
+    const kind = state && state.kind;
+    return {
+      tone: kind === 'ready' ? 'ok' : kind === 'failed' ? 'warn'
+        : kind === 'installing' || kind === 'loading' ? 'busy' : 'off',
+      text: longStateText(state),
+      percent: kind === 'installing' && Number.isFinite(state.percent) && state.percent < 100
+        ? Math.max(0, state.percent) : null,
+    };
+  }
+
+  function statusKeysLine(settings) {
+    const standard = formatChord(settings.hotkey);
+    const keys = settings.long_key && settings.long_available && settings.long_hotkey
+      ? `標準 ${standard} ／ 長文 ${formatChord(settings.long_hotkey)}` : standard;
+    return `${keys} を押している間だけ聞き取ります`;
+  }
+
   function chordFromKeyEvent({ code, key, modifiers }) {
     let chordKey = key;
     if (/^Key[A-Z]$/.test(code)) chordKey = code.slice(3);
     else if (/^Digit[0-9]$/.test(code)) chordKey = code.slice(5);
     else if (code === 'Space') chordKey = 'Space';
+    else if (code) chordKey = code;
     else if (key.length === 1) chordKey = key.toUpperCase();
-    return [...modifiers, chordKey].join('+');
+    return [...MODIFIERS.filter((name) => modifiers.includes(name)), chordKey].join('+');
   }
 
   function longStateText(state) {
@@ -58,7 +98,7 @@
   }
 
   const KikigakiFormat = {
-    statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateText,
+    formatChord, longStateView, statusKeysLine, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateText,
     HISTORY_PAGE: 20,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = KikigakiFormat;

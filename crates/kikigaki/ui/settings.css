@@ -14,9 +14,10 @@
   --rec: #c9432a;
   --loading: #8a7f6f;
   --warning: #b7791f;
-  --error: #c9432a;
+  --error: #b42318;
   --key: #f1efea;
   --key-line: #c8c3ba;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
   --font: -apple-system, "Hiragino Sans", system-ui, sans-serif;
   --mono: ui-monospace, Menlo, monospace;
 }
@@ -38,7 +39,7 @@
     --rec: #e4674c;
     --loading: #a19684;
     --warning: #e5ad50;
-    --error: #f07862;
+    --error: #ff7b72;
     --key: #3a3631;
     --key-line: #5a544b;
   }
@@ -74,7 +75,7 @@ input:focus-visible {
 .scene {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 6px;
 }
 
 [hidden] { display: none !important; }
@@ -99,23 +100,21 @@ input:focus-visible {
   background: var(--ok);
 }
 
-.dot.rec {
+.dot.rec { background: var(--rec); }
+.dot.rec::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
   background: var(--rec);
-  box-shadow: 0 0 0 0 var(--rec);
-  animation: pulse 1.4s ease-out infinite;
+  animation: ring 1.4s var(--ease-out) infinite;
 }
-
 .dot.load { background: var(--loading); }
 .dot.warn { background: var(--warning); }
 .dot.err { background: var(--error); }
-
-@keyframes pulse {
-  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--rec) 55%, transparent); }
-  100% { box-shadow: 0 0 0 12px transparent; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .dot.rec { animation: none; }
+@keyframes ring {
+  from { transform: scale(1); opacity: .55; }
+  to { transform: scale(2.7); opacity: 0; }
 }
 
 .status .t {
@@ -168,29 +167,17 @@ section.group {
   background: var(--panel);
 }
 
-.group h2,
-.subsection-heading {
-  margin: 0;
-  padding: 10px 14px 4px;
-  color: var(--ink-3);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .06em;
-  text-transform: uppercase;
-}
-
-.group-heading {
+.group-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  margin: 10px 2px 4px;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
 }
-
-.group-heading .quiet { margin: 7px 14px 0; }
-
-.subsection-heading {
-  padding-bottom: 7px;
-  border-top: 1px solid var(--line-soft);
-}
+.group-title h2 { margin: 0; font: inherit; }
+.row.sub { padding-left: 28px; border-top-style: dashed; }
 
 .row {
   display: flex;
@@ -201,10 +188,10 @@ section.group {
   border-top: 1px solid var(--line-soft);
 }
 
-.row:first-of-type { border-top: 0; }
+.row:first-child { border-top: 0; }
 
 .row .l {
-  flex: 1 1 14em;
+  flex: 1 1 150px;
   min-width: 0;
 }
 
@@ -218,7 +205,7 @@ section.group {
   margin-left: auto;
 }
 
-.hk .cap { white-space: nowrap; }
+.hk .cap { white-space: nowrap; width: 4em; text-align: center; }
 
 .row .l b {
   display: block;
@@ -237,8 +224,8 @@ section.group {
 }
 
 .kbd kbd {
-  min-width: 28px;
-  padding: 6px 8px;
+  min-width: 24px;
+  padding: 5px 7px;
   border: 1px solid var(--key-line);
   border-radius: 6px;
   background: var(--key);
@@ -295,11 +282,11 @@ section.group {
   background: #fff;
   box-shadow: 0 1px 2px rgba(0, 0, 0, .3);
   content: "";
-  transition: left .15s;
+  transition: transform 150ms var(--ease-out);
 }
 
 .switch[aria-checked="true"] { background: var(--ok); }
-.switch[aria-checked="true"]::after { left: 18px; }
+.switch[aria-checked="true"]::after { transform: translateX(16px); }
 .switch:disabled { cursor: default; opacity: .5; }
 
 .seg {
@@ -365,8 +352,9 @@ section.group {
 .inline-err {
   margin: 0;
   padding: 6px 14px 9px;
-  color: var(--accent);
+  color: var(--error);
   font-size: 12px;
+  animation: note-in 150ms var(--ease-out);
 }
 
 .hist {
@@ -513,3 +501,42 @@ section.group {
 .config-error { min-height: 280px; }
 .config-actions { justify-content: flex-start; }
 .scene-error { padding-left: 2px; }
+
+.status { margin-bottom: 8px; }
+.status .t b { font-size: 14px; font-weight: 600; }
+#retryLongEngineButton { margin-top: 8px; }
+.capture-note { margin: 0; padding: 0 14px 10px; color: var(--ink-2); font-size: 12px; }
+.capture-note.sub { padding-left: 28px; }
+.switch { transition: background-color 150ms ease; }
+.switch[aria-busy="true"] { cursor: progress; }
+.btn, .hk, .seg button { transition: background-color 120ms ease; }
+.btn.quiet { border-color: transparent; background: transparent; color: var(--ink-2); padding: 2px 6px; }
+@media (hover: hover) and (pointer: fine) {
+  .btn:not(:disabled):hover, .hk:not(:disabled):hover, .seg button:not(:disabled):hover {
+    background: color-mix(in srgb, var(--win) 94%, var(--ink));
+  }
+  .btn.primary:not(:disabled):hover { background: color-mix(in srgb, var(--accent) 94%, var(--ink)); }
+  .seg button[aria-pressed="true"]:not(:disabled):hover { background: color-mix(in srgb, var(--ink) 94%, var(--win)); }
+}
+.btn:not(:disabled):active, .hk:not(:disabled):active, .seg button:not(:disabled):active {
+  background: color-mix(in srgb, var(--win) 86%, var(--ink));
+}
+.btn.primary:not(:disabled):active { background: color-mix(in srgb, var(--accent) 86%, var(--ink)); }
+.seg button[aria-pressed="true"]:not(:disabled):active { background: color-mix(in srgb, var(--ink) 86%, black); }
+.pill { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; color: var(--ink-2); font-size: 12px; }
+.pill::before { content: ""; width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--loading); }
+.pill.ok::before { background: var(--ok); }
+.pill.warn::before { background: var(--warning); }
+.bar { width: 200px; max-width: 100%; height: 4px; margin-top: 6px; overflow: hidden; border-radius: 2px; background: var(--line-soft); }
+.bar i { display: block; height: 100%; background: var(--accent); transform-origin: left; }
+.inline-btn { margin-top: 4px; }
+.inline-err { overflow-wrap: anywhere; }
+.inline-err.ok { color: var(--ok); }
+.inline-err.leaving { opacity: 0; transition: opacity 100ms ease; }
+@keyframes note-in { from { opacity: 0; } }
+.foot { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin-top: 12px; padding: 0 2px; color: var(--ink-3); font-size: 11px; }
+.foot .l { flex: 1 1 200px; min-width: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .switch::after { transition: none; }
+  .dot.rec::after { display: none; animation: none; }
+}

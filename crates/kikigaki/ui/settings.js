@@ -14,7 +14,7 @@ window.addEventListener('unhandledrejection', (event) => {
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-const { statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateText, HISTORY_PAGE } = window.KikigakiFormat;
+const { statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateView, formatChord, statusKeysLine, HISTORY_PAGE } = window.KikigakiFormat;
 
 const EVENT_NAME = 'kikigaki://event';
 const MODIFIER_NAMES = ['Meta', 'Alt', 'Control', 'Shift'];
@@ -30,9 +30,6 @@ let captureEnding = false;
 let captureCancelled = false;
 let longKeyPending = false;
 let retryLongPending = false;
-let autostartPending = false;
-let builtinReplaceDictPending = false;
-let transcriptLogPending = false;
 let currentOnboarding = null;
 // Rows the user has expanded to with さらに表示; kept across snapshots so a new utterance
 // does not collapse the list back to the first page.
@@ -76,7 +73,7 @@ function statusMainText(status) {
 function renderChord(key, chord) {
   const container = document.getElementById(key === 'long' ? 'longHkKbd' : 'hkKbd');
   container.replaceChildren();
-  for (const part of chord.split('+').filter(Boolean)) {
+  for (const part of [formatChord(chord)]) {
     const key = document.createElement('kbd');
     key.textContent = part;
     container.appendChild(key);
@@ -93,7 +90,7 @@ function applyStatus(status) {
   detail.hidden = detailText.length === 0;
   detail.querySelector('pre').textContent = detailText;
   document.getElementById('statusMain').textContent = statusMainText(status);
-  document.getElementById('statusSub').textContent = `${status.hotkey} を押している間だけ聞き取ります`;
+  document.getElementById('statusSub').textContent = statusKeysLine(currentSnapshot.settings);
   renderChord('standard', status.hotkey);
   if (status.long_hotkey) renderChord('long', status.long_hotkey);
 }
@@ -105,8 +102,9 @@ function applyPunctSeg(settings) {
 }
 
 function applyHotkeys(settings) {
-  document.getElementById('longHkRow').hidden = !settings.long_key;
-  document.getElementById('longHkNote').hidden = !settings.long_key;
+  document.getElementById('longHkRow').hidden = !settings.long_key || !settings.long_available;
+  document.getElementById('statusSub').textContent = statusKeysLine(settings);
+  document.getElementById('longHkNote').hidden = capturing !== 'long';
   renderChord('standard', settings.hotkey);
   renderChord('long', settings.long_hotkey);
   updateCaptureControls();
@@ -115,12 +113,19 @@ function applyHotkeys(settings) {
 function applyLongKey(settings) {
   document.getElementById('longKeyRow').hidden = !settings.long_available;
   const control = document.getElementById('longKeySwitch');
-  control.setAttribute('aria-checked', String(settings.long_key));
-  control.disabled = longKeyPending || !settings.long_available || Boolean(capturing || capturePending || captureEnding);
+  if (control.getAttribute('aria-busy') !== 'true') control.setAttribute('aria-checked', String(settings.long_key));
+  control.disabled = !settings.long_available || Boolean(capturing || capturePending || captureEnding);
   const state = settings.long_state;
   document.getElementById('longStateRow').hidden = !settings.long_key || !state;
-  document.getElementById('longState').textContent = longStateText(state);
-  document.getElementById('longState').title = state && state.kind === 'failed' ? state.message : '';
+  const view = longStateView(state, retryLongPending);
+  const pill = document.getElementById('longState');
+  pill.textContent = view.text;
+  pill.className = `pill ${view.tone}`;
+  const bar = document.getElementById('longStateBar');
+  if (bar) {
+    bar.hidden = view.percent === null;
+    bar.firstElementChild.style.transform = `scaleX(${(view.percent || 0) / 100})`;
+  }
   const retry = document.getElementById('retryLongEngineButton');
   retry.hidden = !settings.long_key || !state || state.kind !== 'failed';
   retry.disabled = retryLongPending || longKeyPending;
@@ -128,14 +133,12 @@ function applyLongKey(settings) {
 
 function applyBuiltinReplaceDict(settings) {
   const control = document.getElementById('builtinReplaceDictSwitch');
-  control.setAttribute('aria-checked', String(settings.builtin_replace_dict));
-  control.disabled = builtinReplaceDictPending;
+  if (control.getAttribute('aria-busy') !== 'true') control.setAttribute('aria-checked', String(settings.builtin_replace_dict));
 }
 
 function applyTranscriptLog(settings) {
   const control = document.getElementById('transcriptLogSwitch');
-  control.setAttribute('aria-checked', String(settings.transcript_log));
-  control.disabled = transcriptLogPending;
+  if (control.getAttribute('aria-busy') !== 'true') control.setAttribute('aria-checked', String(settings.transcript_log));
 }
 
 function cacheSettings(settings) {
@@ -144,8 +147,8 @@ function cacheSettings(settings) {
 
 function applyAutostart(autostart) {
   const control = document.getElementById('autostartSwitch');
-  control.setAttribute('aria-checked', String(autostart.enabled));
-  control.disabled = autostartPending || !autostart.available;
+  if (control.getAttribute('aria-busy') !== 'true') control.setAttribute('aria-checked', String(autostart.enabled));
+  control.disabled = !autostart.available;
   control.title = autostart.available ? '' : '/Applications 以外にインストールされているため設定できません';
 }
 
@@ -234,13 +237,16 @@ function showOnboarding(state) {
   const micButton = document.getElementById('stepMicButton');
   micButton.textContent = micBlocked ? 'システム設定を開く' : '許可する';
   micButton.disabled = micDone;
+  micButton.hidden = micDone;
   document.getElementById('stepMicDetail').textContent = micDone ? '許可済み' : micBlocked ? 'システム設定で許可してください。' : '文字起こしのために必要です。';
 
   const axButton = document.getElementById('stepAxButton');
   axButton.disabled = state.accessibility_trusted;
+  axButton.hidden = state.accessibility_trusted;
   document.getElementById('stepAxDetail').textContent = state.accessibility_trusted ? '許可済み' : '文字を貼り付けるために必要です。';
 
   const modelsButton = document.getElementById('stepModelsButton');
+  modelsButton.hidden = state.models_installed;
   const bar = document.getElementById('stepModelsBar');
   const progress = document.getElementById('stepModelsProg');
   bar.hidden = true;
@@ -298,25 +304,37 @@ function applyEvent(payload) {
   if (payload.kind === 'snapshot' && payload.status) applyRevisionedSnapshot(payload);
 }
 
-function showInlineError(element, error, isError = true) {
-  const anchor = element.closest('.row') || element.closest('.item') || element;
+function noteAnchor(element) {
+  return element.closest('.row') || element.closest('.item') || element;
+}
+
+function clearInlineNote(element) {
+  const anchor = noteAnchor(element);
   const previous = inlineErrors.get(anchor);
-  if (previous) {
-    clearTimeout(previous.timer);
-    previous.note.remove();
-  }
+  if (!previous) return;
+  clearTimeout(previous.timer);
+  previous.note.classList.add('leaving');
+  setTimeout(() => previous.note.remove(), 100);
+  inlineErrors.delete(anchor);
+}
+
+function showInlineError(element, error, isError = true, lifetime = 8000) {
+  const anchor = noteAnchor(element);
+  clearInlineNote(element);
   const note = document.createElement('p');
   note.className = 'inline-err';
   if (!isError) note.classList.add('ok');
   note.textContent = errorMessage(error);
   anchor.after(note);
   if (typeof note.scrollIntoView === 'function') note.scrollIntoView({ block: 'nearest' });
-  const timer = setTimeout(() => {
-    note.remove();
-    inlineErrors.delete(anchor);
-  }, 5000);
+  const timer = setTimeout(() => clearInlineNote(element), lifetime);
   inlineErrors.set(anchor, { note, timer });
 }
+
+// A new action clears feedback belonging to that row before its handler runs.
+document.addEventListener('click', (event) => {
+  if (event.target.closest('button')) clearInlineNote(event.target);
+}, true);
 
 const hotkeyControls = {
   standard: { button: document.getElementById('hkButton'), note: document.getElementById('hkNote'), cap: document.getElementById('hkCap') },
@@ -335,6 +353,7 @@ function finishHotkeyCaptureUi() {
   if (!capturing) return;
   const control = hotkeyControls[capturing];
   capturing = null;
+  control.note.hidden = true;
   control.button.classList.remove('recording');
   control.cap.textContent = '変更';
 }
@@ -348,9 +367,9 @@ async function endHotkeyCapture(key, newChord) {
     const settings = await invoke('end_hotkey_capture', { key, newChord });
     cacheSettings(settings);
     applyHotkeys(settings);
-    if (newChord) control.note.textContent = '保存しました。すぐに使えます。';
+    if (newChord) showInlineError(control.button, '✓ 保存しました', false, 3000);
   } catch (error) {
-    control.note.textContent = errorMessage(error);
+    showInlineError(control.button, error);
     if (currentSnapshot) applyHotkeys(currentSnapshot.settings);
   } finally {
     captureEnding = false;
@@ -381,11 +400,13 @@ for (const [key, control] of Object.entries(hotkeyControls)) {
         await cancelHotkeyCapture(key);
       } else {
         control.button.classList.add('recording');
-        control.cap.textContent = 'キーを押してください…';
+        control.cap.textContent = '入力中';
+        control.note.textContent = '新しいキーを押してください（Esc で取り消し）';
+        control.note.hidden = false;
         control.button.focus();
       }
     } catch (error) {
-      control.note.textContent = errorMessage(error);
+      showInlineError(control.button, error);
     } finally {
       capturePending = null;
       updateCaptureControls();
@@ -402,7 +423,7 @@ for (const [key, control] of Object.entries(hotkeyControls)) {
     if (MODIFIER_NAMES.includes(event.key)) return;
     const modifiers = MODIFIER_NAMES.filter((name) => event.getModifierState(name));
     if (modifiers.length === 0) {
-      control.note.textContent = '修飾キーを 1 つ以上含めてください。';
+      showInlineError(control.button, '修飾キーを 1 つ以上含めてください。');
       return;
     }
     const chord = chordFromKeyEvent({
@@ -422,23 +443,39 @@ window.addEventListener('blur', () => {
   if (key) void cancelHotkeyCapture(key);
 });
 
-document.getElementById('longKeySwitch').addEventListener('click', async (event) => {
-  const control = event.currentTarget;
-  if (control.disabled || longKeyPending) return;
-  const enabled = control.getAttribute('aria-checked') !== 'true';
-  longKeyPending = true;
-  updateCaptureControls();
-  try {
-    const settings = await invoke('apply_settings', { patch: { longKey: enabled } });
-    cacheSettings(settings);
-    applyHotkeys(settings);
-  } catch (error) {
-    showInlineError(control, error);
-  } finally {
-    longKeyPending = false;
-    updateCaptureControls();
-  }
-});
+function bindSwitch(control, patchKey, onSettings) {
+  control.addEventListener('click', async () => {
+    if (control.disabled || control.getAttribute('aria-busy') === 'true') return;
+    const previous = control.getAttribute('aria-checked') === 'true';
+    const enabled = !previous;
+    control.setAttribute('aria-checked', String(enabled));
+    control.setAttribute('aria-busy', 'true');
+    if (patchKey === 'longKey') { longKeyPending = true; updateCaptureControls(); }
+    try {
+      if (patchKey === 'autostart') {
+        await invoke('set_launch_at_login', { enabled });
+        if (currentSnapshot) currentSnapshot = { ...currentSnapshot,
+          autostart: { ...currentSnapshot.autostart, enabled } };
+      } else {
+        const settings = await invoke('apply_settings', { patch: { [patchKey]: enabled } });
+        cacheSettings(settings);
+      }
+    } catch (error) {
+      control.setAttribute('aria-checked', String(previous));
+      showInlineError(control, error);
+    } finally {
+      control.removeAttribute('aria-busy');
+      if (patchKey === 'longKey') longKeyPending = false;
+      if (currentSnapshot) onSettings(currentSnapshot);
+      updateCaptureControls();
+    }
+  });
+}
+
+bindSwitch(document.getElementById('longKeySwitch'), 'longKey', (snapshot) => applyHotkeys(snapshot.settings));
+bindSwitch(document.getElementById('builtinReplaceDictSwitch'), 'builtinReplaceDict', (snapshot) => applyBuiltinReplaceDict(snapshot.settings));
+bindSwitch(document.getElementById('transcriptLogSwitch'), 'transcriptLog', (snapshot) => applyTranscriptLog(snapshot.settings));
+bindSwitch(document.getElementById('autostartSwitch'), 'autostart', (snapshot) => applyAutostart(snapshot.autostart));
 
 document.getElementById('retryLongEngineButton').addEventListener('click', async (event) => {
   const control = event.currentTarget;
@@ -473,65 +510,6 @@ for (const button of document.querySelectorAll('#punctSeg button')) {
     }
   });
 }
-
-document.getElementById('builtinReplaceDictSwitch').addEventListener('click', async (event) => {
-  const control = event.currentTarget;
-  if (control.disabled || builtinReplaceDictPending) return;
-  const enabled = control.getAttribute('aria-checked') !== 'true';
-  builtinReplaceDictPending = true;
-  control.disabled = true;
-  try {
-    // SettingsPatch is camelCase on the wire, while returned snapshot settings stay snake_case.
-    const settings = await invoke('apply_settings', { patch: { builtinReplaceDict: enabled } });
-    cacheSettings(settings);
-  } catch (error) {
-    showInlineError(control, error);
-  } finally {
-    builtinReplaceDictPending = false;
-    if (currentSnapshot) applyBuiltinReplaceDict(currentSnapshot.settings);
-  }
-});
-
-document.getElementById('transcriptLogSwitch').addEventListener('click', async (event) => {
-  const control = event.currentTarget;
-  if (control.disabled || transcriptLogPending) return;
-  const enabled = control.getAttribute('aria-checked') !== 'true';
-  transcriptLogPending = true;
-  control.disabled = true;
-  try {
-    const settings = await invoke('apply_settings', { patch: { transcriptLog: enabled } });
-    cacheSettings(settings);
-  } catch (error) {
-    showInlineError(control, error);
-  } finally {
-    transcriptLogPending = false;
-    if (currentSnapshot) applyTranscriptLog(currentSnapshot.settings);
-  }
-});
-
-document.getElementById('autostartSwitch').addEventListener('click', async (event) => {
-  const control = event.currentTarget;
-  if (control.disabled) return;
-  const previous = control.getAttribute('aria-checked') === 'true';
-  autostartPending = true;
-  control.disabled = true;
-  control.setAttribute('aria-checked', String(!previous));
-  try {
-    await invoke('set_launch_at_login', { enabled: !previous });
-    if (currentSnapshot) {
-      currentSnapshot = {
-        ...currentSnapshot,
-        autostart: { ...currentSnapshot.autostart, enabled: !previous },
-      };
-    }
-  } catch (error) {
-    control.setAttribute('aria-checked', String(previous));
-    showInlineError(control, error);
-  } finally {
-    autostartPending = false;
-    control.disabled = currentSnapshot ? !currentSnapshot.autostart.available : false;
-  }
-});
 
 document.getElementById('openConfigButton').addEventListener('click', () => {
   invoke('open_config').catch((error) => showInlineError(document.getElementById('openConfigButton'), error));

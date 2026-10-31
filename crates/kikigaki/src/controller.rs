@@ -162,8 +162,9 @@ pub struct HotkeySender {
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PASTE_TIMEOUT: Duration = Duration::from_secs(3);
-const MICROPHONE_PERMISSION_DENIED: &str =
-    "Microphone permission denied — System Settings › Privacy";
+const MICROPHONE_PERMISSION_DENIED: &str = "マイクの使用が許可されていません";
+const MICROPHONE_PERMISSION_DETAIL: &str =
+    "システム設定 › プライバシーとセキュリティ › マイク で kikigaki を許可してください";
 
 impl ControllerClient {
     pub fn sender_for_handle(&self) -> SyncSender<ControllerCmd> {
@@ -406,7 +407,7 @@ fn run(
         match controller.startup.start() {
             Ok(started) => controller.download_in_flight = started,
             Err(error) => {
-                controller.status = Status::StartupFailed(format!("Startup failed — {error}"));
+                controller.status = Status::startup_failed(error.to_string());
             }
         }
     }
@@ -458,7 +459,9 @@ const LONG_STOPPED_NOTICE: &str = "長文エンジンが停止中のため標準
 const LONG_INSTALL_FAILED_NOTICE: &str =
     "長文キーのモデルを準備できませんでした — もう一度お試しください";
 const LONG_FAILED_NOTICE: &str = "長文エンジンが停止しました — 設定から再試行できます";
-const PASTE_FAILED_NOTICE: &str = "Accessibility permission denied — System Settings › Privacy";
+const PASTE_FAILED_NOTICE: &str = "文字を貼り付けられません";
+const PASTE_FAILED_DETAIL: &str =
+    "システム設定 › プライバシーとセキュリティ › アクセシビリティ で kikigaki を許可してください";
 
 #[derive(Debug)]
 enum LongState {
@@ -795,8 +798,7 @@ impl Controller {
                     match self.startup.start() {
                         Ok(started) => self.download_in_flight = started,
                         Err(error) => {
-                            self.status =
-                                Status::StartupFailed(format!("Startup failed — {error}"));
+                            self.status = Status::startup_failed(error.to_string());
                         }
                     }
                 }
@@ -1151,7 +1153,7 @@ impl Controller {
             Err(error) => {
                 self.engine_factory.set_hotwords_enabled(previously_applied);
                 self.mic.stop();
-                self.status = Status::EngineFailed(format!("Engine restart failed — {error}"));
+                self.status = Status::engine_failed(error.to_string());
                 self.standard_disconnected(outputs);
             }
         }
@@ -1330,8 +1332,7 @@ impl Controller {
                 ..SettingsPatch::default()
             }) {
                 tracing::error!(code = error.code, message = %error.message, "failed to compensate long key installation failure");
-                self.long_notice =
-                    Some(format!("{LONG_INSTALL_FAILED_NOTICE} / {}", error.message));
+                self.long_notice = Some(LONG_INSTALL_FAILED_NOTICE.into());
             }
             self.long_desired = false;
             self.long_disable_pending = true;
@@ -1560,7 +1561,8 @@ impl Controller {
                     done_bytes,
                     total_bytes,
                 } => {
-                    self.status = Status::Installing(progress_message(id, done_bytes, total_bytes));
+                    self.status =
+                        Status::Installing(progress_message(done_bytes, total_bytes).into());
                     let required = self.startup.required();
                     let total = u32::try_from(required.len()).unwrap_or(u32::MAX);
                     let done = required
@@ -1595,7 +1597,7 @@ impl Controller {
                             Err(error) => {
                                 tracing::error!(error = %format!("{error:#}"), "failed to start transcription engine");
                                 self.status =
-                                    Status::StartupFailed(format!("Engine start failed — {error}"));
+                                    Status::startup_failed(error.to_string());
                                 false
                             }
                         }
@@ -1616,9 +1618,7 @@ impl Controller {
                             }
                             Err(error) => {
                                 tracing::error!(error = %format!("{error:#}"), "failed to start post-processing");
-                                self.status = Status::StartupFailed(format!(
-                                    "Post-processing start failed — {error}"
-                                ));
+                                self.status = Status::startup_failed(error.to_string());
                                 if let Some(supervisor) = self.supervisor.as_mut() {
                                     supervisor.shutdown();
                                 }
@@ -1629,7 +1629,7 @@ impl Controller {
                 }
                 StartupEvent::Failed(reason) => {
                     self.download_in_flight = false;
-                    self.status = Status::StartupFailed(reason.clone());
+                    self.status = Status::startup_failed(reason.clone());
                     let required = self.startup.required();
                     let fallback_model = required
                         .first()
@@ -1747,9 +1747,9 @@ impl Controller {
                     let startup_failed = failed_model.is_some()
                         && self.startup.invalidate_model_load_failure(failed_model);
                     self.status = if startup_failed {
-                        Status::StartupFailed(reason)
+                        Status::startup_failed(reason)
                     } else {
-                        Status::EngineFailed(reason)
+                        Status::engine_failed(reason)
                     };
                     self.standard_disconnected(outputs);
                     continue;
@@ -1782,13 +1782,18 @@ impl Controller {
                             Status::StartupFailed(_) | Status::EngineFailed(_)
                         );
                         if permission_denied && !standard_failed {
-                            self.status = Status::Warning(MICROPHONE_PERMISSION_DENIED.into());
+                            self.status = Status::Warning(crate::status::StatusText::new(
+                                MICROPHONE_PERMISSION_DENIED,
+                                MICROPHONE_PERMISSION_DETAIL,
+                            ));
                         }
                         if let Err(error) = self.mic.start(sink) {
                             tracing::warn!(%error, "microphone unavailable");
                             if !standard_failed {
-                                self.status =
-                                    Status::Warning(format!("Microphone unavailable — {error}"));
+                                self.status = Status::Warning(crate::status::StatusText::new(
+                                    "マイクを使えません",
+                                    error.to_string(),
+                                ));
                             }
                         } else if !permission_denied
                             && !matches!(
@@ -1864,7 +1869,10 @@ impl Controller {
                                 self.status,
                                 Status::StartupFailed(_) | Status::EngineFailed(_)
                             ) {
-                                self.status = Status::Warning(PASTE_FAILED_NOTICE.into());
+                                self.status = Status::Warning(crate::status::StatusText::new(
+                                    PASTE_FAILED_NOTICE,
+                                    PASTE_FAILED_DETAIL,
+                                ));
                             }
                             if let Some(gen) =
                                 final_gen.filter(|gen| !self.generation_is_in_progress(*gen))
@@ -1893,8 +1901,7 @@ impl Controller {
                         match self.startup.start() {
                             Ok(started) => self.download_in_flight = started,
                             Err(error) => {
-                                self.status =
-                                    Status::StartupFailed(format!("Startup failed — {error}"));
+                                self.status = Status::startup_failed(error.to_string());
                             }
                         }
                     } else if let Some(supervisor) = self.supervisor.as_mut() {
@@ -1905,9 +1912,7 @@ impl Controller {
                         match supervisor.restart() {
                             Ok(_) => {}
                             Err(error) => {
-                                self.status = Status::EngineFailed(format!(
-                                    "Engine restart failed — {error}"
-                                ));
+                                self.status = Status::engine_failed(error.to_string());
                             }
                         }
                     }
@@ -1937,6 +1942,7 @@ impl Controller {
                 phase: phase_name(status.phase(phase)),
                 level: status.level(),
                 message: status.message().map(str::to_owned),
+                detail: status.detail().map(str::to_owned),
                 hotkey: settings.hotkey.clone(),
                 punct_enabled: settings.punct_enabled,
                 strip_trailing_period: settings.strip_trailing_period,
@@ -1978,7 +1984,13 @@ impl Controller {
         ) {
             return match (&self.status, &self.postprocess_degraded) {
                 (Status::EngineFailed(engine), Some(postprocess)) => {
-                    Status::EngineFailed(format!("{engine} / {postprocess}"))
+                    Status::EngineFailed(crate::status::StatusText {
+                        title: engine.title.clone(),
+                        detail: Some(engine.detail.as_deref().map_or_else(
+                            || postprocess.clone(),
+                            |detail| format!("{detail}\n{postprocess}"),
+                        )),
+                    })
                 }
                 _ => self.status.clone(),
             };
@@ -1989,11 +2001,11 @@ impl Controller {
         // Standard-side warnings (microphone, hotkey) and install progress affect both keys,
         // so a long-engine notice only fills an otherwise clear status.
         if let (Some(notice), Status::Ok) = (&self.long_notice, &self.status) {
-            return Status::Warning(notice.clone());
+            return Status::Warning(notice.clone().into());
         }
         self.postprocess_degraded.as_ref().map_or_else(
             || self.status.clone(),
-            |message| Status::Warning(message.clone()),
+            |message| Status::Warning(message.clone().into()),
         )
     }
 
@@ -2086,9 +2098,9 @@ fn percent(done: u64, total: u64) -> u8 {
     }
 }
 
-fn progress_message(id: &str, done_bytes: u64, total_bytes: u64) -> String {
+fn progress_message(done_bytes: u64, total_bytes: u64) -> String {
     let percent = percent(done_bytes, total_bytes);
-    format!("Downloading {id} … {percent}%")
+    format!("モデルをダウンロード中… {percent}%")
 }
 
 fn state_name(state: State) -> &'static str {
@@ -2151,6 +2163,48 @@ mod tests {
     use super::*;
     use crate::settings::SettingsSnapshot;
     use crate::status::{BootstrapError, OnboardingState};
+
+    #[test]
+    fn friendly_status_snapshot_preserves_raw_details() {
+        let mut h = LifecycleHarness::new(false, true);
+        h.controller.status = Status::startup_failed("raw startup");
+        let json = serde_json::to_value(h.controller.snapshot()).unwrap();
+        assert_eq!(
+            json["status"]["message"],
+            "音声エンジンを起動できませんでした"
+        );
+        assert_eq!(json["status"]["detail"], "raw startup");
+        assert_eq!(
+            MICROPHONE_PERMISSION_DENIED,
+            "マイクの使用が許可されていません"
+        );
+        assert_eq!(PASTE_FAILED_NOTICE, "文字を貼り付けられません");
+        h.controller.status = Status::engine_failed("raw engine");
+        h.controller.postprocess_degraded = Some("raw postprocess".into());
+        let status = h.controller.snapshot().status;
+        assert_eq!(
+            status.message.as_deref(),
+            Some("音声エンジンが停止しました")
+        );
+        assert_eq!(
+            status.detail.as_deref(),
+            Some("raw engine\nraw postprocess")
+        );
+        h.controller.postprocess_degraded = None;
+        for (title, detail) in [
+            (MICROPHONE_PERMISSION_DENIED, MICROPHONE_PERMISSION_DETAIL),
+            (PASTE_FAILED_NOTICE, PASTE_FAILED_DETAIL),
+        ] {
+            h.controller.status = Status::Warning(crate::status::StatusText::new(title, detail));
+            let status = h.controller.snapshot().status;
+            assert_eq!(status.message.as_deref(), Some(title));
+            assert_eq!(status.detail.as_deref(), Some(detail));
+        }
+        h.controller.status = Status::Ok;
+        let json = serde_json::to_value(h.controller.snapshot()).unwrap();
+        assert!(json["status"]["detail"].is_null());
+        assert_eq!(progress_message(45, 100), "モデルをダウンロード中… 45%");
+    }
 
     #[test]
     fn hotkey_input_handles_both_keys_with_shared_suppression() {
@@ -3334,7 +3388,11 @@ mod tests {
                 finish(&mut h, &rx, EngineKind::Local, 1, "failed segment");
                 assert_eq!(h.controller.session.state(), State::Recording);
                 assert_eq!(h.controller.active, Some(1));
-                assert_eq!(h.controller.status.message(), Some(PASTE_FAILED_NOTICE));
+                assert_eq!(
+                    h.controller.status.message(),
+                    Some("文字を貼り付けられません")
+                );
+                assert_eq!(h.controller.status.detail(), Some(PASTE_FAILED_DETAIL));
                 assert_eq!(rows(&h)[0]["paste_failed"], true);
                 finish(&mut h, &rx, EngineKind::Local, 1, "later segment");
                 assert_eq!(transcripts_with_count(&h, 1)[0]["text"], "later segment");
@@ -3824,7 +3882,7 @@ mod tests {
             assert_eq!(h.controller.session.state(), State::Finalizing);
             assert_eq!(
                 h.controller.status,
-                Status::EngineFailed("standard failed".into())
+                Status::engine_failed("standard failed")
             );
             finish(&mut h, &rx, EngineKind::Whisper, 1, "long completes");
             assert_eq!(*h.pastes.attempts.lock().unwrap(), ["long completes"]);
@@ -3899,7 +3957,7 @@ mod tests {
             h.controller.execute_outputs(outputs);
             assert_eq!(
                 h.controller.status,
-                Status::EngineFailed("standard failed".into())
+                Status::engine_failed("standard failed")
             );
             assert!(h.controller.standard_disconnect_pending);
             assert_eq!(h.controller.session.state(), State::Recording);
@@ -5113,10 +5171,7 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
         assert_eq!(h.apply(true).unwrap_err().code, "engine_not_started");
         assert_eq!(std::fs::read_to_string(path).unwrap(), before);
-        assert_eq!(
-            h.controller.status,
-            Status::StartupFailed("boot failed".into())
-        );
+        assert_eq!(h.controller.status, Status::startup_failed("boot failed"));
         assert!(h.long_startup.plans.lock().unwrap().is_empty());
     }
 
@@ -5179,12 +5234,10 @@ mod tests {
         assert!(!h.controller.long_desired);
         assert!(h.controller.long.is_none());
         assert_eq!(*h.hotkeys.unregistered.lock().unwrap(), [HotkeyKey::Long]);
-        assert!(h
-            .controller
-            .long_notice
-            .as_deref()
-            .unwrap()
-            .contains("設定ファイルが外部"));
+        assert_eq!(
+            h.controller.long_notice.as_deref(),
+            Some(LONG_INSTALL_FAILED_NOTICE)
+        );
     }
 
     #[test]
@@ -5478,7 +5531,7 @@ mod tests {
             snapshot.status.state == "disconnected"
                 && snapshot
                     .status
-                    .message
+                    .detail
                     .as_deref()
                     .is_some_and(|message| message.contains("scripted build failure"))
         });
@@ -5564,7 +5617,7 @@ mod tests {
         let snapshot = wait_snapshot(&harness, |snapshot| {
             snapshot
                 .status
-                .message
+                .detail
                 .as_deref()
                 .is_some_and(|message| message.contains("engine tier failed"))
         });
@@ -5595,7 +5648,7 @@ mod tests {
 
         apply_builtin(&harness, true);
         let snapshot = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.message.as_deref().is_some_and(|message| {
+            snapshot.status.detail.as_deref().is_some_and(|message| {
                 message.contains("engine tier failed") && message.contains("内蔵置換辞書")
             })
         });
@@ -5868,7 +5921,7 @@ mod tests {
         wait_for_builds(&harness, 3);
         let interim = wait_snapshot(&harness, |snapshot| snapshot.status.phase == "starting");
         assert_eq!(interim.status.state, "idle");
-        assert_eq!(interim.status.message.as_deref(), Some("connection lost"));
+        assert_eq!(interim.status.detail.as_deref(), Some("connection lost"));
         assert_eq!(
             *harness
                 .engine(EngineKind::Local)
@@ -6446,8 +6499,12 @@ mod tests {
                 failed_model: Some("asr"),
             });
         let snapshot = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.message.as_deref() == Some("bad model")
+            snapshot.status.detail.as_deref() == Some("bad model")
         });
+        assert_eq!(
+            snapshot.status.message.as_deref(),
+            Some("音声エンジンを起動できませんでした")
+        );
         assert_eq!(snapshot.status.phase, "failed");
         assert_eq!(*harness.startup.invalidated.lock().unwrap(), ["asr"]);
 
@@ -6459,8 +6516,12 @@ mod tests {
                 failed_model: None,
             });
         let snapshot = wait_snapshot(&harness, |snapshot| {
-            snapshot.status.message.as_deref() == Some("engine stopped")
+            snapshot.status.detail.as_deref() == Some("engine stopped")
         });
+        assert_eq!(
+            snapshot.status.message.as_deref(),
+            Some("音声エンジンが停止しました")
+        );
         assert_eq!(snapshot.status.phase, "failed");
         assert!(harness.startup.invalidated.lock().unwrap().is_empty());
     }
@@ -6760,7 +6821,7 @@ mod tests {
         assert!(progress.failed);
         assert_eq!(progress.model, kikigaki_core::models::MODELS[0].id);
         assert_eq!((progress.done, progress.total), (0, 2));
-        assert_eq!(snapshot.status.message.as_deref(), Some("offline"));
+        assert_eq!(snapshot.status.detail.as_deref(), Some("offline"));
     }
 
     #[test]

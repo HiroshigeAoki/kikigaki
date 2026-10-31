@@ -7,6 +7,7 @@ pub struct UiStatus {
     pub level: &'static str,
     pub phase: &'static str,
     pub message: Option<String>,
+    pub detail: Option<String>,
     pub hotkey: String,
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
@@ -85,22 +86,53 @@ pub struct UiError {
     pub message: String,
 }
 
+/// Display title and optional technical or actionable detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusText {
+    pub title: String,
+    pub detail: Option<String>,
+}
+
+impl StatusText {
+    pub fn new(title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+impl From<String> for StatusText {
+    fn from(title: String) -> Self {
+        Self {
+            title,
+            detail: None,
+        }
+    }
+}
+
+impl From<&str> for StatusText {
+    fn from(title: &str) -> Self {
+        title.to_owned().into()
+    }
+}
+
 /// What the tray shows besides the session state, and how `Reconnect` recovers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     /// Nothing to report.
     Ok,
     /// Model download/extract progress line (phase comes from the supervisor).
-    Installing(String),
+    Installing(StatusText),
     /// Transient warning that does not change the engine phase
     /// (microphone/accessibility permission, microphone unavailable).
-    Warning(String),
+    Warning(StatusText),
     /// Startup coordinator failed (install/start/post-processing/model-load invalidation).
     /// Phase is forced to `Failed`; `Reconnect` re-runs the startup coordinator.
-    StartupFailed(String),
+    StartupFailed(StatusText),
     /// The engine failed to restart; phase comes from the supervisor;
     /// `Reconnect` restarts the engine.
-    EngineFailed(String),
+    EngineFailed(StatusText),
 }
 
 impl Status {
@@ -120,8 +152,29 @@ impl Status {
             Self::Installing(message)
             | Self::Warning(message)
             | Self::StartupFailed(message)
-            | Self::EngineFailed(message) => Some(message),
+            | Self::EngineFailed(message) => Some(&message.title),
         }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Ok => None,
+            Self::Installing(text)
+            | Self::Warning(text)
+            | Self::StartupFailed(text)
+            | Self::EngineFailed(text) => text.detail.as_deref(),
+        }
+    }
+
+    pub fn startup_failed(detail: impl Into<String>) -> Self {
+        Self::StartupFailed(StatusText::new(
+            "音声エンジンを起動できませんでした",
+            detail,
+        ))
+    }
+
+    pub fn engine_failed(detail: impl Into<String>) -> Self {
+        Self::EngineFailed(StatusText::new("音声エンジンが停止しました", detail))
     }
 
     /// Returns the displayed phase, forcing startup failures to `Failed`.
@@ -149,6 +202,45 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_status_serializes_detail_and_null_like_message() {
+        let mut status = UiStatus {
+            state: "disconnected",
+            level: "error",
+            phase: "failed",
+            message: Some("起動できませんでした".into()),
+            detail: Some("raw error".into()),
+            hotkey: "Alt+Space".into(),
+            punct_enabled: false,
+            strip_trailing_period: false,
+            long_hotkey: None,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["message"], "起動できませんでした");
+        assert_eq!(json["detail"], "raw error");
+        status.message = None;
+        status.detail = None;
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json.get("message"), Some(&serde_json::Value::Null));
+        assert_eq!(json.get("detail"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn text_variants_keep_title_and_optional_detail_separate() {
+        assert_eq!(Status::Ok.detail(), None);
+        for make in [
+            Status::Installing,
+            Status::Warning,
+            Status::StartupFailed,
+            Status::EngineFailed,
+        ] {
+            let status = make(StatusText::new("日本語", "raw error"));
+            assert_eq!(status.message(), Some("日本語"));
+            assert_eq!(status.detail(), Some("raw error"));
+            assert_eq!(make("title".into()).detail(), None);
+        }
+    }
 
     #[test]
     fn long_state_view_serializes_as_tagged() {

@@ -1332,7 +1332,6 @@ impl Controller {
                 ..SettingsPatch::default()
             }) {
                 tracing::error!(code = error.code, message = %error.message, "failed to compensate long key installation failure");
-                self.long_notice = Some(LONG_INSTALL_FAILED_NOTICE.into());
             }
             self.long_desired = false;
             self.long_disable_pending = true;
@@ -1618,7 +1617,9 @@ impl Controller {
                             }
                             Err(error) => {
                                 tracing::error!(error = %format!("{error:#}"), "failed to start post-processing");
-                                self.status = Status::startup_failed(error.to_string());
+                                self.status = Status::startup_failed(format!(
+                                    "Post-processing start failed — {error}"
+                                ));
                                 if let Some(supervisor) = self.supervisor.as_mut() {
                                     supervisor.shutdown();
                                 }

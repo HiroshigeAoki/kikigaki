@@ -25,6 +25,7 @@
   }
 
   function downloadLabel(progress) {
+    if (!(progress.total > 0)) return { percent: null, text: '準備中…' };
     const item = Math.min(progress.done + 1, progress.total);
     if (!progress.total_bytes) {
       return { percent: null, text: `${item} / ${progress.total} 個目を準備中…` };

@@ -35,6 +35,9 @@ test('downloadLabel handles unknown totals and clamps file number', () => {
   assert.deepEqual(f.downloadLabel({ done: 3, total: 3, total_bytes: 0 }), {
     percent: null, text: '3 / 3 個目を準備中…',
   });
+  assert.deepEqual(f.downloadLabel({ done: 0, total: 0, bytes: 0, total_bytes: 0 }), {
+    percent: null, text: '準備中…',
+  });
 });
 
 test('downloadLabel formats small and large MB, rounds percent and clamps completed bytes', () => {

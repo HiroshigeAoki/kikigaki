@@ -34,6 +34,9 @@ let autostartPending = false;
 let builtinReplaceDictPending = false;
 let transcriptLogPending = false;
 let currentOnboarding = null;
+// Rows the user has expanded to with さらに表示; kept across snapshots so a new utterance
+// does not collapse the list back to the first page.
+let historyShown = 0;
 const inlineErrors = new WeakMap();
 
 function errorMessage(error) {
@@ -179,6 +182,7 @@ function applyHistory(entries) {
   const visible = visibleHistory(entries);
   list.replaceChildren();
   if (visible.length === 0) {
+    historyShown = 0;
     list.appendChild(emptyMessage('最近の聞き取りはありません'));
     return;
   }
@@ -186,17 +190,18 @@ function applyHistory(entries) {
   const more = document.createElement('button');
   more.className = 'btn small more';
   more.type = 'button';
-  const appendPage = () => {
+  const renderUpTo = (target) => {
     more.remove();
-    const end = Math.min(shown + HISTORY_PAGE, visible.length);
+    const end = Math.min(target, visible.length);
     for (; shown < end; shown++) list.appendChild(createHistoryRow(visible[shown]));
+    historyShown = Math.max(shown, HISTORY_PAGE);
     if (shown < visible.length) {
       more.textContent = `さらに表示（残り ${visible.length - shown} 件）`;
       list.appendChild(more);
     }
   };
-  more.addEventListener('click', appendPage);
-  appendPage();
+  more.addEventListener('click', () => renderUpTo(shown + HISTORY_PAGE));
+  renderUpTo(Math.max(historyShown, HISTORY_PAGE));
 }
 
 function setStepState(stepId, numberId, number, done, current) {

@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const f = require('./settings-format.js');
+const f = require('../ui/settings-format.js');
 
 test('statusDotClass prioritizes recording, error, warning, loading, ready', () => {
   for (const [status, expected] of [

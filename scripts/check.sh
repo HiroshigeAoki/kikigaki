@@ -41,7 +41,7 @@ echo "== settings JavaScript syntax =="
 if command -v node >/dev/null 2>&1; then
   node --check crates/kikigaki/ui/settings.js
   node --check crates/kikigaki/ui/settings-format.js
-  node --test crates/kikigaki/ui/settings-format.test.js
+  node --test crates/kikigaki/ui-tests/settings-format.test.js
 else
   echo "SKIP: node is unavailable; settings JavaScript syntax checks and format tests not run"
 fi

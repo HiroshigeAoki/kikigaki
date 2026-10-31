@@ -70,6 +70,7 @@ async function shoot(harnessFile) {
   const url = (q) => `file://${harnessFile}?chrome=0&${q}`;
   const browser = await chromium.launch();
   const manifest = [];
+  const names = fixtureNames();
   const shot = async (page, name, fullPage = false) => {
     const file = path.join(OUT, 'shots', `${name}.png`);
     await page.screenshot({ path: file, fullPage });
@@ -78,7 +79,7 @@ async function shoot(harnessFile) {
   for (const scheme of ['light', 'dark']) {
     const ctx = await browser.newContext({ viewport: { width: 480, height: 640 }, colorScheme: scheme, locale: 'ja-JP', timezoneId: 'Asia/Tokyo' });
     const page = await ctx.newPage();
-    for (const name of fixtureNames()) {
+    for (const name of names) {
       await page.goto(url(`data=${name}`));
       await page.waitForTimeout(150);
       await shot(page, `${scheme}-${name}`);

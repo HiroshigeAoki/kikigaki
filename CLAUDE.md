@@ -38,6 +38,10 @@ Development happens on Linux; macOS builds run on a separate build Mac over SSH.
   (default `~/dev/voice-engine`) for `remote-engine` sidecar development.
 - `scripts/fetch-onnxruntime.sh` — fetches and hash-verifies the vendored ONNX
   Runtime dylib; invoked by the build.
+- `scripts/ui-harness/` — dev-only worst-case fixtures for the settings window
+  (mocked Tauri bridge, Demo/Worst/Empty/... toggle); `node scripts/ui-harness/shoot.js`
+  screenshots every fixture light/dark at 480x640 into `scripts/ui-harness/out/`.
+  Re-run it after any settings UI change. Needs playwright-core + Chromium.
 - `scripts/hotword-eval/` — offline hotword-biasing evaluation tooling (list
   generator, synthesized bbpe vocab, Mac TTS audio, `hotword-eval` bin, scorer);
   self-tests run in `check.sh`. See `docs/plans/2026-09-01-hotword-eval.md`.

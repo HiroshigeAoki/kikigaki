@@ -141,8 +141,10 @@ function applyTranscriptLog(settings) {
   if (control.getAttribute('aria-busy') !== 'true') control.setAttribute('aria-checked', String(settings.transcript_log));
 }
 
-function cacheSettings(settings) {
-  if (currentSnapshot) currentSnapshot = { ...currentSnapshot, settings };
+// `sinceRevision` is the snapshot revision seen when the command was sent; a snapshot that
+// arrived while it was in flight is newer than the command's reply, so the reply is dropped.
+function cacheSettings(settings, sinceRevision = appliedRevision) {
+  if (currentSnapshot && appliedRevision === sinceRevision) currentSnapshot = { ...currentSnapshot, settings };
 }
 
 function applyAutostart(autostart) {
@@ -363,10 +365,11 @@ async function endHotkeyCapture(key, newChord) {
   finishHotkeyCaptureUi();
   updateCaptureControls();
   const control = hotkeyControls[key];
+  const sinceRevision = appliedRevision;
   try {
     const settings = await invoke('end_hotkey_capture', { key, newChord });
-    cacheSettings(settings);
-    applyHotkeys(settings);
+    cacheSettings(settings, sinceRevision);
+    if (currentSnapshot) applyHotkeys(currentSnapshot.settings);
     if (newChord) showInlineError(control.button, '✓ 保存しました', false, 3000);
   } catch (error) {
     showInlineError(control.button, error);
@@ -374,6 +377,8 @@ async function endHotkeyCapture(key, newChord) {
   } finally {
     captureEnding = false;
     updateCaptureControls();
+    // The button was disabled while ending, which drops keyboard focus to the body.
+    if (document.activeElement === document.body && !control.button.disabled) control.button.focus();
   }
 }
 
@@ -420,7 +425,7 @@ for (const [key, control] of Object.entries(hotkeyControls)) {
       await cancelHotkeyCapture(key);
       return;
     }
-    if (MODIFIER_NAMES.includes(event.key)) return;
+    if (MODIFIER_NAMES.includes(event.key) || event.repeat) return;
     const modifiers = MODIFIER_NAMES.filter((name) => event.getModifierState(name));
     if (modifiers.length === 0) {
       showInlineError(control.button, '修飾キーを 1 つ以上含めてください。');
@@ -451,6 +456,7 @@ function bindSwitch(control, patchKey, onSettings) {
     control.setAttribute('aria-checked', String(enabled));
     control.setAttribute('aria-busy', 'true');
     if (patchKey === 'longKey') { longKeyPending = true; updateCaptureControls(); }
+    const sinceRevision = appliedRevision;
     try {
       if (patchKey === 'autostart') {
         await invoke('set_launch_at_login', { enabled });
@@ -458,7 +464,7 @@ function bindSwitch(control, patchKey, onSettings) {
           autostart: { ...currentSnapshot.autostart, enabled } };
       } else {
         const settings = await invoke('apply_settings', { patch: { [patchKey]: enabled } });
-        cacheSettings(settings);
+        cacheSettings(settings, sinceRevision);
       }
     } catch (error) {
       control.setAttribute('aria-checked', String(previous));

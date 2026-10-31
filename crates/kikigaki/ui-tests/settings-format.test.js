@@ -93,6 +93,13 @@ test('capture falls back to key only without a physical code', () => {
   assert.equal(f.chordFromKeyEvent({code: 'F12', key: 'F12', modifiers: ['Alt']}), 'Alt+F12');
 });
 
+test('chordFromKeyEvent only keeps code names that formatChord can display', () => {
+  // JIS-only and numpad codes fall back to the typed key instead of leaking raw code names.
+  assert.equal(f.chordFromKeyEvent({ code: 'IntlYen', key: '¥', modifiers: ['Ctrl'] }), 'Ctrl+¥');
+  assert.equal(f.chordFromKeyEvent({ code: 'Numpad1', key: '1', modifiers: ['Ctrl'] }), 'Ctrl+1');
+  assert.equal(f.chordFromKeyEvent({ code: 'Home', key: 'Home', modifiers: ['Ctrl'] }), 'Ctrl+Home');
+});
+
 test('longStateView exposes safe tones and progress only during download', () => {
   for (const [state, tone, percent] of [[null, 'off', null], [{kind:'ready'}, 'ok', null],
     [{kind:'loading'}, 'busy', null], [{kind:'installing',percent:42}, 'busy', 42],

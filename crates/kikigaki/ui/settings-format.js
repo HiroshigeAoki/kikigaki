@@ -46,14 +46,19 @@
     ArrowLeft: '←', ArrowUp: '↑', ArrowRight: '→', ArrowDown: '↓',
   };
 
+  // Physical key names the shortcut parser accepts and formatChord can display.
+  function isNamedKey(name) {
+    return /^F(?:[1-9]|1[0-2])$|^(?:Enter|Tab|Escape|Backspace|Delete|Home|End|PageUp|PageDown|Insert)$/.test(name)
+      || Object.hasOwn(KEY_LABELS, name);
+  }
+
   function formatChord(chord) {
     if (typeof chord !== 'string' || !chord) return chord;
     const parts = chord.split('+');
     const key = parts.pop();
     if (!key || MODIFIERS.includes(key) || parts.some((part) => !MODIFIERS.includes(part))
       || new Set(parts).size !== parts.length
-      || !(/^[A-Za-z0-9]$|^Space$|^F(?:[1-9]|1[0-2])$|^(?:Enter|Tab|Escape|Backspace|Delete|Home|End|PageUp|PageDown|Insert)$/.test(key)
-        || Object.hasOwn(KEY_LABELS, key))) return chord;
+      || !(/^[A-Za-z0-9]$|^Space$/.test(key) || isNamedKey(key))) return chord;
     return MODIFIERS.map((name, i) => parts.includes(name) ? SYMBOLS[i] : '').join('')
       + (KEY_LABELS[key] || key);
   }
@@ -82,7 +87,7 @@
     if (/^Key[A-Z]$/.test(code)) chordKey = code.slice(3);
     else if (/^Digit[0-9]$/.test(code)) chordKey = code.slice(5);
     else if (code === 'Space') chordKey = 'Space';
-    else if (code) chordKey = code;
+    else if (isNamedKey(code)) chordKey = code;
     else if (key.length === 1) chordKey = key.toUpperCase();
     return [...MODIFIERS.filter((name) => modifiers.includes(name)), chordKey].join('+');
   }

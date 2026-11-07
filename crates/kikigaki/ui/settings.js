@@ -14,6 +14,8 @@ window.addEventListener('unhandledrejection', (event) => {
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+const { statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateText, HISTORY_PAGE } = window.KikigakiFormat;
+
 const EVENT_NAME = 'kikigaki://event';
 const MODIFIER_NAMES = ['Meta', 'Alt', 'Control', 'Shift'];
 const MODIFIER_SYMBOLS = { Meta: 'Cmd', Alt: 'Alt', Control: 'Ctrl', Shift: 'Shift' };
@@ -32,6 +34,9 @@ let autostartPending = false;
 let builtinReplaceDictPending = false;
 let transcriptLogPending = false;
 let currentOnboarding = null;
+// Rows the user has expanded to with さらに表示; kept across snapshots so a new utterance
+// does not collapse the list back to the first page.
+let historyShown = 0;
 const inlineErrors = new WeakMap();
 
 function errorMessage(error) {
@@ -51,7 +56,8 @@ function showSettings() {
 
 function showConfigError(error) {
   showScene('scene-config-error');
-  document.getElementById('configErrorMessage').textContent = errorMessage(error);
+  document.getElementById('configErrorMessage').textContent = '設定ファイル（config.toml）を読み込めませんでした。「設定ファイルを開く」で該当行を直してから「再試行」を押してください。';
+  document.getElementById('configErrorDetail').textContent = errorMessage(error);
 }
 
 function statusMainText(status) {
@@ -80,19 +86,14 @@ function renderChord(key, chord) {
 function applyStatus(status) {
   const dot = document.getElementById('statusDot');
   dot.className = 'dot';
-  if (status.state === 'recording') {
-    dot.classList.add('rec');
-  } else if (status.phase !== 'ready') {
-    dot.classList.add('load');
-  } else if (status.level === 'warning') {
-    dot.classList.add('warn');
-  } else if (status.level === 'error') {
-    dot.classList.add('err');
-  }
+  const dotClass = statusDotClass(status);
+  if (dotClass) dot.classList.add(dotClass);
+  const detail = document.getElementById('statusDetail');
+  const detailText = typeof status.detail === 'string' ? status.detail : '';
+  detail.hidden = detailText.length === 0;
+  detail.querySelector('pre').textContent = detailText;
   document.getElementById('statusMain').textContent = statusMainText(status);
   document.getElementById('statusSub').textContent = `${status.hotkey} を押している間だけ聞き取ります`;
-  const strip = status.punct_enabled && status.strip_trailing_period ? '（文末の「。」は除く）' : '';
-  document.getElementById('statusHint').textContent = `両方のキー: 句読点 ${status.punct_enabled ? 'on' : 'off'}${strip}`;
   renderChord('standard', status.hotkey);
   if (status.long_hotkey) renderChord('long', status.long_hotkey);
 }
@@ -118,14 +119,7 @@ function applyLongKey(settings) {
   control.disabled = longKeyPending || !settings.long_available || Boolean(capturing || capturePending || captureEnding);
   const state = settings.long_state;
   document.getElementById('longStateRow').hidden = !settings.long_key || !state;
-  let text = '';
-  switch (state && state.kind) {
-    case 'installing': text = `ダウンロード中 ${state.percent}%`; break;
-    case 'loading': text = '準備中…'; break;
-    case 'ready': text = '準備完了'; break;
-    case 'failed': text = '停止中'; break;
-  }
-  document.getElementById('longState').textContent = text;
+  document.getElementById('longState').textContent = longStateText(state);
   document.getElementById('longState').title = state && state.kind === 'failed' ? state.message : '';
   const retry = document.getElementById('retryLongEngineButton');
   retry.hidden = !settings.long_key || !state || state.kind !== 'failed';
@@ -155,12 +149,6 @@ function applyAutostart(autostart) {
   control.title = autostart.available ? '' : '/Applications 以外にインストールされているため設定できません';
 }
 
-function formatHistoryTime(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '';
-  return new Intl.DateTimeFormat('ja-JP', { hour: '2-digit', minute: '2-digit', hour12: false }).format(date);
-}
-
 function emptyMessage(text) {
   const node = document.createElement('div');
   node.className = 'empty';
@@ -171,7 +159,7 @@ function emptyMessage(text) {
 function historyTimeElement(entry) {
   const time = document.createElement('time');
   time.dateTime = entry.at;
-  time.textContent = formatHistoryTime(entry.at);
+  time.textContent = historyTimeLabel(entry.at, new Date());
   return time;
 }
 
@@ -191,12 +179,29 @@ function createHistoryRow(entry) {
 
 function applyHistory(entries) {
   const list = document.getElementById('historyList');
+  const visible = visibleHistory(entries);
   list.replaceChildren();
-  if (entries.length === 0) {
+  if (visible.length === 0) {
+    historyShown = 0;
     list.appendChild(emptyMessage('最近の聞き取りはありません'));
     return;
   }
-  for (const entry of entries) list.appendChild(createHistoryRow(entry));
+  let shown = 0;
+  const more = document.createElement('button');
+  more.className = 'btn small more';
+  more.type = 'button';
+  const renderUpTo = (target) => {
+    more.remove();
+    const end = Math.min(target, visible.length);
+    for (; shown < end; shown++) list.appendChild(createHistoryRow(visible[shown]));
+    historyShown = Math.max(shown, HISTORY_PAGE);
+    if (shown < visible.length) {
+      more.textContent = `さらに表示（残り ${visible.length - shown} 件）`;
+      list.appendChild(more);
+    }
+  };
+  more.addEventListener('click', () => renderUpTo(shown + HISTORY_PAGE));
+  renderUpTo(Math.max(historyShown, HISTORY_PAGE));
 }
 
 function setStepState(stepId, numberId, number, done, current) {
@@ -210,9 +215,11 @@ function applyDownloadProgress(progress) {
   const bar = document.getElementById('stepModelsBar');
   const detail = document.getElementById('stepModelsProg');
   bar.hidden = false;
-  bar.value = Math.round((progress.bytes / Math.max(progress.total_bytes, 1)) * 100);
+  const label = downloadLabel(progress);
+  if (label.percent === null) bar.removeAttribute('value');
+  else bar.value = label.percent;
   detail.hidden = false;
-  detail.textContent = `${progress.model} (${progress.done} / ${progress.total}) · ${(progress.bytes / 1e6).toFixed(0)} / ${(progress.total_bytes / 1e6).toFixed(0)} MB`;
+  detail.textContent = label.text;
 }
 
 function showOnboarding(state) {
@@ -244,7 +251,7 @@ function showOnboarding(state) {
     modelsButton.disabled = true;
   } else if (state.download && state.download.failed) {
     progress.hidden = false;
-    progress.textContent = `ダウンロードに失敗しました（${state.download.model}）。もう一度お試しください。`;
+    progress.textContent = 'ダウンロードに失敗しました。通信を確認して「再試行」を押してください。';
     modelsButton.textContent = '再試行';
     modelsButton.disabled = false;
   } else if (state.download) {
@@ -303,6 +310,7 @@ function showInlineError(element, error, isError = true) {
   if (!isError) note.classList.add('ok');
   note.textContent = errorMessage(error);
   anchor.after(note);
+  if (typeof note.scrollIntoView === 'function') note.scrollIntoView({ block: 'nearest' });
   const timer = setTimeout(() => {
     note.remove();
     inlineErrors.delete(anchor);
@@ -397,8 +405,9 @@ for (const [key, control] of Object.entries(hotkeyControls)) {
       control.note.textContent = '修飾キーを 1 つ以上含めてください。';
       return;
     }
-    const chordKey = event.code === 'Space' ? 'Space' : event.key.length === 1 ? event.key.toUpperCase() : event.key;
-    const chord = [...modifiers.map((name) => MODIFIER_SYMBOLS[name]), chordKey].join('+');
+    const chord = chordFromKeyEvent({
+      code: event.code, key: event.key, modifiers: modifiers.map((name) => MODIFIER_SYMBOLS[name]),
+    });
     await endHotkeyCapture(key, chord);
   });
 

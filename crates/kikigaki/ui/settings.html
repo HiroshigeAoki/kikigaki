@@ -11,8 +11,7 @@
       <div class="scene" id="scene-settings">
         <div class="status scene-status">
           <div class="dot load" id="statusDot"></div>
-          <div class="t"><b id="statusMain">準備中</b><span id="statusSub"></span></div>
-          <div class="hint" id="statusHint"></div>
+          <div class="t"><b id="statusMain">準備中</b><span id="statusSub"></span><details id="statusDetail" hidden><summary>詳細</summary><pre></pre></details></div>
         </div>
 
         <section class="group">
@@ -125,6 +124,7 @@
 
       <div class="scene config-error" id="scene-config-error" hidden>
         <div class="hero"><h3>設定ファイルにエラーがあります</h3><p id="configErrorMessage"></p></div>
+        <pre class="err-detail" id="configErrorDetail"></pre>
         <div class="actions config-actions">
           <button class="btn small" id="configErrorOpenButton" type="button">設定ファイルを開く</button>
           <button class="btn small primary" id="configErrorRetryButton" type="button">再試行</button>
@@ -132,6 +132,7 @@
         <p class="inline-err scene-error" id="configErrorNote" hidden></p>
       </div>
     </main>
+    <script src="settings-format.js"></script>
     <script src="settings.js"></script>
   </body>
 </html>

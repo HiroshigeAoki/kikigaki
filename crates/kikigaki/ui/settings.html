@@ -11,40 +11,33 @@
       <div class="scene" id="scene-settings">
         <div class="status scene-status">
           <div class="dot load" id="statusDot"></div>
-          <div class="t"><b id="statusMain">準備中</b><span id="statusSub"></span><details id="statusDetail" hidden><summary>詳細</summary><pre></pre></details></div>
+          <div class="t"><b id="statusMain">準備中</b><span id="statusSub"></span><details id="statusDetail" hidden><summary>詳細</summary><pre></pre></details><button class="btn small" id="retryLongEngineButton" type="button" hidden>再試行</button></div>
         </div>
 
+        <h2 class="group-title">キー</h2>
         <section class="group">
-          <h2>ホットキー</h2>
           <div class="row">
-            <div class="l"><b>標準キー</b><small>押している間だけ聞き取る。短い返信向け</small></div>
-            <button class="hk" id="hkButton" type="button" aria-label="標準キーを変更">
-              <span class="kbd" id="hkKbd"></span><span class="cap" id="hkCap">変更</span>
-            </button>
+            <div class="l"><b>標準キー</b><small>短い返信向け。押している間だけ聞き取る</small></div>
+            <button class="hk" id="hkButton" type="button" aria-label="標準キーを変更"><span class="kbd" id="hkKbd"></span><span class="cap" id="hkCap">変更</span></button>
           </div>
-          <p class="note" id="hkNote">クリックしてから新しいキーの組み合わせを押してください。修飾キーを 1 つ以上含む必要があります。</p>
-          <div class="row" id="longHkRow" hidden>
-            <div class="l"><b>長文キー</b><small>高精度・英語の固有名詞に強い。貼り付けまで1〜3秒</small></div>
-            <button class="hk" id="longHkButton" type="button" aria-label="長文キーを変更">
-              <span class="kbd" id="longHkKbd"></span><span class="cap" id="longHkCap">変更</span>
-            </button>
-          </div>
-          <p class="note" id="longHkNote" hidden>クリックしてから新しいキーの組み合わせを押してください。修飾キーを 1 つ以上含む必要があります。</p>
-        </section>
-
-        <section class="group">
-          <h2>文字起こし</h2>
+          <p class="capture-note" id="hkNote" hidden></p>
           <div class="row" id="longKeyRow" hidden>
-            <div class="l"><b>長文キー（高精度）を使う</b><small>初回に約0.9GBをダウンロード。メモリを約1GB使います</small>
-              <div class="long-state" id="longStateRow" hidden>
-                <span class="status-small" id="longState" role="status"></span>
-                <button class="btn small" id="retryLongEngineButton" type="button" hidden>再試行</button>
-              </div>
+            <div class="l"><b>長文キー（高精度）</b><small>英語の固有名詞に強い。貼り付けまで1〜3秒。初回に約0.9GBをダウンロード</small>
+              <div id="longStateRow" hidden><span class="pill" id="longState" role="status"></span><div class="bar" id="longStateBar" hidden><i></i></div></div>
             </div>
             <button class="switch" id="longKeySwitch" type="button" role="switch" aria-checked="false" aria-label="長文キー（高精度）を使う"></button>
           </div>
+          <div class="row sub" id="longHkRow" hidden>
+            <div class="l"><b>組み合わせ</b></div>
+            <button class="hk" id="longHkButton" type="button" aria-label="長文キーを変更"><span class="kbd" id="longHkKbd"></span><span class="cap" id="longHkCap">変更</span></button>
+          </div>
+          <p class="capture-note sub" id="longHkNote" hidden></p>
+        </section>
+
+        <h2 class="group-title">文字の整え方</h2>
+        <section class="group">
           <div class="row" id="punctRow">
-            <div class="l"><b>句読点</b><small id="punctNote">両方のキーに適用します。長文キーの句読点と日本語の語句間の空白は先に除きます</small></div>
+            <div class="l"><b>句読点</b><small id="punctNote">両方のキーに適用</small></div>
             <div class="seg" id="punctSeg" role="group" aria-label="句読点">
               <button type="button" data-value="off" aria-pressed="false">付けない</button>
               <button type="button" data-value="on" aria-pressed="false">付ける</button>
@@ -52,48 +45,33 @@
             </div>
           </div>
           <div class="row">
-            <div class="l"><b>カタカナ語→英語辞書（標準キーのみ）</b><small>クバネティス→Kubernetes のような変換と認識バイアス。内蔵辞書を使う。切替はアイドル時に適用され、数秒間エンジンが再ロードされる</small></div>
-            <button class="switch" id="builtinReplaceDictSwitch" type="button" role="switch" aria-checked="false" aria-label="カタカナ語→英語辞書（標準キーのみ）"></button>
+            <div class="l"><b>カタカナ語→英語辞書</b><small>クバネティス→Kubernetes など。変換は両方のキー、聞き取りの補正は標準キーのみ。切り替え時に数秒再読み込み</small></div>
+            <button class="switch" id="builtinReplaceDictSwitch" type="button" role="switch" aria-checked="false" aria-label="カタカナ語→英語辞書"></button>
           </div>
         </section>
 
+        <div class="group-title"><h2>最近の聞き取り</h2><button class="btn quiet" id="clearHistoryButton" type="button">消去</button></div>
         <section class="group">
-          <h2>最近の聞き取り</h2>
-          <div class="row">
-            <div class="l"><b>聞き取りを記録</b><small>認識した文章だけをこの Mac に保存します。音声は保存しません。</small></div>
-            <button class="switch" id="transcriptLogSwitch" type="button" role="switch" aria-checked="false" aria-label="聞き取りを記録"></button>
-          </div>
-          <div class="row">
-            <div class="l"><b>記録フォルダ</b></div>
-            <button class="btn small" id="openTranscriptDirButton" type="button">記録フォルダを開く</button>
-          </div>
           <div class="hist" id="historyList"></div>
-          <p class="note">直近 200 件を表示します。アプリを終了すると消えます。</p>
+          <p class="note">一覧はアプリを終了すると消えます</p>
+          <div class="row">
+            <div class="l"><b>ファイルにも記録</b><small>文章だけをこの Mac に保存。音声は保存しない</small><button class="btn quiet inline-btn" id="openTranscriptDirButton" type="button">フォルダを開く</button></div>
+            <button class="switch" id="transcriptLogSwitch" type="button" role="switch" aria-checked="false" aria-label="ファイルにも記録"></button>
+          </div>
         </section>
 
+        <h2 class="group-title">一般</h2>
         <section class="group">
-          <h2>一般</h2>
           <div class="row">
             <div class="l"><b>ログイン時に起動</b></div>
             <button class="switch" id="autostartSwitch" type="button" role="switch" aria-checked="false" aria-label="ログイン時に起動"></button>
           </div>
           <div class="row">
-            <div class="l"><b>モデル</b><small id="modelsDetail">ReazonSpeech ja-en · Silero VAD · mojicast 句読点</small></div>
-            <span class="status-small ok" id="modelsStatus">インストール済み</span>
-          </div>
-          <div class="row">
-            <div class="l"><b>履歴</b><small>最近の聞き取りをこのウィンドウから消去します</small></div>
-            <button class="btn small" id="clearHistoryButton" type="button">履歴を消去</button>
-          </div>
-          <div class="row">
-            <div class="l"><b>詳細設定</b><small>入力方法・VAD・スレッド数などは設定ファイルで変更できます</small></div>
+            <div class="l"><b>詳細設定</b><small>入力方法・VAD・スレッド数など</small></div>
             <button class="btn small" id="openConfigButton" type="button">設定ファイルを開く</button>
           </div>
-          <div class="row">
-            <div class="l"><b>kikigaki を終了</b><small>メニューバーのアイコンをクリックするとこのウィンドウが開閉します</small></div>
-            <button class="btn small" id="quitButton" type="button">終了</button>
-          </div>
         </section>
+        <div class="foot"><div class="l">メニューバーのアイコンでこの画面を開閉<br>ReazonSpeech ja-en · Silero VAD · mojicast</div><button class="btn" id="quitButton" type="button">kikigaki を終了</button></div>
       </div>
 
       <div class="scene" id="scene-onboarding" hidden>

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kikigaki_core::config::{Capabilities, Config, PunctEnabled};
+use kikigaki_core::config::{chords_match, Capabilities, Config, PunctEnabled};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -119,11 +119,22 @@ impl SettingsCoordinator {
                 document["long_key"] = toml_edit::value(candidate.long_key);
             }
         }
+        // Config::load substitutes a fallback long chord when the default collides with
+        // `hotkey`; pin it so a later `hotkey` change does not silently move the long key.
+        if !document.contains_key("long_hotkey")
+            && candidate.long_hotkey != Config::default().long_hotkey
+        {
+            document["long_hotkey"] = toml_edit::value(candidate.long_hotkey.as_str());
+        }
         if let Some(enabled) = patch.long_key {
             document["long_key"] = toml_edit::value(enabled);
             candidate.long_key = enabled;
         }
         if let Some(chord) = &patch.long_hotkey {
+            parse_chord(chord).map_err(|message| crate::status::UiError {
+                code: "invalid_hotkey",
+                message,
+            })?;
             document["long_hotkey"] = toml_edit::value(chord.as_str());
             candidate.long_hotkey = chord.clone();
         }
@@ -166,6 +177,12 @@ impl SettingsCoordinator {
             candidate.transcript_log = enabled;
         }
 
+        if chords_match(&candidate.hotkey, &candidate.long_hotkey) {
+            return Err(crate::status::UiError {
+                code: "hotkey_conflict",
+                message: "もう一方のキーと同じ組み合わせは使えません".into(),
+            });
+        }
         let body = document.to_string();
         atomic_write(&self.path, body.as_bytes()).map_err(|error| crate::status::UiError {
             code: "write_failed",
@@ -252,6 +269,92 @@ mod tests {
         };
         let coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
         (temp, path, coordinator, caps)
+    }
+
+    #[test]
+    fn upgrade_fallback_long_hotkey_is_pinned_on_the_first_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Shift+Space\"\n").unwrap();
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
+        assert_eq!(coordinator.config().long_hotkey, "Ctrl+Alt+Space");
+        coordinator
+            .apply(SettingsPatch {
+                transcript_log: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        coordinator
+            .apply(SettingsPatch {
+                hotkey: Some("Cmd+Space".into()),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        // Without pinning, the next load would fall back to the plain default chord.
+        let reloaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(reloaded.hotkey, "Cmd+Space");
+        assert_eq!(reloaded.long_hotkey, "Ctrl+Alt+Space");
+    }
+
+    #[test]
+    fn default_long_hotkey_is_not_written_unprompted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
+        coordinator
+            .apply(SettingsPatch {
+                transcript_log: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("long_hotkey"));
+    }
+
+    #[test]
+    fn conflicting_long_hotkey_patch_changes_nothing() {
+        let (_temp, path, mut coordinator, _) = legacy_coordinator();
+        let before = coordinator.snapshot();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let error = coordinator
+            .apply(SettingsPatch {
+                long_hotkey: Some("Alt+Space".into()),
+                transcript_log: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "hotkey_conflict");
+        assert_eq!(error.message, "もう一方のキーと同じ組み合わせは使えません");
+        assert_eq!(coordinator.snapshot(), before);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn malformed_long_hotkey_patch_changes_nothing() {
+        let (_temp, path, mut coordinator, _) = legacy_coordinator();
+        let before = coordinator.snapshot();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let error = coordinator
+            .apply(SettingsPatch {
+                long_hotkey: Some("Space".into()),
+                ..SettingsPatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_hotkey");
+        assert_eq!(coordinator.snapshot(), before);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
     }
 
     #[test]

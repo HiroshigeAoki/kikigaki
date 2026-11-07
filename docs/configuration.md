@@ -48,7 +48,7 @@ server_punctuates = true
 
 ## 長文キー
 
-`long_key` は真偽値で、既定値は `false`。`true` にするとWhisperによる長文キーを有効にする。設定画面の「長文キー（高精度）を使う」と同じ項目で、Apple Silicon搭載Macのビルドでのみ働く。`long_hotkey` は長文キーの組み合わせで、`hotkey` と同じ組み合わせは指定できない。
+`long_key` は真偽値で、既定値は `false`。`true` にするとWhisperによる長文キーを有効にする。設定画面の「長文キー（高精度）を使う」と同じ項目で、Apple Silicon搭載Macのビルドでのみ働く。`long_hotkey` は長文キーの組み合わせで、`hotkey` と同じ組み合わせは指定できない。`long_hotkey` が未設定で `hotkey` がすでに `Alt+Shift+Space` の場合、長文キーの既定値は `Ctrl+Alt+Space` になる。この値は、設定画面で項目を変更したときにファイルへ書き込まれる。
 
 以前の版で `engine = "whisper"` を設定していた場合、起動時に `engine = "local"` と `long_key = true` として読み込む。設定画面で項目を変更すると、この値がファイルにも書き戻される。`engine` に指定できるのは `"local"` と `"remote"` のみ。
 

@@ -321,6 +321,41 @@ impl Default for Config {
     }
 }
 
+/// Compares chords with case-insensitive keys and unordered, aliased modifier sets.
+/// Modifier aliases follow global-hotkey 0.7's parser, including platform-specific CmdOrCtrl.
+pub fn chords_match(a: &str, b: &str) -> bool {
+    fn canonical(chord: &str) -> (Vec<String>, Vec<String>) {
+        let mut modifiers = Vec::new();
+        let mut keys = Vec::new();
+        for part in chord.split('+') {
+            let part = part.trim().to_ascii_lowercase();
+            let modifier = match part.as_str() {
+                "option" | "alt" => Some("alt"),
+                "control" | "ctrl" => Some("ctrl"),
+                "command" | "cmd" | "super" => Some("super"),
+                "shift" => Some("shift"),
+                "commandorcontrol" | "commandorctrl" | "cmdorctrl" | "cmdorcontrol" => {
+                    Some(if cfg!(target_os = "macos") {
+                        "super"
+                    } else {
+                        "ctrl"
+                    })
+                }
+                _ => None,
+            };
+            if let Some(modifier) = modifier {
+                modifiers.push(modifier.to_owned());
+            } else {
+                keys.push(part);
+            }
+        }
+        modifiers.sort_unstable();
+        modifiers.dedup();
+        (modifiers, keys)
+    }
+    canonical(a) == canonical(b)
+}
+
 impl Config {
     /// Loads TOML configuration, returning defaults when the file is absent.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
@@ -358,17 +393,16 @@ impl Config {
                 config.long_key = true;
             }
         }
+        if !table.contains_key("long_hotkey") && chords_match(&config.hotkey, &config.long_hotkey) {
+            config.long_hotkey = "Ctrl+Alt+Space".into();
+        }
         config.expand_paths();
         Ok(config)
     }
 
     /// Validates configuration values against supported ranges and capabilities.
     pub fn validate(&self, caps: Capabilities) -> anyhow::Result<()> {
-        if self
-            .long_hotkey
-            .trim()
-            .eq_ignore_ascii_case(self.hotkey.trim())
-        {
+        if chords_match(&self.long_hotkey, &self.hotkey) {
             bail!("long_hotkey must differ from hotkey");
         }
         if !(1..=16).contains(&self.asr.num_threads) {
@@ -591,6 +625,96 @@ mod tests {
         let path = temp.path().join("config.toml");
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn chords_match_normalizes_modifiers() {
+        for (a, b) in [
+            (" Shift + Alt + Space ", "alt+shift+SPACE"),
+            ("Option+Space", "Alt+Space"),
+            ("Control+Space", "Ctrl+Space"),
+            ("Command+Space", "Cmd+Space"),
+            ("Super+Space", "Cmd+Space"),
+            ("Alt+Alt+Space", "Alt+Space"),
+        ] {
+            assert!(chords_match(a, b), "{a} vs {b}");
+        }
+        let platform_modifier = if cfg!(target_os = "macos") {
+            "Super"
+        } else {
+            "Ctrl"
+        };
+        for alias in [
+            "CommandOrControl",
+            "CommandOrCtrl",
+            "CmdOrCtrl",
+            "CmdOrControl",
+        ] {
+            assert!(chords_match(
+                &format!("{alias}+Space"),
+                &format!("{platform_modifier}+Space")
+            ));
+        }
+        assert!(!chords_match("Alt+Space", "Alt+Shift+Space"));
+    }
+
+    #[test]
+    fn missing_long_hotkey_uses_upgrade_safe_default() {
+        let temp = tempfile::tempdir().unwrap();
+        for chord in ["Alt+Shift+Space", "Shift+Option+Space"] {
+            let raw = format!("hotkey = {chord:?}\n");
+            let path = write(&temp, &raw);
+            let cfg = Config::load(Some(&path)).unwrap();
+            assert_eq!(cfg.long_hotkey, "Ctrl+Alt+Space");
+            cfg.validate(Capabilities {
+                punct: true,
+                remote_engine: true,
+                long_key: true,
+            })
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn explicit_duplicate_long_hotkey_is_not_migrated() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            &temp,
+            "hotkey = \"Alt+Shift+Space\"\nlong_hotkey = \"Alt+Shift+Space\"\n",
+        );
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.long_hotkey, "Alt+Shift+Space");
+        assert!(cfg
+            .validate(Capabilities {
+                punct: true,
+                remote_engine: true,
+                long_key: true
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_canonical_duplicate_chords() {
+        for (hotkey, long_hotkey) in [
+            ("Shift+Alt+Space", "Alt+Shift+Space"),
+            ("Option+Space", "Alt+Space"),
+        ] {
+            let cfg = Config {
+                hotkey: hotkey.into(),
+                long_hotkey: long_hotkey.into(),
+                ..Config::default()
+            };
+            assert!(
+                cfg.validate(Capabilities {
+                    punct: true,
+                    remote_engine: true,
+                    long_key: true
+                })
+                .is_err(),
+                "{hotkey}"
+            );
+        }
     }
 
     #[test]

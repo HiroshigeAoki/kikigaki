@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
-use kikigaki_core::config::{postprocess_settings, Capabilities, Config, EngineKind};
+use kikigaki_core::config::{chords_match, postprocess_settings, Capabilities, Config, EngineKind};
 use kikigaki_core::engine::{Engine, EngineCmd, EngineMsg, EnginePhase, EngineSupervisor, Waker};
 use kikigaki_core::metrics;
 use kikigaki_core::postprocess::{to_protocol_final, PostprocessWorker};
@@ -888,7 +888,7 @@ impl Controller {
             return;
         };
         // Match Config::validate, even when the other key is disabled.
-        if chord.trim().eq_ignore_ascii_case(other_chord.trim()) {
+        if chords_match(&chord, &other_chord) {
             let _ = self.restore_capture_hotkeys();
             let _ = reply.send(Err(UiError {
                 code: "hotkey_conflict",
@@ -1162,6 +1162,12 @@ impl Controller {
         &mut self,
         patch: SettingsPatch,
     ) -> Result<crate::settings::SettingsSnapshot, UiError> {
+        if patch.hotkey.is_some() || patch.long_hotkey.is_some() {
+            return Err(UiError {
+                code: "invalid_patch",
+                message: "キーの組み合わせはキー入力で変更してください".into(),
+            });
+        }
         let requested = patch.long_key;
         if requested == Some(true) && !self.capabilities.long_key {
             return Err(UiError {
@@ -1178,10 +1184,7 @@ impl Controller {
         }
         let newly_registered = requested == Some(true) && !self.long_hotkey_registered;
         if newly_registered {
-            let chord = patch
-                .long_hotkey
-                .as_deref()
-                .unwrap_or(&self.settings.config().long_hotkey);
+            let chord = &self.settings.config().long_hotkey;
             self.hotkeys
                 .register(HotkeyKey::Long, chord)
                 .map_err(register_failed)?;
@@ -5998,10 +6001,45 @@ mod tests {
         assert_eq!(harness.snapshots.1.load(Ordering::Relaxed), builds);
     }
 
-    fn apply_hotkey(client: &ControllerClient, chord: &str) -> Result<SettingsSnapshot, UiError> {
+    #[test]
+    fn generic_chord_patches_are_rejected_without_side_effects() {
+        for key in [HotkeyKey::Standard, HotkeyKey::Long] {
+            let mut h = capture_harness(false, true);
+            let before = h.controller.settings_snapshot();
+            let path = h._temp.path().join("config.toml");
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let (reply, rx) = mpsc::sync_channel(1);
+            let mut patch = SettingsPatch {
+                long_key: Some(true),
+                transcript_log: Some(true),
+                ..SettingsPatch::default()
+            };
+            match key {
+                HotkeyKey::Standard => patch.hotkey = Some("Cmd+Space".into()),
+                HotkeyKey::Long => patch.long_hotkey = Some("Cmd+Space".into()),
+            }
+            h.controller
+                .handle_command(ControllerCmd::ApplySettings { patch, reply });
+            let error = rx.try_recv().unwrap().unwrap_err();
+            assert_eq!(error.code, "invalid_patch");
+            assert_eq!(
+                error.message,
+                "キーの組み合わせはキー入力で変更してください"
+            );
+            assert_eq!(h.controller.settings_snapshot(), before);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+            assert!(h.hotkeys.registered.lock().unwrap().is_empty());
+            assert!(h.hotkeys.unregistered.lock().unwrap().is_empty());
+        }
+    }
+
+    fn apply_transcript_log(
+        client: &ControllerClient,
+        enabled: bool,
+    ) -> Result<SettingsSnapshot, UiError> {
         client.send_and_wait(|reply| ControllerCmd::ApplySettings {
             patch: SettingsPatch {
-                hotkey: Some(chord.into()),
+                transcript_log: Some(enabled),
                 ..SettingsPatch::default()
             },
             reply,
@@ -6013,15 +6051,18 @@ mod tests {
         let harness = ready_harness();
         let a = harness.client.clone();
         let b = harness.client.clone();
-        let first = thread::spawn(move || apply_hotkey(&a, "Alt+A").unwrap().hotkey);
-        let second = thread::spawn(move || apply_hotkey(&b, "Alt+B").unwrap().hotkey);
-        assert_eq!(first.join().unwrap(), "Alt+A");
-        assert_eq!(second.join().unwrap(), "Alt+B");
+        let first = thread::spawn(move || apply_transcript_log(&a, true).unwrap().transcript_log);
+        let second = thread::spawn(move || apply_transcript_log(&b, false).unwrap().transcript_log);
+        assert!(first.join().unwrap());
+        assert!(!second.join().unwrap());
     }
 
     #[test]
     fn concurrent_patches_apply_in_order() {
         let harness = ready_harness();
+        let initial = wait_snapshot(&harness, |_| true).settings;
+        assert!(!initial.transcript_log);
+        let flipped = !initial.strip_trailing_period;
         let (a_tx, a_rx) = mpsc::sync_channel(1);
         let (b_tx, b_rx) = mpsc::sync_channel(1);
         harness
@@ -6029,7 +6070,7 @@ mod tests {
             .tx
             .send(ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
-                    hotkey: Some("Alt+A".into()),
+                    transcript_log: Some(true),
                     ..SettingsPatch::default()
                 },
                 reply: a_tx,
@@ -6040,20 +6081,25 @@ mod tests {
             .tx
             .send(ControllerCmd::ApplySettings {
                 patch: SettingsPatch {
-                    hotkey: Some("Alt+B".into()),
+                    strip_trailing_period: Some(flipped),
                     ..SettingsPatch::default()
                 },
                 reply: b_tx,
             })
             .unwrap();
-        assert!(a_rx.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
-        assert!(b_rx.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
-        assert_eq!(
-            wait_snapshot(&harness, |snapshot| snapshot.settings.hotkey == "Alt+B")
-                .settings
-                .hotkey,
-            "Alt+B"
+        let a = a_rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        assert!(a.transcript_log);
+        assert_ne!(
+            a.strip_trailing_period, flipped,
+            "the second patch ran first"
         );
+        // The second reply already carries the first patch: they applied in send order.
+        let b = b_rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+        assert!(b.transcript_log);
+        assert_eq!(b.strip_trailing_period, flipped);
+        wait_snapshot(&harness, |snapshot| {
+            snapshot.settings.transcript_log && snapshot.settings.strip_trailing_period == flipped
+        });
     }
 
     fn capture_harness(enabled: bool, capable: bool) -> LifecycleHarness {
@@ -6151,6 +6197,7 @@ mod tests {
         for (key, chord) in [
             (HotkeyKey::Long, "  alt+SPACE  "),
             (HotkeyKey::Standard, "  alt+SHIFT+space  "),
+            (HotkeyKey::Standard, "Shift+Alt+Space"),
         ] {
             let mut h = capture_harness(true, true);
             begin_capture(&mut h, key).unwrap();

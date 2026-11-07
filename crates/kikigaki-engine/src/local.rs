@@ -137,7 +137,7 @@ impl LocalEngine {
                             cmds,
                             worker_events,
                             worker_sink,
-                            vad.max_speech_s,
+                            vad,
                             move || {
                                 build_vad(&vad_models_dir, &vad_config)
                                     .map(|detector| Box::new(detector) as Box<dyn Vad>)
@@ -230,7 +230,7 @@ fn run_with_loaders<V, A>(
     cmds: Receiver<EngineCmd>,
     events: EventSender,
     sink: AudioSink,
-    max_speech_s: f32,
+    vad_config: VadConfig,
     mut make_vad: V,
     mut make_asr: A,
 ) -> anyhow::Result<()>
@@ -249,7 +249,7 @@ where
         .context("send local-engine ready")?;
     let rebuild_vad =
         Box::new(move || make_vad().map_err(|error| model_load_error(VAD_MODEL_ID, error)));
-    run_local_worker(cmds, events, sink, vad, asr, max_speech_s, rebuild_vad)
+    run_local_worker(cmds, events, sink, vad, asr, &vad_config, rebuild_vad)
 }
 
 #[derive(Debug)]
@@ -296,12 +296,16 @@ pub fn run_local_worker(
     sink: AudioSink,
     mut vad: Box<dyn Vad>,
     mut asr: Box<dyn Recognizer>,
-    max_speech_s: f32,
+    vad_config: &VadConfig,
     mut make_vad: Box<dyn FnMut() -> anyhow::Result<Box<dyn Vad>>>,
 ) -> anyhow::Result<()> {
     let mut framer = Framer::new(512);
-    let mut history = AudioHistory::new(max_speech_s);
+    let mut history = AudioHistory::new(vad_config.max_speech_s);
+    let min_real_samples = usize::try_from(vad_config.min_speech_ms.saturating_mul(16))
+        .context("minimum speech sample count exceeds address space")?;
     let mut last_segment_end = 0;
+    // Samples received since Begin; unlike `history`, this includes the framer's carry.
+    let mut received_samples = 0usize;
     let mut current = None;
 
     while let Ok(command) = cmds.recv() {
@@ -313,8 +317,10 @@ pub fn run_local_worker(
                 current = Some(gen);
                 history.clear();
                 last_segment_end = 0;
+                received_samples = 0;
             }
             EngineCmd::Audio(samples) if current.is_some() => {
+                received_samples = received_samples.saturating_add(samples.len());
                 framer.push(&samples, |frame| {
                     accept_frame(&mut history, vad.as_mut(), frame)
                 });
@@ -324,6 +330,7 @@ pub fn run_local_worker(
                     asr.as_mut(),
                     &history,
                     &mut last_segment_end,
+                    None,
                 )?;
                 let gen = current.expect("active generation checked above");
                 for segment in segments {
@@ -363,6 +370,10 @@ pub fn run_local_worker(
                     asr.as_mut(),
                     &history,
                     &mut last_segment_end,
+                    Some(RealAudioEnd {
+                        end: received_samples,
+                        min_samples: min_real_samples,
+                    }),
                 )?;
                 let asr_end_at = Instant::now();
                 let segment_count = segments.len();
@@ -393,6 +404,7 @@ pub fn run_local_worker(
                 current = None;
                 history.clear();
                 last_segment_end = 0;
+                received_samples = 0;
             }
             EngineCmd::End { .. } => {
                 tracing::debug!("ignoring stale local-engine end command");
@@ -403,12 +415,21 @@ pub fn run_local_worker(
                 reset_or_rebuild(&mut vad, make_vad.as_mut())?;
                 history.clear();
                 last_segment_end = 0;
+                received_samples = 0;
                 let _ = sink.take_dropped();
             }
             EngineCmd::Shutdown => return Ok(()),
         }
     }
     Ok(())
+}
+
+/// Where real audio ends in the detector stream once the End silence pad has been appended.
+struct RealAudioEnd {
+    end: usize,
+    /// Segments with fewer real (pre-pad) samples than this are dropped undecoded: the decoder
+    /// hallucinates short words (はい, あっ) on a segment that is mostly the silence pad.
+    min_samples: usize,
 }
 
 struct DecodedSegment {
@@ -422,10 +443,20 @@ fn drain_and_transcribe(
     asr: &mut dyn Recognizer,
     history: &AudioHistory,
     last_segment_end: &mut usize,
+    real_audio_end: Option<RealAudioEnd>,
 ) -> anyhow::Result<Vec<DecodedSegment>> {
     let mut decoded = Vec::new();
     for segment in vad.drain()? {
         let segment_ms = segment.samples.len() as f64 / 16.0;
+        if let Some(real) = &real_audio_end {
+            let segment_end = segment.start.saturating_add(segment.samples.len());
+            let real_samples = segment_end.min(real.end).saturating_sub(segment.start);
+            if real_samples < real.min_samples {
+                let real_ms = real_samples as f64 / 16.0;
+                tracing::debug!(segment_ms, real_ms, "dropping pad-dominated end segment");
+                continue;
+            }
+        }
         let want_start = segment
             .start
             .saturating_sub(PREROLL_SAMPLES)
@@ -625,9 +656,10 @@ mod tests {
         }
 
         fn flush(&mut self) {
+            // A trailing segment over all real audio, so the End filter keeps it.
             self.inner.pending.push(VadSegment {
-                start: self.inner.accepted * 512,
-                samples: vec![0.0; 512],
+                start: 0,
+                samples: vec![0.0; self.inner.accepted * 512],
             });
         }
 
@@ -657,11 +689,97 @@ mod tests {
             sink,
             Box::new(vad),
             Box::new(CapturingRecognizer(Arc::clone(&captured))),
-            12.0,
+            &kikigaki_core::config::VadConfig::default(),
             Box::new(|| Ok(Box::new(FakeVad::new(1, Arc::new(AtomicBool::new(false)))))),
         )
         .unwrap();
         Arc::try_unwrap(captured).unwrap().into_inner().unwrap()
+    }
+
+    struct EndVad(OffsetVad);
+
+    impl Vad for EndVad {
+        fn accept(&mut self, _frame: &[f32]) {}
+        fn flush(&mut self) {
+            self.0.wait_for_reset = false;
+        }
+        fn reset(&mut self) -> anyhow::Result<()> {
+            self.0.pending.clear();
+            Ok(())
+        }
+        fn drain(&mut self) -> anyhow::Result<Vec<VadSegment>> {
+            self.0.drain()
+        }
+    }
+
+    fn end_segments(ranges: &[(usize, usize)], audio_end: usize, expected_calls: usize) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let events = run_with_fakes(
+            Box::new(EndVad(OffsetVad {
+                pending: ranges
+                    .iter()
+                    .map(|&(start, len)| VadSegment {
+                        start,
+                        samples: vec![0.5; len],
+                    })
+                    .collect(),
+                wait_for_reset: true,
+            })),
+            Box::new(CapturingRecognizer(Arc::clone(&captured))),
+            [
+                EngineCmd::Begin { gen: 1 },
+                EngineCmd::Audio(vec![0.5; audio_end]),
+                EngineCmd::End {
+                    gen: 1,
+                    pad_ms: 500,
+                },
+            ],
+        );
+        assert_eq!(captured.lock().unwrap().len(), expected_calls);
+        assert_eq!(
+            final_text_and_gen(&events),
+            (1, "seg".repeat(expected_calls))
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn end_drops_segment_with_only_100_ms_real_audio() {
+        end_segments(&[(14_400, 8_000)], 16_000, 0);
+    }
+
+    #[test]
+    fn end_keeps_segment_with_250_ms_real_audio_including_framer_carry() {
+        // 16,000 is not frame aligned: the last 128 real samples remain in the framer.
+        end_segments(&[(12_000, 8_000)], 16_000, 1);
+    }
+
+    #[test]
+    fn end_keeps_segment_fully_before_audio_end() {
+        end_segments(&[(8_000, 4_000)], 16_000, 1);
+    }
+
+    #[test]
+    fn end_keeps_only_real_segment_before_pad_dominated_segment() {
+        end_segments(&[(8_000, 4_000), (14_400, 8_000)], 16_000, 1);
+    }
+
+    #[test]
+    fn mid_utterance_keeps_150_ms_segment() {
+        let captured = captured_segments(
+            OffsetVad {
+                pending: vec![VadSegment {
+                    start: 8_000,
+                    samples: vec![0.5; 2_400],
+                }],
+                wait_for_reset: false,
+            },
+            [
+                EngineCmd::Begin { gen: 1 },
+                EngineCmd::Audio(vec![0.5; 16_000]),
+            ],
+        );
+        assert_eq!(captured.len(), 1);
     }
 
     #[test]
@@ -731,7 +849,14 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut recognizer = CapturingRecognizer(Arc::clone(&captured));
         let mut last_segment_end = 0;
-        drain_and_transcribe(&mut vad, &mut recognizer, &history, &mut last_segment_end).unwrap();
+        drain_and_transcribe(
+            &mut vad,
+            &mut recognizer,
+            &history,
+            &mut last_segment_end,
+            None,
+        )
+        .unwrap();
         let captured = captured.lock().unwrap();
 
         assert_eq!(captured[0].len(), 6_400 + segment_samples.len());
@@ -819,7 +944,7 @@ mod tests {
             sink,
             Box::new(FakeVad::new(every, fail_reset)),
             Box::new(FakeRecognizer),
-            12.0,
+            &kikigaki_core::config::VadConfig::default(),
             Box::new(move || {
                 factory_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(FakeVad::new(
@@ -849,7 +974,7 @@ mod tests {
             sink,
             vad,
             recognizer,
-            12.0,
+            &kikigaki_core::config::VadConfig::default(),
             Box::new(|| Ok(Box::new(FakeVad::new(1, Arc::new(AtomicBool::new(false)))))),
         )
         .unwrap();
@@ -906,12 +1031,13 @@ mod tests {
     fn end_final_contains_only_trailing_segments() {
         let events = run_with_fakes(
             Box::new(FlushVad {
-                inner: FakeVad::new(1, Arc::new(AtomicBool::new(false))),
+                inner: FakeVad::new(16, Arc::new(AtomicBool::new(false))),
             }),
             Box::new(FakeRecognizer),
             [
                 EngineCmd::Begin { gen: 1 },
-                EngineCmd::Audio(vec![0.5; 512]),
+                // 512 ms of real audio, well above the End filter's min_speech_ms.
+                EngineCmd::Audio(vec![0.5; 16 * 512]),
                 EngineCmd::End { gen: 1, pad_ms: 0 },
             ],
         );
@@ -1019,8 +1145,14 @@ mod tests {
                 &events_tx,
                 &done_tx,
                 AssertUnwindSafe(|| {
-                    let result =
-                        run_with_loaders(cmds, worker_events, sink, 12.0, make_vad, make_asr);
+                    let result = run_with_loaders(
+                        cmds,
+                        worker_events,
+                        sink,
+                        kikigaki_core::config::VadConfig::default(),
+                        make_vad,
+                        make_asr,
+                    );
                     report_model_load_failure(&events_tx, result)
                 }),
             );

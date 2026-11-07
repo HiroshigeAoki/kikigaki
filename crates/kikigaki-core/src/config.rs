@@ -428,8 +428,7 @@ impl Config {
     pub fn engine_punctuates(&self, engine: EngineKind) -> bool {
         match engine {
             EngineKind::Remote => self.remote.server_punctuates,
-            EngineKind::Whisper => false,
-            EngineKind::Local => false,
+            EngineKind::Local | EngineKind::Whisper => false,
         }
     }
 

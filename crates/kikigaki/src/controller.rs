@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use kikigaki_core::config::{chords_match, postprocess_settings, Capabilities, Config, EngineKind};
-use kikigaki_core::engine::{Engine, EngineCmd, EngineMsg, EnginePhase, EngineSupervisor, Waker};
-use kikigaki_core::metrics;
+use kikigaki_core::engine::{
+    AudioSink, Engine, EngineCmd, EngineMsg, EnginePhase, EngineSupervisor, Waker,
+};
+use kikigaki_core::metrics::{self, Routing};
 use kikigaki_core::postprocess::{to_protocol_final, PostprocessWorker};
 use kikigaki_core::protocol::{Event, SAMPLE_RATE};
 use kikigaki_core::session::{Input, Output, Session, SessionConfig, State};
@@ -446,10 +448,50 @@ fn run(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct Owner {
     key: HotkeyKey,
     engine: EngineKind,
+    shadow: Option<ShadowState>,
+    // Retained after a recording-time shadow failure until the standard End final arrives.
+    held: Vec<EngineMsg>,
+    merge_standard: bool,
+    fallback: Option<EngineMsg>,
+    routed: Routing,
+    result_submitted: bool,
+}
+
+impl Owner {
+    fn new(key: HotkeyKey, engine: EngineKind) -> Self {
+        Self {
+            key,
+            engine,
+            shadow: None,
+            held: Vec::new(),
+            merge_standard: false,
+            fallback: None,
+            routed: Routing::Standard,
+            result_submitted: false,
+        }
+    }
+
+    fn uses_long(&self) -> bool {
+        self.engine == EngineKind::Whisper || self.shadow.is_some()
+    }
+
+    fn held_finals(&mut self) -> &mut Vec<EngineMsg> {
+        match &mut self.shadow {
+            Some(shadow) => &mut shadow.held,
+            None => &mut self.held,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ShadowState {
+    started_at: Instant,
+    held: Vec<EngineMsg>,
+    promoted: bool,
 }
 
 const LONG_HOTKEY_INVALID_NOTICE: &str = "長文キーのホットキーが無効 — 再設定してください";
@@ -684,11 +726,24 @@ impl Controller {
     }
 
     fn cancel_generation(&mut self, gen: u64, engine: EngineKind) {
+        if self
+            .owners
+            .get(&gen)
+            .is_some_and(|owner| owner.shadow.is_some())
+        {
+            self.cancel_on(gen, self.standard_engine);
+            self.cancel_on(gen, EngineKind::Whisper);
+        } else {
+            self.cancel_on(gen, engine);
+        }
+        self.retire_generation(gen);
+    }
+
+    fn cancel_on(&self, gen: u64, engine: EngineKind) {
         if let Some(supervisor) = self.supervisor_for(engine) {
             supervisor.cancel(gen);
             send_command(supervisor, EngineCmd::Cancel { gen });
         }
-        self.retire_generation(gen);
     }
 
     fn handle_command(&mut self, command: ControllerCmd) {
@@ -955,12 +1010,12 @@ impl Controller {
             HotkeyEdge::Pressed(key) => (key, true),
             HotkeyEdge::Released(key) => (key, false),
         };
-        let active_owner = self.active.and_then(|gen| self.owners.get(&gen)).copied();
+        let active_owner = self.active.and_then(|gen| self.owners.get(&gen));
         if !pressed && active_owner.is_none_or(|owner| owner.key != key) {
             return;
         }
         let mut notice = None;
-        let engine = if !pressed {
+        let mut engine = if !pressed {
             active_owner.unwrap().engine
         } else if self.session.state() == State::Disconnected
             || key == HotkeyKey::Standard
@@ -985,17 +1040,45 @@ impl Controller {
         else {
             return;
         };
+        let now = self.clock.now();
+        if !pressed && self.session.state() == State::Recording {
+            let owner = self.owners.get_mut(&self.active.unwrap()).unwrap();
+            if let Some(shadow) = &mut owner.shadow {
+                if now.saturating_duration_since(shadow.started_at)
+                    > Duration::from_millis(self.settings.config().auto_long_ms)
+                {
+                    shadow.promoted = true;
+                    owner.engine = EngineKind::Whisper;
+                    owner.routed = Routing::AutoLong;
+                    engine = EngineKind::Whisper;
+                }
+            }
+        }
+        let input = if pressed {
+            input
+        } else {
+            Input::Released { engine }
+        };
         self.dirty = true;
         if pressed && self.long_notice.as_deref().is_some_and(is_fallback_notice) {
             self.long_notice = self.long_notice_under_fallback.take();
         }
-        let edge_outputs = self.session.handle(input, self.clock.now());
+        let edge_outputs = self.session.handle(input, now);
         // Bind each edge's Begin before another edge or engine message can be handled.
         for output in &edge_outputs {
             match output {
                 Output::Cancel { gen } => self.retire_generation(*gen),
                 Output::Begin { gen } => {
-                    self.owners.insert(*gen, Owner { key, engine });
+                    let mut owner = Owner::new(key, engine);
+                    if key == HotkeyKey::Standard && self.can_shadow() {
+                        owner.shadow = Some(ShadowState {
+                            started_at: now,
+                            held: Vec::new(),
+                            promoted: false,
+                        });
+                        owner.merge_standard = true;
+                    }
+                    self.owners.insert(*gen, owner);
                     if let Some(notice) = notice.take() {
                         self.pending_notices.insert(*gen, notice);
                     }
@@ -1005,6 +1088,20 @@ impl Controller {
             }
         }
         outputs.extend(edge_outputs);
+    }
+
+    fn can_shadow(&self) -> bool {
+        self.settings.config().auto_long_ms > 0
+            && self.standard_engine == EngineKind::Local
+            && !self.long_disable_pending
+            && self
+                .long
+                .as_ref()
+                .is_some_and(|long| matches!(long.state, LongState::Ready))
+            && !self
+                .owners
+                .iter()
+                .any(|(gen, owner)| !self.retired.contains(gen) && owner.uses_long())
     }
 
     fn generation_is_in_progress(&self, gen: u64) -> bool {
@@ -1036,6 +1133,14 @@ impl Controller {
         )
     }
 
+    fn result_engine(&self, gen: u64) -> EngineKind {
+        if self.owner_routed(gen) == Routing::AutoLongFallback {
+            self.standard_engine
+        } else {
+            self.owner_engine(gen)
+        }
+    }
+
     fn supervisor_for(&self, engine: EngineKind) -> Option<&EngineSupervisor> {
         if engine == EngineKind::Whisper {
             self.long.as_ref().and_then(|long| long.supervisor.as_ref())
@@ -1044,24 +1149,50 @@ impl Controller {
         }
     }
 
-    fn submit_final(&self, engine: EngineKind, message: EngineMsg) {
-        let EngineMsg::Final { gen, .. } = &message else {
+    fn submit_final(&mut self, engine: EngineKind, mut message: EngineMsg) {
+        let EngineMsg::Final { gen, ref text, .. } = message else {
             return;
         };
-        let gen = *gen;
+        let empty = text.trim().is_empty();
         let Some(owner) = self
             .owners
-            .get(&gen)
-            .filter(|owner| owner.engine == engine && !self.retired.contains(&gen))
+            .get_mut(&gen)
+            .filter(|owner| !self.retired.contains(&gen) && !owner.result_submitted)
         else {
-            tracing::debug!(gen, ?engine, "dropping final without a live matching owner");
+            tracing::debug!(gen, ?engine, "dropping final without a live owner");
             return;
         };
+        if engine == self.standard_engine && owner.merge_standard {
+            if self.active == Some(gen) && self.session.state() == State::Recording {
+                owner.held_finals().push(message);
+                return;
+            }
+            if owner.routed == Routing::AutoLong {
+                owner.fallback = Some(message);
+                return;
+            }
+            merge_held_finals(owner.held_finals(), &mut message);
+            owner.result_submitted = true;
+        } else if engine == EngineKind::Whisper && owner.shadow.is_some() {
+            if owner.routed != Routing::AutoLong {
+                return;
+            }
+            if empty {
+                self.use_standard_fallback(gen);
+                return;
+            }
+            owner.result_submitted = true;
+            owner.held_finals().clear();
+            owner.fallback = None;
+        } else if owner.engine != engine {
+            tracing::debug!(gen, ?engine, "dropping final from non-owner engine");
+            return;
+        }
         if let Some(worker) = &self.postprocess {
             let result = worker.submit(
                 gen,
                 message,
-                postprocess_settings(self.settings.config(), self.capabilities, owner.engine),
+                postprocess_settings(self.settings.config(), self.capabilities, engine),
             );
             if let Err(error) = result {
                 tracing::error!(%error, "submit configured final for post-processing");
@@ -1071,12 +1202,49 @@ impl Controller {
         }
     }
 
+    fn use_standard_fallback(&mut self, gen: u64) {
+        let Some(owner) = self
+            .owners
+            .get_mut(&gen)
+            .filter(|owner| !owner.result_submitted)
+        else {
+            return;
+        };
+        owner.routed = Routing::AutoLongFallback;
+        let fallback = owner.fallback.take();
+        if let Some(message) = fallback {
+            self.submit_final(self.standard_engine, message);
+        }
+    }
+
+    fn drop_active_shadow(&mut self) {
+        let Some(owner) = self.active.and_then(|gen| self.owners.get_mut(&gen)) else {
+            return;
+        };
+        if let Some(shadow) = owner.shadow.take() {
+            owner.held = shadow.held;
+        }
+    }
+
+    fn owner_routed(&self, gen: u64) -> Routing {
+        self.owners
+            .get(&gen)
+            .map_or(Routing::Standard, |owner| owner.routed)
+    }
+
     fn standard_disconnected(&mut self, outputs: &mut Vec<Output>) {
         if self.active_engine_is_whisper() {
             self.standard_disconnect_pending = true;
             return;
         }
         if let Some(gen) = self.active {
+            if self
+                .owners
+                .get(&gen)
+                .is_some_and(|owner| owner.shadow.is_some())
+            {
+                self.cancel_on(gen, EngineKind::Whisper);
+            }
             self.retire_generation(gen);
         }
         outputs.extend(
@@ -1369,6 +1537,7 @@ impl Controller {
     }
 
     fn disable_long(&mut self) {
+        self.drop_active_shadow();
         if self.long_hotkey_registered {
             self.unregister_long_hotkey();
             self.long_hotkey_registered = false;
@@ -1532,13 +1701,25 @@ impl Controller {
                     reason,
                     failed_model,
                 } => {
-                    if self.active_engine_is_whisper() {
+                    let promoted = self
+                        .active
+                        .and_then(|gen| self.owners.get(&gen))
+                        .is_some_and(|owner| {
+                            owner.shadow.as_ref().is_some_and(|shadow| shadow.promoted)
+                        });
+                    if promoted {
+                        let gen = self.active.unwrap();
+                        self.cancel_on(gen, EngineKind::Whisper);
+                        self.use_standard_fallback(gen);
+                        self.fail_long_load(reason, failed_model, Some(LONG_FAILED_NOTICE.into()));
+                    } else if self.active_engine_is_whisper() {
                         let gen = self.active.unwrap();
                         outputs.extend(self.session.handle(Input::Abort { gen }, self.clock.now()));
                         // Retirement removes the supervisor; deliver cancellation before moving it.
                         self.cancel_generation(gen, EngineKind::Whisper);
                         self.fail_long_load(reason, failed_model, Some(LONG_FAILED_NOTICE.into()));
                     } else {
+                        self.drop_active_shadow();
                         self.fail_long_load(reason, failed_model, None);
                     }
                     // Retire the entire supervisor before another poll can shut it down inline.
@@ -1767,14 +1948,34 @@ impl Controller {
             match output {
                 Output::Begin { gen } => {
                     mic_gen = Some(gen);
-                    if let Some(supervisor) = self.supervisor_for(self.owner_engine(gen)) {
+                    if self
+                        .owners
+                        .get(&gen)
+                        .is_some_and(|owner| owner.shadow.is_some())
+                    {
+                        for engine in [self.standard_engine, EngineKind::Whisper] {
+                            if let Some(supervisor) = self.supervisor_for(engine) {
+                                send_command(supervisor, EngineCmd::Begin { gen });
+                            }
+                        }
+                    } else if let Some(supervisor) = self.supervisor_for(self.owner_engine(gen)) {
                         send_command(supervisor, EngineCmd::Begin { gen });
                     }
                 }
                 Output::StartMic => {
-                    let sink = mic_gen
-                        .and_then(|gen| self.supervisor_for(self.owner_engine(gen)))
-                        .and_then(EngineSupervisor::sink);
+                    let sink = mic_gen.and_then(|gen| {
+                        if self
+                            .owners
+                            .get(&gen)
+                            .is_some_and(|owner| owner.shadow.is_some())
+                        {
+                            let primary = self.supervisor_for(self.standard_engine)?.sink()?;
+                            let mirror = self.supervisor_for(EngineKind::Whisper)?.sink()?;
+                            Some(AudioSink::mirrored(primary, mirror))
+                        } else {
+                            self.supervisor_for(self.owner_engine(gen))?.sink()
+                        }
+                    });
                     if let Some(sink) = sink {
                         let permission_denied = microphone_permission_denied();
                         let standard_failed = matches!(
@@ -1802,7 +2003,22 @@ impl Controller {
                 }
                 Output::StopMic => self.mic.stop(),
                 Output::EndUtterance { gen, pad_ms } => {
-                    if let Some(supervisor) = self.supervisor_for(self.owner_engine(gen)) {
+                    if let Some(shadow) = self
+                        .owners
+                        .get(&gen)
+                        .and_then(|owner| owner.shadow.as_ref())
+                    {
+                        if shadow.promoted {
+                            if let Some(supervisor) = self.supervisor_for(EngineKind::Whisper) {
+                                send_command(supervisor, EngineCmd::End { gen, pad_ms });
+                            }
+                        } else {
+                            self.cancel_on(gen, EngineKind::Whisper);
+                        }
+                        if let Some(supervisor) = self.supervisor_for(self.standard_engine) {
+                            send_command(supervisor, EngineCmd::End { gen, pad_ms });
+                        }
+                    } else if let Some(supervisor) = self.supervisor_for(self.owner_engine(gen)) {
                         send_command(supervisor, EngineCmd::End { gen, pad_ms });
                     }
                 }
@@ -1836,7 +2052,8 @@ impl Controller {
                                 crate::transcript::enqueue(
                                     self.settings.config().transcript_log,
                                     self.settings.config().transcript_dir.clone(),
-                                    self.owner_engine(gen).as_str(),
+                                    self.result_engine(gen).as_str(),
+                                    self.owner_routed(gen).as_str(),
                                     raw.clone(),
                                     text.clone(),
                                     at,
@@ -1877,7 +2094,16 @@ impl Controller {
                 }
                 Output::Record(mut row) => {
                     row.ts = metric_timestamp();
-                    row.engine = Some(self.owner_engine(row.gen).as_str().into());
+                    row.engine = Some(self.result_engine(row.gen).as_str().into());
+                    row.routed = Some(self.owner_routed(row.gen));
+                    if row.timeout
+                        && self
+                            .owners
+                            .get(&row.gen)
+                            .is_some_and(|owner| owner.shadow.is_some())
+                    {
+                        self.cancel_generation(row.gen, self.owner_engine(row.gen));
+                    }
                     if !self.generation_is_in_progress(row.gen) {
                         if row.final_to_paste_ms.is_none() && !row.timeout && !row.paste_failed {
                             self.complete_notice(row.gen);
@@ -2089,6 +2315,31 @@ fn percent(done: u64, total: u64) -> u8 {
 fn progress_message(id: &str, done_bytes: u64, total_bytes: u64) -> String {
     let percent = percent(done_bytes, total_bytes);
     format!("Downloading {id} … {percent}%")
+}
+
+fn merge_held_finals(held: &mut Vec<EngineMsg>, end: &mut EngineMsg) {
+    let EngineMsg::Final {
+        text,
+        dropped_chunks,
+        ..
+    } = end
+    else {
+        return;
+    };
+    let mut merged = String::new();
+    for message in held.drain(..) {
+        if let EngineMsg::Final {
+            text,
+            dropped_chunks: dropped,
+            ..
+        } = message
+        {
+            merged.push_str(&text);
+            *dropped_chunks = dropped_chunks.saturating_add(dropped);
+        }
+    }
+    merged.push_str(text);
+    *text = merged;
 }
 
 fn state_name(state: State) -> &'static str {
@@ -2936,7 +3187,7 @@ mod tests {
             let path = temp.path().join("config.toml");
             let replace_file = temp.path().join("replace.toml");
             std::fs::write(&replace_file, "").unwrap();
-            std::fs::write(&path, format!("long_key = {enabled}\nreplace_file = {:?}\nmetrics_path = {:?}\ntranscript_dir = {:?}\nlearned_file = {:?}\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"), temp.path().join("transcripts"), temp.path().join("learned.toml"))).unwrap();
+            std::fs::write(&path, format!("long_key = {enabled}\nauto_long_ms = 0\nreplace_file = {:?}\nmetrics_path = {:?}\ntranscript_dir = {:?}\nlearned_file = {:?}\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"), temp.path().join("transcripts"), temp.path().join("learned.toml"))).unwrap();
             let capabilities = Capabilities {
                 punct: true,
                 remote_engine: true,
@@ -3098,6 +3349,496 @@ mod tests {
 
     mod routing_tests {
         use super::*;
+
+        mod auto_routing_tests {
+            use super::*;
+
+            fn auto_config(h: &mut LifecycleHarness, ms: u64) {
+                let path = h._temp.path().join("config.toml");
+                let mut table: toml::Table =
+                    toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                table.insert("auto_long_ms".into(), toml::Value::Integer(ms as i64));
+                std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+                h.controller.settings =
+                    SettingsCoordinator::load(path, h.controller.capabilities).unwrap();
+            }
+
+            fn ready_auto(ms: u64) -> (LifecycleHarness, Receiver<()>) {
+                let (mut h, rx) = ready();
+                auto_config(&mut h, ms);
+                h.controller
+                    .apply_settings(SettingsPatch {
+                        transcript_log: Some(true),
+                        ..SettingsPatch::default()
+                    })
+                    .unwrap();
+                (h, rx)
+            }
+
+            fn finish(
+                h: &mut LifecycleHarness,
+                _rx: &Receiver<()>,
+                kind: EngineKind,
+                gen: u64,
+                text: &str,
+            ) {
+                let before = rows(h).len();
+                h.engine(kind).send(final_message(gen, text));
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    h.turn();
+                    if rows(h).len() > before {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "final was not processed");
+                    thread::yield_now();
+                }
+            }
+
+            fn await_idle(h: &mut LifecycleHarness) {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while h.controller.session.state() != State::Idle {
+                    h.turn();
+                    assert!(Instant::now() < deadline, "fallback did not complete");
+                    thread::yield_now();
+                }
+            }
+
+            fn press(h: &mut LifecycleHarness) -> Instant {
+                let at = Instant::now();
+                h.controller.clock = Box::new(FakeClock(Some(at)));
+                edges(h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);
+                at
+            }
+
+            fn release(h: &mut LifecycleHarness, press: Instant, ms: u64) {
+                h.controller.clock = Box::new(FakeClock(Some(press + Duration::from_millis(ms))));
+                edges(h, [HotkeyEdge::Released(HotkeyKey::Standard)]);
+            }
+
+            fn held(h: &mut LifecycleHarness, text: &str) {
+                h.engine(EngineKind::Local).send(final_message(1, text));
+                h.turn();
+                assert_no_submission(h);
+                assert!(h.pastes.attempts.lock().unwrap().is_empty());
+            }
+
+            fn metadata(h: &LifecycleHarness, engine: &str, routed: &str, raw: &str) {
+                let metrics = rows(h);
+                assert_eq!(metrics.len(), 1);
+                assert_eq!(metrics[0]["engine"], engine);
+                assert_eq!(metrics[0]["routed"], routed);
+                let logs = transcripts(h);
+                assert_eq!(logs[0]["engine"], engine);
+                assert_eq!(logs[0]["routed"], routed);
+                assert_eq!(logs[0]["raw"], raw);
+                assert!(h.controller.owners.is_empty());
+                assert!(h.controller.active.is_none());
+            }
+
+            #[test]
+            fn promoted_timeout_cancels_both_and_never_uses_the_held_fallback() {
+                let (mut h, _) = ready_auto(6000);
+                let at = press(&mut h);
+                held(&mut h, "segment");
+                release(&mut h, at, 8000);
+                h.engine(EngineKind::Local).send(final_message(1, "end"));
+                h.turn();
+                assert_no_submission(&mut h);
+                let outputs = h
+                    .controller
+                    .session
+                    .handle(Input::Tick, at + Duration::from_millis(14999));
+                assert!(
+                    outputs.is_empty(),
+                    "promotion must scale the Whisper deadline"
+                );
+                let outputs = h
+                    .controller
+                    .session
+                    .handle(Input::Tick, at + Duration::from_secs(15));
+                h.controller.execute_outputs(outputs);
+                assert_eq!(h.controller.session.state(), State::Idle);
+                assert_eq!(rows(&h)[0]["timeout"], true);
+                assert_eq!(rows(&h)[0]["routed"], "auto_long");
+                assert!(h.pastes.attempts.lock().unwrap().is_empty());
+                for kind in [EngineKind::Local, EngineKind::Whisper] {
+                    assert!(commands(&h, kind).contains(&EngineCmd::Cancel { gen: 1 }));
+                    h.engine(kind).send(final_message(1, "late"));
+                }
+                h.turn();
+                assert_no_submission(&mut h);
+            }
+
+            #[test]
+            fn promoted_final_and_fallback_use_per_engine_punctuation_once() {
+                use crate::settings::PunctSetting;
+                for (choice, standard, whisper) in [
+                    (PunctSetting::Off, "甲、乙", "甲乙"),
+                    (PunctSetting::On, "甲、乙。", "甲乙。"),
+                    (PunctSetting::OnStrip, "甲、乙", "甲乙"),
+                ] {
+                    for fallback in [false, true] {
+                        let (mut h, rx) = ready_auto(6000);
+                        h.controller
+                            .apply_settings(SettingsPatch {
+                                punctuation: Some(choice),
+                                ..SettingsPatch::default()
+                            })
+                            .unwrap();
+                        let at = press(&mut h);
+                        held(&mut h, "甲、");
+                        release(&mut h, at, 8000);
+                        h.engine(EngineKind::Local).send(final_message(1, "乙"));
+                        h.turn();
+                        assert_no_submission(&mut h);
+                        if fallback {
+                            h.engine(EngineKind::Whisper).send(final_message(1, ""));
+                            await_idle(&mut h);
+                        } else {
+                            finish(&mut h, &rx, EngineKind::Whisper, 1, "甲、乙。");
+                        }
+                        assert_eq!(
+                            *h.pastes.attempts.lock().unwrap(),
+                            [if fallback { standard } else { whisper }]
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn accepted_whisper_final_survives_disconnect_and_rejects_queued_standard() {
+                let (mut h, _) = ready_auto(6000);
+                let at = press(&mut h);
+                release(&mut h, at, 8000);
+                h.engine(EngineKind::Whisper)
+                    .send(final_message(1, "winner"));
+                h.engine(EngineKind::Whisper).send(EngineMsg::Disconnected {
+                    reason: "failed after final".into(),
+                    failed_model: None,
+                });
+                let mut outputs = Vec::new();
+                h.controller.handle_long_events(&mut outputs);
+                h.engine(EngineKind::Local)
+                    .send(final_message(1, "superseded"));
+                h.controller.handle_engine_messages(&mut outputs);
+                h.controller.execute_outputs(outputs);
+                await_idle(&mut h);
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["winner"]);
+                metadata(&h, "whisper", "auto_long", "winner");
+            }
+
+            #[test]
+            fn disable_while_shadow_recording_keeps_held_finals_for_standard_end() {
+                let (mut h, rx) = ready_auto(6000);
+                let at = press(&mut h);
+                held(&mut h, "甲");
+                h.apply(false).unwrap();
+                h.turn();
+                assert!(h.controller.long.is_none());
+                assert!(h.controller.owners[&1].shadow.is_none());
+                held(&mut h, "乙");
+                release(&mut h, at, 8000);
+                finish(&mut h, &rx, EngineKind::Local, 1, "");
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲乙"]);
+                metadata(&h, "local", "standard", "甲乙");
+            }
+
+            #[test]
+            fn standard_disconnect_while_shadow_recording_cancels_the_mirror() {
+                let (mut h, _) = ready_auto(6000);
+                press(&mut h);
+                held(&mut h, "discarded");
+                h.engine(EngineKind::Local).send(EngineMsg::Disconnected {
+                    reason: "standard failed".into(),
+                    failed_model: None,
+                });
+                h.turn();
+                assert_eq!(h.controller.session.state(), State::Disconnected);
+                assert!(commands(&h, EngineKind::Whisper).contains(&EngineCmd::Cancel { gen: 1 }));
+                assert!(h.controller.owners.is_empty());
+            }
+
+            #[test]
+            fn promoted_stored_fallback_survives_both_engines_disconnecting() {
+                let (mut h, _) = ready_auto(6000);
+                let at = press(&mut h);
+                held(&mut h, "甲");
+                release(&mut h, at, 8000);
+                h.engine(EngineKind::Local).send(final_message(1, "乙"));
+                h.engine(EngineKind::Local).send(EngineMsg::Disconnected {
+                    reason: "standard failed".into(),
+                    failed_model: None,
+                });
+                h.engine(EngineKind::Whisper).send(EngineMsg::Disconnected {
+                    reason: "long failed".into(),
+                    failed_model: None,
+                });
+                let mut outputs = Vec::new();
+                h.controller.handle_engine_messages(&mut outputs);
+                h.controller.handle_long_events(&mut outputs);
+                h.controller.execute_outputs(outputs);
+                h.controller.apply_standard_disconnect();
+                assert_eq!(
+                    h.controller.session.state(),
+                    State::Finalizing,
+                    "disconnect must wait for the stored fallback to finish postprocessing"
+                );
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while h.pastes.attempts.lock().unwrap().is_empty() {
+                    h.turn();
+                    assert!(Instant::now() < deadline, "stored fallback was lost");
+                    thread::yield_now();
+                }
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲乙"]);
+                assert_eq!(h.controller.session.state(), State::Disconnected);
+                metadata(&h, "local", "auto_long_fallback", "甲乙");
+            }
+
+            #[test]
+            fn shadow_requires_ready_long_local_standard_and_idle_long() {
+                for case in [
+                    "ready", "loading", "failed", "remote", "busy", "off", "long_key",
+                ] {
+                    let (mut h, _) = ready_auto(if case == "off" { 0 } else { 6000 });
+                    match case {
+                        "loading" => h.controller.long.as_mut().unwrap().state = LongState::Loading,
+                        "failed" => {
+                            h.controller.long.as_mut().unwrap().state = LongState::Failed {
+                                reason: "failed".into(),
+                            }
+                        }
+                        "remote" => h.controller.standard_engine = EngineKind::Remote,
+                        "busy" => {
+                            h.controller
+                                .owners
+                                .insert(42, Owner::new(HotkeyKey::Long, EngineKind::Whisper));
+                        }
+                        _ => {}
+                    }
+                    let key = if case == "long_key" {
+                        HotkeyKey::Long
+                    } else {
+                        HotkeyKey::Standard
+                    };
+                    edges(&mut h, [HotkeyEdge::Pressed(key)]);
+                    let standard = commands(&h, EngineKind::Local);
+                    let long = commands(&h, EngineKind::Whisper);
+                    let mirrored = case == "ready";
+                    assert_eq!(
+                        long.iter()
+                            .any(|cmd| matches!(cmd, EngineCmd::Begin { gen: 1 })),
+                        mirrored || case == "long_key",
+                        "{case}"
+                    );
+                    assert_eq!(
+                        long.iter().any(|cmd| matches!(cmd, EngineCmd::Audio(_))),
+                        mirrored || case == "long_key",
+                        "{case}"
+                    );
+                    assert_eq!(
+                        standard
+                            .iter()
+                            .any(|cmd| matches!(cmd, EngineCmd::Begin { gen: 1 })),
+                        case != "long_key",
+                        "{case}"
+                    );
+                }
+            }
+
+            #[test]
+            fn short_shadowed_utterance_pastes_once_with_held_segments_merged() {
+                for duration in [3000, 6000] {
+                    let (mut h, rx) = ready_auto(6000);
+                    std::fs::write(
+                        &h.controller.settings.config().replace_file,
+                        "[[rule]]\nfrom = [\"甲乙\"]\nto = \"merged\"\n",
+                    )
+                    .unwrap();
+                    let at = press(&mut h);
+                    held(&mut h, "甲");
+                    held(&mut h, "乙");
+                    release(&mut h, at, duration);
+                    assert!(
+                        commands(&h, EngineKind::Whisper).contains(&EngineCmd::Cancel { gen: 1 })
+                    );
+                    finish(&mut h, &rx, EngineKind::Local, 1, "終");
+                    assert_eq!(*h.pastes.attempts.lock().unwrap(), ["merged終"]);
+                    metadata(&h, "local", "standard", "甲乙終");
+                    h.engine(EngineKind::Whisper)
+                        .send(final_message(1, "late mirror"));
+                    h.turn();
+                    assert_no_submission(&mut h);
+                }
+            }
+
+            #[test]
+            fn long_shadowed_utterance_pastes_whisper_only_no_mid_utterance_paste() {
+                let (mut h, rx) = ready_auto(6000);
+                let at = press(&mut h);
+                held(&mut h, "standard segment");
+                release(&mut h, at, 6001);
+                for kind in [EngineKind::Local, EngineKind::Whisper] {
+                    assert!(commands(&h, kind)
+                        .iter()
+                        .any(|cmd| matches!(cmd, EngineCmd::End { gen: 1, .. })));
+                }
+                h.engine(EngineKind::Local)
+                    .send(final_message(1, "standard end"));
+                h.turn();
+                assert_no_submission(&mut h);
+                finish(&mut h, &rx, EngineKind::Whisper, 1, "甲、乙。");
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲乙"]);
+                metadata(&h, "whisper", "auto_long", "甲、乙。");
+                h.engine(EngineKind::Local).send(final_message(1, "late"));
+                h.turn();
+                assert_no_submission(&mut h);
+            }
+
+            #[test]
+            fn promoted_falls_back_to_standard_on_long_disconnect() {
+                for standard_first in [false, true] {
+                    let (mut h, rx) = ready_auto(6000);
+                    let at = press(&mut h);
+                    held(&mut h, "甲、");
+                    release(&mut h, at, 7000);
+                    if standard_first {
+                        h.engine(EngineKind::Local).send(final_message(1, "乙"));
+                        h.turn();
+                        assert_no_submission(&mut h);
+                    }
+                    h.disconnected(None);
+                    if standard_first {
+                        await_idle(&mut h);
+                    } else {
+                        assert_eq!(
+                            h.controller.owners[&1].engine,
+                            EngineKind::Whisper,
+                            "the promoted owner must stay fixed while awaiting its fallback"
+                        );
+                        finish(&mut h, &rx, EngineKind::Local, 1, "乙");
+                    }
+                    assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲、乙"]);
+                    metadata(&h, "local", "auto_long_fallback", "甲、乙");
+                    assert!(h.controller.long.as_ref().unwrap().supervisor.is_none());
+                }
+            }
+
+            #[test]
+            fn promoted_falls_back_to_standard_on_empty_long_final() {
+                for standard_first in [false, true] {
+                    let (mut h, rx) = ready_auto(6000);
+                    let at = press(&mut h);
+                    held(&mut h, "甲、");
+                    release(&mut h, at, 7000);
+                    if standard_first {
+                        h.engine(EngineKind::Local).send(final_message(1, "乙"));
+                        h.turn();
+                        assert_no_submission(&mut h);
+                    }
+                    h.engine(EngineKind::Whisper).send(final_message(1, "  "));
+                    h.turn();
+                    if standard_first {
+                        await_idle(&mut h);
+                    } else {
+                        assert_eq!(
+                            h.controller.owners[&1].engine,
+                            EngineKind::Whisper,
+                            "the promoted owner must stay fixed while awaiting its fallback"
+                        );
+                        finish(&mut h, &rx, EngineKind::Local, 1, "乙");
+                    }
+                    assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲、乙"]);
+                    metadata(&h, "local", "auto_long_fallback", "甲、乙");
+                }
+            }
+
+            #[test]
+            fn long_disconnect_while_recording_drops_shadow_and_stays_standard() {
+                let (mut h, rx) = ready_auto(6000);
+                let at = press(&mut h);
+                held(&mut h, "甲");
+                h.disconnected(None);
+                assert_eq!(h.controller.session.state(), State::Recording);
+                held(&mut h, "乙");
+                release(&mut h, at, 8000);
+                finish(&mut h, &rx, EngineKind::Local, 1, "終");
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲乙終"]);
+                metadata(&h, "local", "standard", "甲乙終");
+            }
+
+            #[test]
+            fn auto_long_zero_disables_and_mid_utterance_pastes_stay_as_today() {
+                let (mut h, rx) = ready_auto(0);
+                let at = press(&mut h);
+                finish(&mut h, &rx, EngineKind::Local, 1, "甲");
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲"]);
+                // The existing logger spawns independent appenders; await this row before the next.
+                assert_eq!(transcripts(&h)[0]["routed"], "standard");
+                release(&mut h, at, 8000);
+                finish(&mut h, &rx, EngineKind::Local, 1, "乙");
+                assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲", "乙"]);
+                assert!(commands(&h, EngineKind::Whisper).is_empty());
+                assert!(rows(&h).iter().all(|row| row["routed"] == "standard"));
+                assert!(transcripts_with_count(&h, 2)
+                    .iter()
+                    .all(|row| row["routed"] == "standard"));
+            }
+
+            #[test]
+            fn long_not_ready_behaves_as_today() {
+                for state in [
+                    LongState::Loading,
+                    LongState::Installing { percent: 50 },
+                    LongState::Failed {
+                        reason: "failed".into(),
+                    },
+                ] {
+                    let (mut h, rx) = ready_auto(6000);
+                    h.controller.long.as_mut().unwrap().state = state;
+                    let at = press(&mut h);
+                    finish(&mut h, &rx, EngineKind::Local, 1, "甲");
+                    assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲"]);
+                    release(&mut h, at, 8000);
+                    finish(&mut h, &rx, EngineKind::Local, 1, "乙");
+                    assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲", "乙"]);
+                    assert!(commands(&h, EngineKind::Whisper).is_empty());
+                    assert!(rows(&h).iter().all(|row| row["routed"] == "standard"));
+                }
+            }
+
+            #[test]
+            fn re_press_during_promoted_finalizing_cancels_both_engines() {
+                for key in [HotkeyKey::Standard, HotkeyKey::Long] {
+                    let (mut h, rx) = ready_auto(6000);
+                    let at = press(&mut h);
+                    release(&mut h, at, 8000);
+                    commands(&h, EngineKind::Local);
+                    commands(&h, EngineKind::Whisper);
+                    edges(&mut h, [HotkeyEdge::Pressed(key)]);
+                    for kind in [EngineKind::Local, EngineKind::Whisper] {
+                        assert!(commands(&h, kind).contains(&EngineCmd::Cancel { gen: 1 }));
+                        assert!(h.engine(kind).canceled.lock().unwrap().contains(&1));
+                        h.engine(kind).send(final_message(1, "canceled"));
+                    }
+                    h.turn();
+                    assert_no_submission(&mut h);
+                    edges(&mut h, [HotkeyEdge::Released(key)]);
+                    finish(
+                        &mut h,
+                        &rx,
+                        if key == HotkeyKey::Long {
+                            EngineKind::Whisper
+                        } else {
+                            EngineKind::Local
+                        },
+                        2,
+                        "new",
+                    );
+                    assert_eq!(*h.pastes.attempts.lock().unwrap(), ["new"]);
+                }
+            }
+        }
 
         const PREPARING: &str = "長文エンジン準備中のため標準で認識しました";
         const STOPPED: &str = "長文エンジンが停止中のため標準で認識しました";
@@ -4069,13 +4810,9 @@ mod tests {
                     (11, EngineKind::Whisper, "甲、乙。"),
                     (12, EngineKind::Local, "甲、乙"),
                 ] {
-                    h.controller.owners.insert(
-                        gen,
-                        Owner {
-                            key: HotkeyKey::Standard,
-                            engine,
-                        },
-                    );
+                    h.controller
+                        .owners
+                        .insert(gen, Owner::new(HotkeyKey::Standard, engine));
                     h.controller.submit_final(engine, final_message(gen, text));
                 }
                 let deadline = Instant::now() + Duration::from_secs(1);

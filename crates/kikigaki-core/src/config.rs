@@ -17,6 +17,9 @@ pub struct Config {
     pub long_key: bool,
     /// Global hotkey for long dictation.
     pub long_hotkey: String,
+    /// Duration threshold in milliseconds for routing standard recordings to resident Whisper.
+    /// Zero disables auto-routing.
+    pub auto_long_ms: u64,
     /// Method used to insert transcribed text.
     pub paste_method: PasteMethod,
     /// Whether one trailing Japanese or ASCII period is removed.
@@ -300,6 +303,7 @@ impl Default for Config {
             hotkey: "Alt+Space".into(),
             long_key: false,
             long_hotkey: "Alt+Shift+Space".into(),
+            auto_long_ms: 6_000,
             paste_method: PasteMethod::Clipboard,
             strip_trailing_period: true,
             silence_pad_ms: 500,
@@ -423,6 +427,9 @@ impl Config {
         }
         if !(1..=5_000).contains(&self.silence_pad_ms) {
             bail!("silence_pad_ms must be in 1..=5000");
+        }
+        if self.auto_long_ms != 0 && !(2_000..=60_000).contains(&self.auto_long_ms) {
+            bail!("auto_long_ms must be 0 or in 2000..=60000");
         }
         if self.final_timeout_ms == 0 {
             bail!("final_timeout_ms must be greater than zero");
@@ -573,6 +580,28 @@ pub fn sidecar_endpoint(ws_url: &str) -> anyhow::Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_long_ms_validation() {
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+        assert_eq!(defaults["auto_long_ms"].as_integer(), Some(6000));
+        for (ms, valid) in [
+            (0, true),
+            (1999, false),
+            (2000, true),
+            (6000, true),
+            (60000, true),
+            (60001, false),
+        ] {
+            let cfg: Config = toml::from_str(&format!("auto_long_ms = {ms}")).unwrap();
+            assert_eq!(cfg.validate(caps).is_ok(), valid, "auto_long_ms = {ms}");
+        }
+    }
 
     #[test]
     fn postprocess_settings_per_engine_matches_shared_punctuation() {

@@ -1983,7 +1983,9 @@ impl Controller {
         if self.status.message() == Some(PASTE_FAILED_NOTICE) {
             return self.status.clone();
         }
-        if let Some(notice) = &self.long_notice {
+        // Standard-side warnings (microphone, hotkey) and install progress affect both keys,
+        // so a long-engine notice only fills an otherwise clear status.
+        if let (Some(notice), Status::Ok) = (&self.long_notice, &self.status) {
             return Status::Warning(notice.clone());
         }
         self.postprocess_degraded.as_ref().map_or_else(
@@ -4015,6 +4017,33 @@ mod tests {
             );
             assert!(h.controller.owners.is_empty());
             assert_eq!(rows(&h)[0]["paste_failed"], true);
+        }
+
+        #[test]
+        fn standard_warnings_and_install_progress_outrank_long_notices() {
+            let (mut h, _) = ready();
+            h.disconnected(None);
+            assert_eq!(
+                h.controller.snapshot().status.message.as_deref(),
+                Some(LONG_FAILED_NOTICE)
+            );
+            for status in [
+                Status::Warning(MICROPHONE_PERMISSION_DENIED.into()),
+                Status::Warning("ホットキーが無効 — 再設定してください".into()),
+                Status::Installing("downloading".into()),
+            ] {
+                h.controller.status = status.clone();
+                assert_eq!(
+                    h.controller.snapshot().status.message.as_deref(),
+                    status.message(),
+                    "{status:?}"
+                );
+            }
+            h.controller.status = Status::Ok;
+            assert_eq!(
+                h.controller.snapshot().status.message.as_deref(),
+                Some(LONG_FAILED_NOTICE)
+            );
         }
 
         #[test]
@@ -6260,9 +6289,10 @@ mod tests {
                         h.controller.long_notice.as_deref(),
                         Some(LONG_HOTKEY_INVALID_NOTICE)
                     );
+                    // The broken standard key outranks the long-key notice.
                     assert_eq!(
                         h.controller.snapshot().status.message.as_deref(),
-                        h.controller.long_notice.as_deref()
+                        h.controller.status.message()
                     );
                 } else {
                     assert!(h.controller.long_notice.is_none());

@@ -32,7 +32,11 @@ impl StartupPlan {
         Self {
             engine: config.engine,
             models_dir: config.models_dir.clone(),
-            required: required(config.engine, caps, punct_effective(config, caps)),
+            required: required(
+                config.engine,
+                caps,
+                punct_effective(config, caps, config.engine),
+            ),
         }
     }
 
@@ -172,7 +176,7 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: false,
+            long_key: false,
         };
 
         assert!(StartupPlan::from_config(&config, caps).required.is_empty());
@@ -197,7 +201,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: true,
+                long_key: false,
             },
             false,
         );
@@ -226,7 +230,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         );
         let (tx, rx) = mpsc::sync_channel(1);

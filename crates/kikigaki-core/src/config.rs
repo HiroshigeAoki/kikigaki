@@ -13,6 +13,10 @@ pub struct Config {
     pub engine: EngineKind,
     /// Push-to-talk global hotkey.
     pub hotkey: String,
+    /// Enable the long dictation key.
+    pub long_key: bool,
+    /// Global hotkey for long dictation.
+    pub long_hotkey: String,
     /// Method used to insert transcribed text.
     pub paste_method: PasteMethod,
     /// Whether one trailing Japanese or ASCII period is removed.
@@ -56,6 +60,17 @@ pub enum EngineKind {
     Remote,
     /// Run Whisper large-v3-turbo in this process via whisper-rs.
     Whisper,
+}
+
+impl EngineKind {
+    /// Returns the serialized snake_case engine name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+            Self::Whisper => "whisper",
+        }
+    }
 }
 
 /// Method used to insert transcribed text into the frontmost application.
@@ -273,8 +288,8 @@ pub struct Capabilities {
     pub punct: bool,
     /// Whether the remote WebSocket engine is available.
     pub remote_engine: bool,
-    /// Whether the Whisper engine (whisper-rs) is compiled into this build.
-    pub whisper: bool,
+    /// Whether the long dictation key is supported on this platform.
+    pub long_key: bool,
 }
 
 impl Default for Config {
@@ -283,6 +298,8 @@ impl Default for Config {
         Self {
             engine: EngineKind::Local,
             hotkey: "Alt+Space".into(),
+            long_key: false,
+            long_hotkey: "Alt+Shift+Space".into(),
             paste_method: PasteMethod::Clipboard,
             strip_trailing_period: true,
             silence_pad_ms: 500,
@@ -302,6 +319,41 @@ impl Default for Config {
             learned_file: home.join(".config/kikigaki/learned.toml"),
         }
     }
+}
+
+/// Compares chords with case-insensitive keys and unordered, aliased modifier sets.
+/// Modifier aliases follow global-hotkey 0.7's parser, including platform-specific CmdOrCtrl.
+pub fn chords_match(a: &str, b: &str) -> bool {
+    fn canonical(chord: &str) -> (Vec<String>, Vec<String>) {
+        let mut modifiers = Vec::new();
+        let mut keys = Vec::new();
+        for part in chord.split('+') {
+            let part = part.trim().to_ascii_lowercase();
+            let modifier = match part.as_str() {
+                "option" | "alt" => Some("alt"),
+                "control" | "ctrl" => Some("ctrl"),
+                "command" | "cmd" | "super" => Some("super"),
+                "shift" => Some("shift"),
+                "commandorcontrol" | "commandorctrl" | "cmdorctrl" | "cmdorcontrol" => {
+                    Some(if cfg!(target_os = "macos") {
+                        "super"
+                    } else {
+                        "ctrl"
+                    })
+                }
+                _ => None,
+            };
+            if let Some(modifier) = modifier {
+                modifiers.push(modifier.to_owned());
+            } else {
+                keys.push(part);
+            }
+        }
+        modifiers.sort_unstable();
+        modifiers.dedup();
+        (modifiers, keys)
+    }
+    canonical(a) == canonical(b)
 }
 
 impl Config {
@@ -333,12 +385,26 @@ impl Config {
                 return Err(error).with_context(|| format!("parse config {}", path.display()));
             }
         };
+        let table: toml::Table = toml::from_str(&contents)
+            .with_context(|| format!("parse config {}", path.display()))?;
+        if config.engine == EngineKind::Whisper {
+            config.engine = EngineKind::Local;
+            if !table.contains_key("long_key") {
+                config.long_key = true;
+            }
+        }
+        if !table.contains_key("long_hotkey") && chords_match(&config.hotkey, &config.long_hotkey) {
+            config.long_hotkey = "Ctrl+Alt+Space".into();
+        }
         config.expand_paths();
         Ok(config)
     }
 
     /// Validates configuration values against supported ranges and capabilities.
     pub fn validate(&self, caps: Capabilities) -> anyhow::Result<()> {
+        if chords_match(&self.long_hotkey, &self.hotkey) {
+            bail!("long_hotkey must differ from hotkey");
+        }
         if !(1..=16).contains(&self.asr.num_threads) {
             bail!("asr.num_threads must be in 1..=16");
         }
@@ -370,8 +436,8 @@ impl Config {
         if self.engine == EngineKind::Remote && !caps.remote_engine {
             bail!("engine = \"remote\" requires a build with the remote-engine feature");
         }
-        if self.engine == EngineKind::Whisper && !caps.whisper {
-            bail!("engine = \"whisper\" requires a build with the whisper feature");
+        if self.engine == EngineKind::Whisper {
+            bail!("engine = \"whisper\" is no longer supported; use long_key = true");
         }
         if self.remote.spawn_sidecar {
             let (host, _) = sidecar_endpoint(&self.remote.ws_url)?;
@@ -386,13 +452,17 @@ impl Config {
         Ok(())
     }
 
-    /// Returns whether the selected engine already punctuates its own output, making local
-    /// punctuation redundant (and, for Whisper, actively wrong to layer on top of).
-    pub fn engine_punctuates(&self) -> bool {
-        match self.engine {
+    /// Returns whether the long key is enabled and supported.
+    pub fn long_key_effective(&self, caps: Capabilities) -> bool {
+        self.long_key && caps.long_key
+    }
+
+    /// Returns whether engine punctuation is retained instead of running local punctuation.
+    /// Whisper punctuation is stripped so both local engines use the same punctuator.
+    pub fn engine_punctuates(&self, engine: EngineKind) -> bool {
+        match engine {
             EngineKind::Remote => self.remote.server_punctuates,
-            EngineKind::Whisper => true,
-            EngineKind::Local => false,
+            EngineKind::Local | EngineKind::Whisper => false,
         }
     }
 
@@ -408,8 +478,21 @@ impl Config {
 }
 
 /// Returns whether this process should run punctuation for the selected engine.
-pub fn punct_effective(config: &Config, caps: Capabilities) -> bool {
-    config.punct.effective(caps) && !config.engine_punctuates()
+pub fn punct_effective(config: &Config, caps: Capabilities, engine: EngineKind) -> bool {
+    config.punct.effective(caps) && !config.engine_punctuates(engine)
+}
+
+/// Resolves text processing choices independently of the configured engine.
+pub fn postprocess_settings(
+    config: &Config,
+    caps: Capabilities,
+    engine: EngineKind,
+) -> crate::postprocess::PostprocessSettings {
+    crate::postprocess::PostprocessSettings {
+        punct_enabled: punct_effective(config, caps, engine),
+        strip_trailing_period: config.strip_trailing_period,
+        strip_engine_punct: engine == EngineKind::Whisper,
+    }
 }
 
 const LEGACY_REMOTE_KEYS: &[&str] = &[
@@ -491,10 +574,208 @@ pub fn sidecar_endpoint(ws_url: &str) -> anyhow::Result<(String, u16)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn postprocess_settings_per_engine_matches_shared_punctuation() {
+        use crate::postprocess::PostprocessSettings;
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        for (choice, strip) in [
+            (PunctEnabled::Off, false),
+            (PunctEnabled::On, false),
+            (PunctEnabled::On, true),
+        ] {
+            let mut cfg = Config {
+                strip_trailing_period: strip,
+                ..Config::default()
+            };
+            cfg.punct.enabled = choice;
+            for engine in [EngineKind::Local, EngineKind::Whisper, EngineKind::Remote] {
+                let whisper = engine == EngineKind::Whisper;
+                assert_eq!(
+                    postprocess_settings(&cfg, caps, engine),
+                    PostprocessSettings {
+                        punct_enabled: engine != EngineKind::Remote && choice != PunctEnabled::Off,
+                        strip_trailing_period: strip,
+                        strip_engine_punct: whisper,
+                    }
+                );
+            }
+            cfg.remote.server_punctuates = false;
+            assert_eq!(
+                postprocess_settings(&cfg, caps, EngineKind::Remote).punct_enabled,
+                choice != PunctEnabled::Off
+            );
+        }
+        let cfg = Config::default();
+        assert!(postprocess_settings(&cfg, caps, EngineKind::Whisper).strip_engine_punct);
+        let no_punct = Capabilities {
+            punct: false,
+            ..caps
+        };
+        let settings = postprocess_settings(&cfg, no_punct, EngineKind::Whisper);
+        assert!(settings.strip_engine_punct);
+        assert!(!settings.punct_enabled);
+        assert!(postprocess_settings(&cfg, caps, EngineKind::Local).punct_enabled);
+    }
+
     fn write(temp: &tempfile::TempDir, body: &str) -> PathBuf {
         let path = temp.path().join("config.toml");
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn chords_match_normalizes_modifiers() {
+        for (a, b) in [
+            (" Shift + Alt + Space ", "alt+shift+SPACE"),
+            ("Option+Space", "Alt+Space"),
+            ("Control+Space", "Ctrl+Space"),
+            ("Command+Space", "Cmd+Space"),
+            ("Super+Space", "Cmd+Space"),
+            ("Alt+Alt+Space", "Alt+Space"),
+        ] {
+            assert!(chords_match(a, b), "{a} vs {b}");
+        }
+        let platform_modifier = if cfg!(target_os = "macos") {
+            "Super"
+        } else {
+            "Ctrl"
+        };
+        for alias in [
+            "CommandOrControl",
+            "CommandOrCtrl",
+            "CmdOrCtrl",
+            "CmdOrControl",
+        ] {
+            assert!(chords_match(
+                &format!("{alias}+Space"),
+                &format!("{platform_modifier}+Space")
+            ));
+        }
+        assert!(!chords_match("Alt+Space", "Alt+Shift+Space"));
+    }
+
+    #[test]
+    fn missing_long_hotkey_uses_upgrade_safe_default() {
+        let temp = tempfile::tempdir().unwrap();
+        for chord in ["Alt+Shift+Space", "Shift+Option+Space"] {
+            let raw = format!("hotkey = {chord:?}\n");
+            let path = write(&temp, &raw);
+            let cfg = Config::load(Some(&path)).unwrap();
+            assert_eq!(cfg.long_hotkey, "Ctrl+Alt+Space");
+            cfg.validate(Capabilities {
+                punct: true,
+                remote_engine: true,
+                long_key: true,
+            })
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn explicit_duplicate_long_hotkey_is_not_migrated() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            &temp,
+            "hotkey = \"Alt+Shift+Space\"\nlong_hotkey = \"Alt+Shift+Space\"\n",
+        );
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.long_hotkey, "Alt+Shift+Space");
+        assert!(cfg
+            .validate(Capabilities {
+                punct: true,
+                remote_engine: true,
+                long_key: true
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_canonical_duplicate_chords() {
+        for (hotkey, long_hotkey) in [
+            ("Shift+Alt+Space", "Alt+Shift+Space"),
+            ("Option+Space", "Alt+Space"),
+        ] {
+            let cfg = Config {
+                hotkey: hotkey.into(),
+                long_hotkey: long_hotkey.into(),
+                ..Config::default()
+            };
+            assert!(
+                cfg.validate(Capabilities {
+                    punct: true,
+                    remote_engine: true,
+                    long_key: true
+                })
+                .is_err(),
+                "{hotkey}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_key_defaults_off_with_alt_shift_space() {
+        let cfg = Config::default();
+        assert!(!cfg.long_key);
+        assert_eq!(cfg.long_hotkey, "Alt+Shift+Space");
+    }
+
+    #[test]
+    fn legacy_whisper_without_long_key_migrates_on() {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = "engine = \"whisper\"\n";
+        let path = write(&temp, raw);
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.engine, EngineKind::Local);
+        assert!(cfg.long_key);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn legacy_whisper_with_long_key_false_stays_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(&temp, "engine = \"whisper\"\nlong_key = false\n");
+        let cfg = Config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.engine, EngineKind::Local);
+        assert!(!cfg.long_key);
+    }
+
+    #[test]
+    fn validate_rejects_long_hotkey_equal_to_hotkey() {
+        let cfg = Config {
+            long_hotkey: "  alt+SPACE  ".into(),
+            ..Config::default()
+        };
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        assert!(cfg
+            .validate(caps)
+            .unwrap_err()
+            .to_string()
+            .contains("long_hotkey"));
+    }
+
+    #[test]
+    fn long_key_effective_requires_capability() {
+        let mut cfg = Config::default();
+        for enabled in [false, true] {
+            cfg.long_key = enabled;
+            for available in [false, true] {
+                let caps = Capabilities {
+                    punct: true,
+                    remote_engine: true,
+                    long_key: available,
+                };
+                assert_eq!(cfg.long_key_effective(caps), enabled && available);
+            }
+        }
     }
 
     #[test]
@@ -605,7 +886,7 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: false,
+            long_key: false,
         };
         for hotwords_score in [0.0, f32::INFINITY, f32::NAN, -1.0] {
             let mut config = Config::default();
@@ -664,7 +945,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -673,7 +954,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -682,7 +963,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_err());
         let cfg = Config {
@@ -693,7 +974,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -702,14 +983,14 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_err());
         assert!(Config::default()
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_ok());
     }
@@ -722,7 +1003,7 @@ mod tests {
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("punct"));
@@ -730,7 +1011,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_ok());
     }
@@ -745,7 +1026,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: false,
-                whisper: false,
+                long_key: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("remote-engine"));
@@ -753,13 +1034,13 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_ok());
     }
 
     #[test]
-    fn validate_rejects_whisper_engine_without_the_feature_when_capabilities_say_so() {
+    fn validate_rejects_whisper_as_standard_engine_even_with_the_feature() {
         let cfg = Config {
             engine: EngineKind::Whisper,
             ..Config::default()
@@ -768,7 +1049,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("whisper"));
@@ -776,9 +1057,9 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: true,
+                long_key: false,
             })
-            .is_ok());
+            .is_err());
     }
 
     #[test]
@@ -789,7 +1070,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("loopback"));
@@ -804,7 +1085,7 @@ mod tests {
                 cfg.validate(Capabilities {
                     punct: true,
                     remote_engine: true,
-                    whisper: false,
+                    long_key: false,
                 })
                 .is_ok(),
                 "{url}"
@@ -817,7 +1098,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             })
             .is_ok());
     }
@@ -828,18 +1109,18 @@ mod tests {
         assert!(cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: false,
+            long_key: false,
         }));
         assert!(!cfg.punct.effective(Capabilities {
             punct: false,
             remote_engine: true,
-            whisper: false,
+            long_key: false,
         }));
         cfg.punct.enabled = PunctEnabled::Off;
         assert!(!cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: false,
+            long_key: false,
         }));
 
         cfg.punct.enabled = PunctEnabled::On;
@@ -850,8 +1131,9 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
-            }
+                long_key: false,
+            },
+            cfg.engine
         ));
         cfg.remote.server_punctuates = false;
         assert!(punct_effective(
@@ -859,26 +1141,27 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
-            }
+                long_key: false,
+            },
+            cfg.engine
         ));
     }
 
     #[test]
-    fn whisper_engine_always_suppresses_local_punctuation() {
+    fn whisper_engine_uses_local_punctuation_choice() {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: true,
+            long_key: false,
         };
         let mut cfg = Config {
             engine: EngineKind::Whisper,
             ..Config::default()
         };
         cfg.punct.enabled = PunctEnabled::On;
-        assert!(!punct_effective(&cfg, caps));
+        assert!(punct_effective(&cfg, caps, cfg.engine));
         cfg.punct.enabled = PunctEnabled::Off;
-        assert!(!punct_effective(&cfg, caps));
+        assert!(!punct_effective(&cfg, caps, cfg.engine));
     }
 
     #[test]

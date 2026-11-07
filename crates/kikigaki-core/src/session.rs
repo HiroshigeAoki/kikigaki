@@ -21,6 +21,11 @@ pub enum Input {
         /// Engine active for this utterance, which may differ from a pending desired engine.
         engine: EngineKind,
     },
+    /// Abort the active utterance if its generation matches.
+    Abort {
+        /// Session-assigned utterance generation to cancel.
+        gen: u64,
+    },
     /// The engine emitted a protocol event.
     Engine(Event),
     /// The engine WebSocket disconnected.
@@ -123,6 +128,18 @@ impl Session {
     /// Applies an input at the supplied timestamp and returns requested effects.
     pub fn handle(&mut self, input: Input, now: Instant) -> Vec<Output> {
         match (self.state, input) {
+            (State::Recording | State::Finalizing, Input::Abort { gen }) if gen == self.gen => {
+                let mut outputs = Vec::new();
+                if self.state == State::Recording {
+                    outputs.push(Output::StopMic);
+                }
+                self.state = State::Idle;
+                self.t_press = None;
+                self.t_release = None;
+                outputs.push(Output::Cancel { gen });
+                outputs.push(Output::SetState(State::Idle));
+                outputs
+            }
             (State::Idle, Input::Pressed) => {
                 self.gen = self.gen.wrapping_add(1);
                 self.t_press = Some(now);
@@ -276,6 +293,7 @@ impl Session {
             postprocess_ms: final_event.postprocess_ms,
             dropped_chunks: final_event.dropped_chunks,
             gen: final_event.gen,
+            engine: None,
             chars: text.chars().count(),
             lang: final_event.lang.clone(),
             timeout: false,
@@ -298,6 +316,7 @@ impl Session {
             postprocess_ms: None,
             dropped_chunks: 0,
             gen: self.gen,
+            engine: None,
             chars: 0,
             lang: String::new(),
             timeout: true,
@@ -363,6 +382,111 @@ mod tests {
     fn local_release() -> Input {
         Input::Released {
             engine: EngineKind::Local,
+        }
+    }
+
+    #[test]
+    fn abort_in_recording_stops_mic_cancels_and_goes_idle() {
+        let mut session = session();
+        let now = Instant::now();
+        session.handle(Input::Pressed, now);
+
+        assert_eq!(
+            session.handle(Input::Abort { gen: 1 }, now),
+            vec![
+                Output::StopMic,
+                Output::Cancel { gen: 1 },
+                Output::SetState(State::Idle),
+            ]
+        );
+        assert_eq!(session.state(), State::Idle);
+        assert!(session.pasted(now).is_empty());
+    }
+
+    #[test]
+    fn abort_in_finalizing_cancels_and_goes_idle_without_record() {
+        let mut session = session();
+        let now = Instant::now();
+        session.handle(Input::Pressed, now);
+        session.handle(local_release(), now + Duration::from_secs(1));
+
+        assert_eq!(
+            session.handle(Input::Abort { gen: 1 }, now + Duration::from_secs(2)),
+            vec![Output::Cancel { gen: 1 }, Output::SetState(State::Idle)]
+        );
+        assert_eq!(session.state(), State::Idle);
+        assert!(session.t_press.is_none());
+        assert!(session.t_release.is_none());
+        assert!(session
+            .handle(Input::Tick, now + Duration::from_secs(5))
+            .is_empty());
+        assert!(session.pasted(now + Duration::from_secs(5)).is_empty());
+    }
+
+    #[test]
+    fn abort_with_stale_gen_is_ignored() {
+        let now = Instant::now();
+        for state in [State::Recording, State::Finalizing] {
+            let mut session = session();
+            session.handle(Input::Pressed, now);
+            if state == State::Finalizing {
+                session.handle(local_release(), now);
+            }
+            let timing = (session.t_press, session.t_release);
+            assert!(session.handle(Input::Abort { gen: 0 }, now).is_empty());
+            assert_eq!(session.state(), state);
+            assert_eq!((session.t_press, session.t_release), timing);
+        }
+        for state in [State::Idle, State::Disconnected] {
+            let mut session = session();
+            session.state = state;
+            assert!(session.handle(Input::Abort { gen: 0 }, now).is_empty());
+            assert_eq!(session.state(), state);
+        }
+    }
+
+    #[test]
+    fn final_after_abort_is_dropped() {
+        let now = Instant::now();
+        for state in [State::Recording, State::Finalizing] {
+            let mut session = session();
+            session.handle(Input::Pressed, now);
+            if state == State::Finalizing {
+                session.handle(local_release(), now);
+            }
+            session.handle(Input::Abort { gen: 1 }, now);
+            assert!(session
+                .handle(Input::Engine(final_event("aborted")), now)
+                .is_empty());
+            assert_eq!(session.state(), State::Idle);
+            session.handle(Input::Pressed, now);
+            assert!(session
+                .handle(Input::Engine(final_event("stale")), now)
+                .is_empty());
+            assert_eq!(session.state(), State::Recording);
+            assert!(session.pasted(now).is_empty());
+        }
+    }
+
+    #[test]
+    fn press_after_abort_begins_a_new_generation() {
+        let now = Instant::now();
+        for state in [State::Recording, State::Finalizing] {
+            let mut session = session();
+            session.handle(Input::Pressed, now);
+            if state == State::Finalizing {
+                session.handle(local_release(), now);
+            }
+            session.handle(Input::Abort { gen: 1 }, now);
+            assert_eq!(
+                session.handle(Input::Pressed, now),
+                vec![
+                    Output::Begin { gen: 2 },
+                    Output::StartMic,
+                    Output::SetState(State::Recording),
+                ]
+            );
+            assert_eq!(session.state(), State::Recording);
         }
     }
 
@@ -446,6 +570,7 @@ mod tests {
                 postprocess_ms: Some(3),
                 dropped_chunks: 2,
                 gen: 1,
+                engine: None,
                 chars: 6,
                 lang: "ja".into(),
                 timeout: false,
@@ -477,6 +602,7 @@ mod tests {
                     postprocess_ms: Some(3),
                     dropped_chunks: 2,
                     gen: 1,
+                    engine: None,
                     chars: 0,
                     lang: "ja".into(),
                     timeout: false,
@@ -534,6 +660,7 @@ mod tests {
                 postprocess_ms: Some(3),
                 dropped_chunks: 2,
                 gen: 1,
+                engine: None,
                 chars: 3,
                 lang: "ja".into(),
                 timeout: false,
@@ -719,6 +846,7 @@ mod tests {
                     postprocess_ms: None,
                     dropped_chunks: 0,
                     gen: 1,
+                    engine: None,
                     chars: 0,
                     lang: String::new(),
                     timeout: true,
@@ -799,6 +927,7 @@ mod tests {
                     postprocess_ms: None,
                     dropped_chunks: 0,
                     gen: 1,
+                    engine: None,
                     chars: 0,
                     lang: String::new(),
                     timeout: true,

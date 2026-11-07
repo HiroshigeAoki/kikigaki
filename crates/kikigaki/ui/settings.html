@@ -18,36 +18,43 @@
         <section class="group">
           <h2>ホットキー</h2>
           <div class="row">
-            <div class="l"><b>押している間だけ聞き取る</b><small>離すと最後の文を貼り付けます</small></div>
-            <button class="hk" id="hkButton" type="button" aria-label="ホットキーを変更">
+            <div class="l"><b>標準キー</b><small>押している間だけ聞き取る。短い返信向け</small></div>
+            <button class="hk" id="hkButton" type="button" aria-label="標準キーを変更">
               <span class="kbd" id="hkKbd"></span><span class="cap" id="hkCap">変更</span>
             </button>
           </div>
           <p class="note" id="hkNote">クリックしてから新しいキーの組み合わせを押してください。修飾キーを 1 つ以上含む必要があります。</p>
+          <div class="row" id="longHkRow" hidden>
+            <div class="l"><b>長文キー</b><small>高精度・英語の固有名詞に強い。貼り付けまで1〜3秒</small></div>
+            <button class="hk" id="longHkButton" type="button" aria-label="長文キーを変更">
+              <span class="kbd" id="longHkKbd"></span><span class="cap" id="longHkCap">変更</span>
+            </button>
+          </div>
+          <p class="note" id="longHkNote" hidden>クリックしてから新しいキーの組み合わせを押してください。修飾キーを 1 つ以上含む必要があります。</p>
         </section>
 
         <section class="group">
           <h2>文字起こし</h2>
-          <div class="row" id="engineRow" hidden>
-            <div class="l"><b>認識エンジン</b><small id="engineNote">初回選択時に約0.9GBのダウンロードが必要です</small></div>
-            <div class="seg" id="engineSeg" role="group" aria-label="認識エンジン">
-              <button type="button" data-value="local" aria-pressed="false">標準</button>
-              <button type="button" data-value="whisper" aria-pressed="false">高性能<small>約0.9GB</small></button>
+          <div class="row" id="longKeyRow" hidden>
+            <div class="l"><b>長文キー（高精度）を使う</b><small>初回に約0.9GBをダウンロード。メモリを約1GB使います</small>
+              <div class="long-state" id="longStateRow" hidden>
+                <span class="status-small" id="longState" role="status"></span>
+                <button class="btn small" id="retryLongEngineButton" type="button" hidden>再試行</button>
+              </div>
             </div>
+            <button class="switch" id="longKeySwitch" type="button" role="switch" aria-checked="false" aria-label="長文キー（高精度）を使う"></button>
           </div>
           <div class="row" id="punctRow">
-            <div class="l"><b>句読点</b><small id="punctNote">「、」「。」を自動で入れます。チャット欄などでは文末の「。」だけ省けます</small></div>
+            <div class="l"><b>句読点</b><small id="punctNote">両方のキーに適用します。長文キーの句読点と日本語の語句間の空白は先に除きます</small></div>
             <div class="seg" id="punctSeg" role="group" aria-label="句読点">
-              <button type="button" data-punct-mode="local" data-value="off" aria-pressed="false">付けない</button>
-              <button type="button" data-punct-mode="local" data-value="on" aria-pressed="false">付ける</button>
-              <button type="button" data-punct-mode="local" data-value="on_strip" aria-pressed="false">文末の「。」は除く</button>
-              <button type="button" data-punct-mode="engine" data-strip="false" aria-pressed="false" hidden>文末の「。」を残す</button>
-              <button type="button" data-punct-mode="engine" data-strip="true" aria-pressed="false" hidden>文末の「。」を省く</button>
+              <button type="button" data-value="off" aria-pressed="false">付けない</button>
+              <button type="button" data-value="on" aria-pressed="false">付ける</button>
+              <button type="button" data-value="on_strip" aria-pressed="false">文末の「。」は除く</button>
             </div>
           </div>
           <div class="row">
-            <div class="l"><b>カタカナ語→英語辞書</b><small>クバネティス→Kubernetes のような変換と認識バイアス。内蔵辞書を使う。切替はアイドル時に適用され、数秒間エンジンが再ロードされる</small></div>
-            <button class="switch" id="builtinReplaceDictSwitch" type="button" role="switch" aria-checked="false" aria-label="カタカナ語→英語辞書"></button>
+            <div class="l"><b>カタカナ語→英語辞書（標準キーのみ）</b><small>クバネティス→Kubernetes のような変換と認識バイアス。内蔵辞書を使う。切替はアイドル時に適用され、数秒間エンジンが再ロードされる</small></div>
+            <button class="switch" id="builtinReplaceDictSwitch" type="button" role="switch" aria-checked="false" aria-label="カタカナ語→英語辞書（標準キーのみ）"></button>
           </div>
         </section>
 

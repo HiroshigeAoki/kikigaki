@@ -1,5 +1,6 @@
 //! macOS Tauri shell and adapters for the platform-independent controller.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,56 +12,75 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-use crate::controller::{ControllerEventSink as _, HotkeyPort as _};
+use crate::controller::{ControllerEventSink as _, HotkeyKey, HotkeyPort as _};
 
 pub fn run() -> anyhow::Result<()> {
     let process_started_at = Instant::now();
     init_logging()?;
     let (client, cmd_rx, hotkey, hotkey_rx) = crate::controller::client_channels();
     let setup_client = client;
+    let shortcuts = Arc::new(Mutex::new(HashMap::<HotkeyKey, Shortcut>::new()));
+    let handler_shortcuts = Arc::clone(&shortcuts);
 
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("settings") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }))
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(move |_app, _shortcut, event| {
-                    let edge = match event.state() {
-                        ShortcutState::Pressed => crate::controller::HotkeyEdge::Pressed,
-                        ShortcutState::Released => crate::controller::HotkeyEdge::Released,
-                    };
-                    hotkey.send(edge);
-                })
-                .build(),
-        )
-        .setup(move |app| setup(app, setup_client, cmd_rx, hotkey_rx, process_started_at))
-        .on_window_event(on_window_event)
-        .invoke_handler(tauri::generate_handler![
-            get_snapshot,
-            apply_settings,
-            begin_hotkey_capture,
-            end_hotkey_capture,
-            set_launch_at_login,
-            retry_bootstrap,
-            open_config,
-            open_transcript_dir,
-            open_settings_pane,
-            request_microphone_access,
-            start_download,
-            retry_download,
-            list_history,
-            clear_history,
-            quit,
-        ])
-        .build(tauri::generate_context!())?;
+    let app =
+        tauri::Builder::default()
+            .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+                if let Some(window) = app.get_webview_window("settings") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }))
+            .plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                None,
+            ))
+            .plugin(
+                tauri_plugin_global_shortcut::Builder::new()
+                    .with_handler(move |_app, shortcut, event| {
+                        let key = handler_shortcuts.lock().unwrap().iter().find_map(
+                            |(key, registered)| (registered.id() == shortcut.id()).then_some(*key),
+                        );
+                        let Some(key) = key else {
+                            return;
+                        };
+                        let edge = match event.state() {
+                            ShortcutState::Pressed => crate::controller::HotkeyEdge::Pressed(key),
+                            ShortcutState::Released => crate::controller::HotkeyEdge::Released(key),
+                        };
+                        hotkey.send(edge);
+                    })
+                    .build(),
+            )
+            .setup(move |app| {
+                setup(
+                    app,
+                    setup_client,
+                    cmd_rx,
+                    hotkey_rx,
+                    process_started_at,
+                    shortcuts,
+                )
+            })
+            .on_window_event(on_window_event)
+            .invoke_handler(tauri::generate_handler![
+                get_snapshot,
+                apply_settings,
+                begin_hotkey_capture,
+                end_hotkey_capture,
+                set_launch_at_login,
+                retry_bootstrap,
+                open_config,
+                open_transcript_dir,
+                open_settings_pane,
+                request_microphone_access,
+                start_download,
+                retry_download,
+                retry_long_engine,
+                list_history,
+                clear_history,
+                quit,
+            ])
+            .build(tauri::generate_context!())?;
     app.run(handle_run_event);
     Ok(())
 }
@@ -100,6 +120,7 @@ fn setup(
     cmd_rx: std::sync::mpsc::Receiver<crate::controller::ControllerCmd>,
     hotkey_rx: std::sync::mpsc::Receiver<crate::controller::HotkeyEdge>,
     process_started_at: Instant,
+    shortcuts: Arc<Mutex<HashMap<HotkeyKey, Shortcut>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     app.handle()
         .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
@@ -142,6 +163,7 @@ fn setup(
             controller: Mutex::new(None),
             controller_ports: Mutex::new(Some(ControllerPorts { cmd_rx, hotkey_rx })),
             process_started_at,
+            shortcuts,
             shutdown: crate::shutdown::ShutdownState::new(),
             onboarding_poll: Mutex::new(None),
         })),
@@ -191,15 +213,29 @@ fn start_controller(
     }
 
     let cfg = settings.config().clone();
-    let hotkeys = TauriHotkeys(handle.clone());
-    if let Err(error) = hotkeys.register(&cfg.hotkey) {
+    let hotkeys = TauriHotkeys {
+        app: handle.clone(),
+        shortcuts: Arc::clone(&state.shortcuts),
+    };
+    if let Err(error) = hotkeys.register(HotkeyKey::Standard, &cfg.hotkey) {
         tracing::error!(hotkey = %cfg.hotkey, %error, "failed to register the initial hotkey");
     } else {
         tracing::info!(chord = %cfg.hotkey, "initial hotkey registered");
     }
+    let long_hotkey_registered = cfg.long_key_effective(capabilities).then(|| {
+        match hotkeys.register(HotkeyKey::Long, &cfg.long_hotkey) {
+            Ok(()) => {
+                tracing::info!(chord = %cfg.long_hotkey, "initial long hotkey registered");
+                true
+            }
+            Err(error) => {
+                tracing::error!(hotkey = %cfg.long_hotkey, %error, "failed to register the initial long hotkey");
+                false
+            }
+        }
+    });
     let startup_plan = kikigaki_core::startup::StartupPlan::from_config(&cfg, capabilities);
     let engine_factory = Arc::new(TauriEngineFactory {
-        engine_kind: Mutex::new(cfg.engine),
         local_models_dir: cfg.models_dir.clone(),
         local_asr_cfg: cfg.asr.clone(),
         local_vad_cfg: cfg.vad.clone(),
@@ -222,6 +258,8 @@ fn start_controller(
         builtin,
     });
     let startup_port = Box::new(crate::startup::StartupCoordinatorPort::new(startup_plan));
+    let long_install_factory: crate::controller::StartupPortFactory =
+        Box::new(|plan| Box::new(crate::startup::StartupCoordinatorPort::new(plan)));
     let models_dir = cfg.models_dir.clone();
     let ports = state
         .controller_ports
@@ -236,6 +274,7 @@ fn start_controller(
             models_dir,
             bootstrap,
             process_started_at: state.process_started_at,
+            long_hotkey_registered,
         },
         ports.cmd_rx,
         ports.hotkey_rx,
@@ -247,7 +286,7 @@ fn start_controller(
         Box::new(crate::mic::Mic::new()),
         postprocess_factory,
         startup_port,
-        Box::new(|plan| Box::new(crate::startup::StartupCoordinatorPort::new(plan))),
+        long_install_factory,
         Box::new(crate::controller::RealClock),
     );
     let controller_death = spawn_controller_death_monitor(handle.clone(), exited_rx);
@@ -321,11 +360,6 @@ fn default_snapshot(
     bootstrap_error: Option<crate::status::BootstrapError>,
 ) -> crate::status::UiSnapshot {
     let settings_snapshot = settings.snapshot();
-    let engine = match settings.config().engine {
-        kikigaki_core::config::EngineKind::Local => "local",
-        kikigaki_core::config::EngineKind::Remote => "remote",
-        kikigaki_core::config::EngineKind::Whisper => "whisper",
-    };
     let phase = if bootstrap_error.is_some() {
         "failed"
     } else {
@@ -335,13 +369,17 @@ fn default_snapshot(
         revision: 0,
         status: crate::status::UiStatus {
             state: "disconnected",
+            level: if bootstrap_error.is_some() {
+                "error"
+            } else {
+                "ok"
+            },
             phase,
             message: bootstrap_error.as_ref().map(|error| error.message.clone()),
             hotkey: settings_snapshot.hotkey.clone(),
             punct_enabled: settings_snapshot.punct_enabled,
             strip_trailing_period: settings_snapshot.strip_trailing_period,
-            engine_punctuates: settings_snapshot.engine_punctuates,
-            engine,
+            long_hotkey: None,
         },
         settings: settings_snapshot,
         autostart: autostart_state(app),
@@ -352,7 +390,6 @@ fn default_snapshot(
 }
 
 struct TauriEngineFactory {
-    engine_kind: Mutex<kikigaki_core::config::EngineKind>,
     local_models_dir: std::path::PathBuf,
     local_asr_cfg: kikigaki_core::config::AsrConfig,
     local_vad_cfg: kikigaki_core::config::VadConfig,
@@ -363,8 +400,10 @@ struct TauriEngineFactory {
 }
 
 impl crate::controller::EngineFactory for TauriEngineFactory {
-    fn build(&self) -> anyhow::Result<Box<dyn kikigaki_core::engine::Engine>> {
-        let kind = *self.engine_kind.lock().unwrap();
+    fn build(
+        &self,
+        kind: kikigaki_core::config::EngineKind,
+    ) -> anyhow::Result<Box<dyn kikigaki_core::engine::Engine>> {
         match kind {
             kikigaki_core::config::EngineKind::Local => {
                 let enabled = self.hotwords_enabled.load(Ordering::Relaxed);
@@ -417,10 +456,6 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
     fn set_hotwords_enabled(&self, enabled: bool) {
         self.hotwords_enabled.store(enabled, Ordering::Relaxed);
     }
-
-    fn set_engine_kind(&self, kind: kikigaki_core::config::EngineKind) {
-        *self.engine_kind.lock().unwrap() = kind;
-    }
 }
 
 struct TauriPostprocessFactory {
@@ -462,8 +497,7 @@ impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
                 kikigaki_core::postprocess::Pipeline::new(
                     replace,
                     punctuator,
-                    false,
-                    false,
+                    kikigaki_core::postprocess::PostprocessSettings::default(),
                     Arc::clone(&self.builtin),
                     builtin_enabled,
                     learned,
@@ -567,6 +601,7 @@ pub(crate) struct ShellState {
     >,
     controller_ports: Mutex<Option<ControllerPorts>>,
     process_started_at: Instant,
+    shortcuts: Arc<Mutex<HashMap<HotkeyKey, Shortcut>>>,
     pub(crate) shutdown: crate::shutdown::ShutdownState,
     onboarding_poll: Mutex<Option<OnboardingPoll>>,
 }
@@ -623,23 +658,43 @@ fn autostart_state(app: &AppHandle) -> crate::status::AutostartState {
     }
 }
 
-struct TauriHotkeys(AppHandle);
+struct TauriHotkeys {
+    app: AppHandle,
+    shortcuts: Arc<Mutex<HashMap<HotkeyKey, Shortcut>>>,
+}
 
 impl crate::controller::HotkeyPort for TauriHotkeys {
-    fn register(&self, chord: &str) -> Result<(), String> {
+    fn register(&self, key: HotkeyKey, chord: &str) -> Result<(), String> {
         let shortcut: Shortcut = chord.parse().map_err(|error| format!("{error}"))?;
-        self.0
+        let previous = self.shortcuts.lock().unwrap().get(&key).copied();
+        if previous.is_some_and(|old| old.id() == shortcut.id()) {
+            return Ok(());
+        }
+        // Plugin calls may dispatch on the main thread; never hold the key-map lock here.
+        self.app
             .global_shortcut()
             .register(shortcut)
-            .map_err(|error| format!("{error}"))
+            .map_err(|error| format!("{error}"))?;
+        if let Some(old) = previous {
+            if let Err(error) = self.app.global_shortcut().unregister(old) {
+                let _ = self.app.global_shortcut().unregister(shortcut);
+                return Err(format!("{error}"));
+            }
+        }
+        self.shortcuts.lock().unwrap().insert(key, shortcut);
+        Ok(())
     }
 
-    fn unregister(&self, chord: &str) -> Result<(), String> {
-        let shortcut: Shortcut = chord.parse().map_err(|error| format!("{error}"))?;
-        self.0
-            .global_shortcut()
-            .unregister(shortcut)
-            .map_err(|error| format!("{error}"))
+    fn unregister(&self, key: HotkeyKey) -> Result<(), String> {
+        let shortcut = self.shortcuts.lock().unwrap().get(&key).copied();
+        if let Some(shortcut) = shortcut {
+            self.app
+                .global_shortcut()
+                .unregister(shortcut)
+                .map_err(|error| format!("{error}"))?;
+            self.shortcuts.lock().unwrap().remove(&key);
+        }
+        Ok(())
     }
 }
 
@@ -814,20 +869,23 @@ async fn apply_settings(
 #[tauri::command]
 async fn begin_hotkey_capture(
     state: tauri::State<'_, Arc<ShellState>>,
+    key: HotkeyKey,
 ) -> Result<(), crate::status::UiError> {
     state
         .client
-        .send_and_wait(|reply| crate::controller::ControllerCmd::BeginHotkeyCapture { reply })
+        .send_and_wait(|reply| crate::controller::ControllerCmd::BeginHotkeyCapture { key, reply })
 }
 
 #[tauri::command]
 async fn end_hotkey_capture(
     state: tauri::State<'_, Arc<ShellState>>,
+    key: HotkeyKey,
     new_chord: Option<String>,
 ) -> Result<crate::settings::SettingsSnapshot, crate::status::UiError> {
     state
         .client
         .send_and_wait(|reply| crate::controller::ControllerCmd::EndHotkeyCapture {
+            key,
             new_chord,
             reply,
         })
@@ -1006,6 +1064,15 @@ async fn retry_download(
     state
         .client
         .send_and_wait(|reply| crate::controller::ControllerCmd::RetryDownload { reply })
+}
+
+#[tauri::command]
+async fn retry_long_engine(
+    state: tauri::State<'_, Arc<ShellState>>,
+) -> Result<(), crate::status::UiError> {
+    state
+        .client
+        .send_and_wait(|reply| crate::controller::ControllerCmd::RetryLongEngine { reply })
 }
 
 #[tauri::command]

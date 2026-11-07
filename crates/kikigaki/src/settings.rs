@@ -2,22 +2,23 @@
 
 use std::path::{Path, PathBuf};
 
-use kikigaki_core::config::{Capabilities, Config, PunctEnabled};
+use kikigaki_core::config::{chords_match, Capabilities, Config, PunctEnabled};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
     pub hotkey: Option<String>,
+    pub long_key: Option<bool>,
+    pub long_hotkey: Option<String>,
     pub punctuation: Option<PunctSetting>,
     pub strip_trailing_period: Option<bool>,
     /// JSON uses `builtinReplaceDict`; snapshots and persisted TOML stay snake_case.
     pub builtin_replace_dict: Option<bool>,
     pub transcript_log: Option<bool>,
-    pub engine: Option<kikigaki_core::config::EngineKind>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum PunctSetting {
     Off,
@@ -28,16 +29,17 @@ pub enum PunctSetting {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SettingsSnapshot {
     pub hotkey: String,
+    pub long_key: bool,
+    pub long_hotkey: String,
+    pub long_state: Option<crate::status::LongStateView>,
+    pub punct_choice: PunctSetting,
+    pub long_available: bool,
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
     pub builtin_replace_dict: bool,
     pub transcript_log: bool,
     pub transcript_dir: PathBuf,
     pub paste_method: kikigaki_core::config::PasteMethod,
-    pub engine: kikigaki_core::config::EngineKind,
-    pub active_engine: kikigaki_core::config::EngineKind,
-    pub engine_punctuates: bool,
-    pub whisper_available: bool,
 }
 
 pub struct SettingsCoordinator {
@@ -51,6 +53,9 @@ impl SettingsCoordinator {
     pub fn load(path: PathBuf, capabilities: Capabilities) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
         let config = Config::load(Some(&path))?;
+        if config.long_key && !capabilities.long_key {
+            tracing::warn!("long_key is enabled, but this build does not support the long key");
+        }
         Ok(Self {
             path,
             config,
@@ -59,20 +64,31 @@ impl SettingsCoordinator {
         })
     }
 
-    /// UI-bound snapshots must use the controller's active-engine-aware `settings_snapshot()`.
+    /// The controller adds runtime long-engine state in `settings_snapshot()`.
     pub fn snapshot(&self) -> SettingsSnapshot {
         SettingsSnapshot {
             hotkey: self.config.hotkey.clone(),
-            punct_enabled: kikigaki_core::config::punct_effective(&self.config, self.capabilities),
+            long_key: self.config.long_key,
+            long_hotkey: self.config.long_hotkey.clone(),
+            long_state: None,
+            punct_choice: if self.config.punct.enabled == PunctEnabled::Off {
+                PunctSetting::Off
+            } else if self.config.strip_trailing_period {
+                PunctSetting::OnStrip
+            } else {
+                PunctSetting::On
+            },
+            long_available: self.capabilities.long_key,
+            punct_enabled: kikigaki_core::config::punct_effective(
+                &self.config,
+                self.capabilities,
+                self.config.engine,
+            ),
             strip_trailing_period: self.config.strip_trailing_period,
             builtin_replace_dict: self.config.builtin_replace_dict,
             transcript_log: self.config.transcript_log,
             transcript_dir: self.config.transcript_dir.clone(),
             paste_method: self.config.paste_method,
-            engine: self.config.engine,
-            active_engine: self.config.engine,
-            engine_punctuates: self.config.engine_punctuates(),
-            whisper_available: self.capabilities.whisper && cfg!(target_os = "macos"),
         }
     }
 
@@ -97,6 +113,31 @@ impl SettingsCoordinator {
                 message: format!("設定ファイルを読み込めませんでした: {error}"),
             })?;
         let mut candidate = self.config.clone();
+        if document.get("engine").and_then(toml_edit::Item::as_str) == Some("whisper") {
+            document["engine"] = toml_edit::value("local");
+            if !document.contains_key("long_key") {
+                document["long_key"] = toml_edit::value(candidate.long_key);
+            }
+        }
+        // Config::load substitutes a fallback long chord when the default collides with
+        // `hotkey`; pin it so a later `hotkey` change does not silently move the long key.
+        if !document.contains_key("long_hotkey")
+            && candidate.long_hotkey != Config::default().long_hotkey
+        {
+            document["long_hotkey"] = toml_edit::value(candidate.long_hotkey.as_str());
+        }
+        if let Some(enabled) = patch.long_key {
+            document["long_key"] = toml_edit::value(enabled);
+            candidate.long_key = enabled;
+        }
+        if let Some(chord) = &patch.long_hotkey {
+            parse_chord(chord).map_err(|message| crate::status::UiError {
+                code: "invalid_hotkey",
+                message,
+            })?;
+            document["long_hotkey"] = toml_edit::value(chord.as_str());
+            candidate.long_hotkey = chord.clone();
+        }
         if let Some(chord) = &patch.hotkey {
             parse_chord(chord).map_err(|message| crate::status::UiError {
                 code: "invalid_hotkey",
@@ -135,21 +176,13 @@ impl SettingsCoordinator {
             document["transcript_log"] = toml_edit::value(enabled);
             candidate.transcript_log = enabled;
         }
-        if let Some(engine) = patch.engine {
-            candidate.engine = engine;
-            candidate
-                .validate(self.capabilities)
-                .map_err(|_error| crate::status::UiError {
-                    code: "unsupported_engine",
-                    message: "この機能はこのビルドでは利用できません".into(),
-                })?;
-            document["engine"] = toml_edit::value(match engine {
-                kikigaki_core::config::EngineKind::Local => "local",
-                kikigaki_core::config::EngineKind::Remote => "remote",
-                kikigaki_core::config::EngineKind::Whisper => "whisper",
+
+        if chords_match(&candidate.hotkey, &candidate.long_hotkey) {
+            return Err(crate::status::UiError {
+                code: "hotkey_conflict",
+                message: "もう一方のキーと同じ組み合わせは使えません".into(),
             });
         }
-
         let body = document.to_string();
         atomic_write(&self.path, body.as_bytes()).map_err(|error| crate::status::UiError {
             code: "write_failed",
@@ -220,6 +253,162 @@ mod tests {
     use super::*;
     use kikigaki_core::config::{Capabilities, EngineKind};
 
+    fn legacy_coordinator() -> (
+        tempfile::TempDir,
+        PathBuf,
+        SettingsCoordinator,
+        Capabilities,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "# keep\nengine = \"whisper\"\n").unwrap();
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        let coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
+        (temp, path, coordinator, caps)
+    }
+
+    #[test]
+    fn upgrade_fallback_long_hotkey_is_pinned_on_the_first_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Shift+Space\"\n").unwrap();
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
+        assert_eq!(coordinator.config().long_hotkey, "Ctrl+Alt+Space");
+        coordinator
+            .apply(SettingsPatch {
+                transcript_log: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        coordinator
+            .apply(SettingsPatch {
+                hotkey: Some("Cmd+Space".into()),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        // Without pinning, the next load would fall back to the plain default chord.
+        let reloaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(reloaded.hotkey, "Cmd+Space");
+        assert_eq!(reloaded.long_hotkey, "Ctrl+Alt+Space");
+    }
+
+    #[test]
+    fn default_long_hotkey_is_not_written_unprompted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
+        coordinator
+            .apply(SettingsPatch {
+                transcript_log: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("long_hotkey"));
+    }
+
+    #[test]
+    fn conflicting_long_hotkey_patch_changes_nothing() {
+        let (_temp, path, mut coordinator, _) = legacy_coordinator();
+        let before = coordinator.snapshot();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let error = coordinator
+            .apply(SettingsPatch {
+                long_hotkey: Some("Alt+Space".into()),
+                transcript_log: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "hotkey_conflict");
+        assert_eq!(error.message, "もう一方のキーと同じ組み合わせは使えません");
+        assert_eq!(coordinator.snapshot(), before);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn malformed_long_hotkey_patch_changes_nothing() {
+        let (_temp, path, mut coordinator, _) = legacy_coordinator();
+        let before = coordinator.snapshot();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let error = coordinator
+            .apply(SettingsPatch {
+                long_hotkey: Some("Space".into()),
+                ..SettingsPatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_hotkey");
+        assert_eq!(coordinator.snapshot(), before);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn apply_rewrites_legacy_engine_and_writes_long_key() {
+        let (_temp, path, mut coordinator, caps) = legacy_coordinator();
+        coordinator
+            .apply(SettingsPatch {
+                punctuation: Some(PunctSetting::Off),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# keep"));
+        assert!(raw.contains("engine = \"local\""));
+        assert!(raw.contains("long_key = true"));
+        let reloaded = SettingsCoordinator::load(path, caps).unwrap();
+        assert_eq!(reloaded.config(), coordinator.config());
+        assert!(reloaded.snapshot().long_available);
+        coordinator.apply(SettingsPatch::default()).unwrap();
+    }
+
+    #[test]
+    fn long_key_off_then_reload_stays_off() {
+        let (_temp, path, mut coordinator, caps) = legacy_coordinator();
+        coordinator
+            .apply(SettingsPatch {
+                long_key: Some(false),
+                long_hotkey: Some("Ctrl+Shift+Space".into()),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        let reloaded = SettingsCoordinator::load(path, caps).unwrap();
+        assert!(!reloaded.config().long_key);
+        assert_eq!(reloaded.config().long_hotkey, "Ctrl+Shift+Space");
+        assert_eq!(reloaded.config().engine, EngineKind::Local);
+    }
+
+    #[test]
+    fn apply_external_change_still_rejected_with_legacy_engine() {
+        let (_temp, path, mut coordinator, _caps) = legacy_coordinator();
+        let before = coordinator.config().clone();
+        let raw = "# external\nengine = \"whisper\"\n";
+        std::fs::write(&path, raw).unwrap();
+        let error = coordinator
+            .apply(SettingsPatch {
+                long_key: Some(false),
+                ..SettingsPatch::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "external_change");
+        assert_eq!(coordinator.config(), &before);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
     #[test]
     fn builtin_replace_dict_patch_uses_camel_case_json_wire_key() {
         let camel_case: SettingsPatch =
@@ -248,11 +437,12 @@ mod tests {
         assert!(patch.punctuation.is_none());
         assert!(patch.strip_trailing_period.is_none());
         assert!(patch.builtin_replace_dict.is_none());
-        assert!(patch.engine.is_none());
+        assert!(patch.long_key.is_none());
+        assert!(patch.long_hotkey.is_none());
     }
 
     #[test]
-    fn coordinator_snapshot_initializes_active_engine_from_config() {
+    fn coordinator_snapshot_initializes_long_settings_and_configured_punct_choice() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
         std::fs::write(&path, "engine = \"local\"\n").unwrap();
@@ -261,14 +451,16 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: true,
+                long_key: false,
             },
         )
         .unwrap();
 
         let snapshot = coordinator.snapshot();
-        assert_eq!(snapshot.engine, EngineKind::Local);
-        assert_eq!(snapshot.active_engine, EngineKind::Local);
+        assert!(!snapshot.long_key);
+        assert_eq!(snapshot.long_hotkey, "Alt+Shift+Space");
+        assert!(snapshot.long_state.is_none());
+        assert_eq!(snapshot.punct_choice, PunctSetting::OnStrip);
     }
 
     #[test]
@@ -329,18 +521,14 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
         coordinator
             .apply(SettingsPatch {
                 hotkey: Some("Cmd+Shift+Space".into()),
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
-                engine: None,
+                ..SettingsPatch::default()
             })
             .unwrap();
         let on_disk = std::fs::read_to_string(path).unwrap();
@@ -363,19 +551,15 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
 
         let snapshot = coordinator
             .apply(SettingsPatch {
-                hotkey: None,
-                punctuation: None,
-                strip_trailing_period: None,
                 builtin_replace_dict: Some(true),
-                transcript_log: None,
-                engine: None,
+                ..SettingsPatch::default()
             })
             .unwrap();
 
@@ -397,7 +581,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
@@ -414,86 +598,39 @@ mod tests {
     }
 
     #[test]
-    fn engine_patch_persists_and_updates_snapshot() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
-        let mut coordinator = SettingsCoordinator::load(
-            path.clone(),
-            Capabilities {
-                punct: true,
-                remote_engine: true,
-                whisper: true,
-            },
-        )
-        .unwrap();
-
+    fn long_patch_persists_and_updates_snapshot() {
+        let (_temp, path, mut coordinator, _) = legacy_coordinator();
         let snapshot = coordinator
             .apply(SettingsPatch {
-                hotkey: None,
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
-                engine: Some(kikigaki_core::config::EngineKind::Whisper),
+                long_key: Some(true),
+                ..SettingsPatch::default()
             })
             .unwrap();
-
-        assert_eq!(snapshot.engine, kikigaki_core::config::EngineKind::Whisper);
-        let on_disk = std::fs::read_to_string(path).unwrap();
-        assert!(on_disk.contains("engine = \"whisper\""), "{on_disk}");
+        assert!(snapshot.long_key);
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("long_key = true"));
     }
 
     #[test]
-    fn engine_patch_to_whisper_is_rejected_without_the_capability() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
-        let mut coordinator = SettingsCoordinator::load(
-            path,
-            Capabilities {
-                punct: true,
-                remote_engine: true,
-                whisper: false,
-            },
-        )
-        .unwrap();
-
-        let error = coordinator
-            .apply(SettingsPatch {
-                hotkey: None,
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
-                engine: Some(kikigaki_core::config::EngineKind::Whisper),
-            })
-            .unwrap_err();
-
-        assert_eq!(error.code, "unsupported_engine");
-        assert_eq!(
-            coordinator.config().engine,
-            kikigaki_core::config::EngineKind::Local
-        );
-    }
-
-    #[test]
-    fn whisper_ui_availability_is_os_gated_independently_of_config_validation() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        std::fs::write(&path, "engine = \"whisper\"\n").unwrap();
-        let capabilities = Capabilities {
-            punct: true,
-            remote_engine: true,
-            whisper: true,
-        };
-        let coordinator = SettingsCoordinator::load(path, capabilities).unwrap();
-
-        assert!(coordinator.config().validate(capabilities).is_ok());
-        assert_eq!(
-            coordinator.snapshot().whisper_available,
-            cfg!(target_os = "macos")
-        );
+    fn long_ui_availability_uses_only_long_capability() {
+        for available in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            let coordinator = SettingsCoordinator::load(
+                path,
+                Capabilities {
+                    punct: false,
+                    remote_engine: false,
+                    long_key: available,
+                },
+            )
+            .unwrap();
+            let snapshot = coordinator.snapshot();
+            assert_eq!(snapshot.long_available, available);
+            assert_eq!(snapshot.punct_choice, PunctSetting::OnStrip);
+            assert!(!snapshot.punct_enabled);
+        }
     }
 
     #[test]
@@ -506,7 +643,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
@@ -514,12 +651,7 @@ mod tests {
 
         let snapshot = coordinator
             .apply(SettingsPatch {
-                hotkey: None,
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
-                engine: None,
+                ..SettingsPatch::default()
             })
             .unwrap();
 
@@ -539,18 +671,14 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
         let snapshot = coordinator
             .apply(SettingsPatch {
-                hotkey: None,
                 punctuation: Some(PunctSetting::OnStrip),
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
-                engine: None,
+                ..SettingsPatch::default()
             })
             .unwrap();
         assert!(snapshot.punct_enabled && snapshot.strip_trailing_period);
@@ -570,7 +698,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: true,
+                long_key: false,
             },
         )
         .unwrap();
@@ -607,7 +735,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
@@ -625,7 +753,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
@@ -633,11 +761,7 @@ mod tests {
         let error = coordinator
             .apply(SettingsPatch {
                 hotkey: Some("Ctrl+Space".into()),
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
-                engine: None,
+                ..SettingsPatch::default()
             })
             .unwrap_err();
         assert_eq!(error.code, "external_change");
@@ -653,7 +777,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
@@ -662,12 +786,8 @@ mod tests {
 
         let error = coordinator
             .apply(SettingsPatch {
-                hotkey: None,
-                punctuation: None,
-                strip_trailing_period: None,
                 builtin_replace_dict: Some(true),
-                transcript_log: None,
-                engine: None,
+                ..SettingsPatch::default()
             })
             .unwrap_err();
 
@@ -688,7 +808,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
         )
         .unwrap();
@@ -696,11 +816,7 @@ mod tests {
         assert!(coordinator
             .apply(SettingsPatch {
                 hotkey: Some("Cmd+Space".into()),
-                punctuation: None,
-                strip_trailing_period: None,
-                builtin_replace_dict: None,
-                transcript_log: None,
-                engine: None,
+                ..SettingsPatch::default()
             })
             .is_err());
         assert_eq!(coordinator.snapshot().hotkey, "Alt+Space");

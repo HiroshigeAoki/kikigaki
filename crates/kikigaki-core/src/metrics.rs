@@ -33,6 +33,9 @@ pub struct Utterance {
     /// Session generation assigned to the utterance.
     #[serde(default)]
     pub gen: u64,
+    /// Serving engine, filled by the controller; absent in legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
     /// Number of characters in normalized output text.
     pub chars: usize,
     /// Language code reported by hayamimi.
@@ -140,6 +143,7 @@ mod tests {
             postprocess_ms: Some(3),
             dropped_chunks: 2,
             gen: 4,
+            engine: None,
             chars: 5,
             lang: "ja".into(),
             timeout: false,
@@ -169,6 +173,19 @@ mod tests {
         assert_eq!(row.postprocess_ms, None);
         assert_eq!(row.dropped_chunks, 0);
         assert_eq!(row.gen, 0);
+        assert_eq!(row.engine, None);
+    }
+
+    #[test]
+    fn engine_metadata_is_optional_and_round_trips_when_present() {
+        let mut row = utterance();
+        assert!(!to_line(&MetricRow::Utterance(row.clone())).contains("\"engine\":"));
+        row.engine = Some("whisper".into());
+        let expected = MetricRow::Utterance(row);
+        assert_eq!(
+            serde_json::from_str::<MetricRow>(to_line(&expected).trim()).unwrap(),
+            expected
+        );
     }
 
     #[test]

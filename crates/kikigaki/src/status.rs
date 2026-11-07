@@ -4,13 +4,22 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UiStatus {
     pub state: &'static str,
+    pub level: &'static str,
     pub phase: &'static str,
     pub message: Option<String>,
     pub hotkey: String,
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
-    pub engine_punctuates: bool,
-    pub engine: &'static str,
+    pub long_hotkey: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LongStateView {
+    Installing { percent: u8 },
+    Loading,
+    Ready,
+    Failed { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -95,6 +104,15 @@ pub enum Status {
 }
 
 impl Status {
+    /// Severity of the effective status shown in the settings card.
+    pub fn level(&self) -> &'static str {
+        match self {
+            Self::Warning(_) => "warning",
+            Self::StartupFailed(_) | Self::EngineFailed(_) => "error",
+            Self::Ok | Self::Installing(_) => "ok",
+        }
+    }
+
     /// Returns the message shown by the tray, if any.
     pub fn message(&self) -> Option<&str> {
         match self {
@@ -131,6 +149,29 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_state_view_serializes_as_tagged() {
+        for (state, expected) in [
+            (
+                LongStateView::Installing { percent: 45 },
+                serde_json::json!({"kind":"installing","percent":45}),
+            ),
+            (
+                LongStateView::Loading,
+                serde_json::json!({"kind":"loading"}),
+            ),
+            (LongStateView::Ready, serde_json::json!({"kind":"ready"})),
+            (
+                LongStateView::Failed {
+                    message: "failed".into(),
+                },
+                serde_json::json!({"kind":"failed","message":"failed"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn message_maps_every_status_variant() {

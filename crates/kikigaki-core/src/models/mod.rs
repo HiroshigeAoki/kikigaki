@@ -314,7 +314,7 @@ mod tests {
             Capabilities {
                 punct: false,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
             false
         )
@@ -324,7 +324,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
             true,
         );
@@ -340,7 +340,7 @@ mod tests {
             Capabilities {
                 punct: false,
                 remote_engine: true,
-                whisper: false,
+                long_key: false,
             },
             false,
         );
@@ -355,7 +355,7 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            whisper: true,
+            long_key: false,
         };
         let mut whisper_ids = required(EngineKind::Whisper, caps, false)
             .iter()
@@ -366,13 +366,43 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(whisper_ids, expected);
 
-        // Whisper punctuates on its own — punct_effective is always false for it in practice
-        // (see Config::engine_punctuates), but required() itself doesn't assume that; it just
-        // trusts its caller's punct_effective input, same as every other engine kind.
+        // Whisper shares Local's punctuator; both require mojicast when punctuation is effective.
         let local = required(EngineKind::Local, caps, false);
         assert!(!local.iter().any(|model| model.id == WHISPER_MODEL_ID));
         // Local must still get VAD too — the Asr/Vad split must not change Local's model set.
         assert!(local.iter().any(|model| model.id == VAD_MODEL_ID));
+    }
+
+    #[test]
+    fn whisper_requires_punctuation_model_when_effective() {
+        let mut config = crate::config::Config::default();
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        for choice in [
+            crate::config::PunctEnabled::On,
+            crate::config::PunctEnabled::Off,
+        ] {
+            config.punct.enabled = choice;
+            let models = required(
+                EngineKind::Whisper,
+                caps,
+                crate::config::punct_effective(&config, caps, EngineKind::Whisper),
+            );
+            assert_eq!(
+                models.iter().any(|model| model.id == "mojicast-punct"),
+                choice == crate::config::PunctEnabled::On
+            );
+        }
+        let caps = Capabilities {
+            punct: false,
+            ..caps
+        };
+        assert!(!required(EngineKind::Whisper, caps, true)
+            .iter()
+            .any(|model| model.id == "mojicast-punct"));
     }
 
     #[test]

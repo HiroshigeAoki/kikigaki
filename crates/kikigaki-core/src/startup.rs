@@ -35,6 +35,20 @@ impl StartupPlan {
             required: required(config.engine, caps, punct_effective(config, caps)),
         }
     }
+
+    /// Builds a plan for an engine candidate independently of the configured engine.
+    pub fn for_target(
+        target: EngineKind,
+        models_dir: PathBuf,
+        caps: Capabilities,
+        punct_effective: bool,
+    ) -> Self {
+        Self {
+            engine: target,
+            models_dir,
+            required: required(target, caps, punct_effective),
+        }
+    }
 }
 
 /// Status emitted by the startup worker.
@@ -158,6 +172,7 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         };
 
         assert!(StartupPlan::from_config(&config, caps).required.is_empty());
@@ -174,6 +189,31 @@ mod tests {
     }
 
     #[test]
+    fn target_plan_uses_the_candidate_engine_and_its_effective_punctuation() {
+        let models_dir = PathBuf::from("candidate-models");
+        let plan = StartupPlan::for_target(
+            EngineKind::Whisper,
+            models_dir.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
+            },
+            false,
+        );
+
+        assert_eq!(plan.engine, EngineKind::Whisper);
+        assert_eq!(plan.models_dir, models_dir);
+        assert_eq!(
+            plan.required
+                .iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            [crate::models::VAD_MODEL_ID, crate::models::WHISPER_MODEL_ID,]
+        );
+    }
+
+    #[test]
     fn empty_install_report_is_warm() {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
@@ -186,6 +226,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         );
         let (tx, rx) = mpsc::sync_channel(1);

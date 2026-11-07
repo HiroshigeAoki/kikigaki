@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::config::EngineKind;
 use crate::metrics::Utterance;
 use crate::protocol::{Event, Final};
 
@@ -15,8 +16,11 @@ use crate::protocol::{Event, Final};
 pub enum Input {
     /// The push-to-talk hotkey was pressed.
     Pressed,
-    /// The push-to-talk hotkey was released.
-    Released,
+    /// The push-to-talk hotkey was released using the serving engine.
+    Released {
+        /// Engine active for this utterance, which may differ from a pending desired engine.
+        engine: EngineKind,
+    },
     /// The engine emitted a protocol event.
     Engine(Event),
     /// The engine WebSocket disconnected.
@@ -93,11 +97,13 @@ pub struct Session {
     pending: VecDeque<PendingRow>,
     gen: u64,
     cfg: SessionConfig,
+    armed_final_timeout: Duration,
 }
 
 impl Session {
     /// Creates a disconnected session awaiting engine readiness.
     pub fn new(cfg: SessionConfig) -> Self {
+        let armed_final_timeout = cfg.final_timeout;
         Self {
             state: State::Disconnected,
             t_press: None,
@@ -105,6 +111,7 @@ impl Session {
             pending: VecDeque::new(),
             gen: 0,
             cfg,
+            armed_final_timeout,
         }
     }
 
@@ -127,8 +134,17 @@ impl Session {
                     Output::SetState(State::Recording),
                 ]
             }
-            (State::Recording, Input::Released) => {
+            (State::Recording, Input::Released { engine }) => {
                 self.t_release = Some(now);
+                let recorded_ms = self
+                    .t_press
+                    .map(|press| elapsed_ms(press, now))
+                    .unwrap_or_default();
+                self.armed_final_timeout = Duration::from_millis(final_timeout_ms(
+                    duration_ms(self.cfg.final_timeout),
+                    recorded_ms,
+                    engine,
+                ));
                 self.state = State::Finalizing;
                 vec![
                     Output::StopMic,
@@ -161,7 +177,7 @@ impl Session {
             (State::Finalizing, Input::Tick)
                 if self.t_release.is_some_and(|release| {
                     now.checked_duration_since(release).unwrap_or_default()
-                        >= self.cfg.final_timeout
+                        >= self.armed_final_timeout
                 }) =>
             {
                 self.finish_timeout()
@@ -302,6 +318,18 @@ fn elapsed_ms(start: Instant, end: Instant) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn final_timeout_ms(base_ms: u64, recorded_ms: u64, engine: EngineKind) -> u64 {
+    if engine == EngineKind::Whisper {
+        base_ms.saturating_add(recorded_ms / 2)
+    } else {
+        base_ms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +358,12 @@ mod tests {
             vad_close_to_asr_end_ms: Some(7),
             postprocess_ms: Some(3),
         })
+    }
+
+    fn local_release() -> Input {
+        Input::Released {
+            engine: EngineKind::Local,
+        }
     }
 
     #[test]
@@ -363,7 +397,7 @@ mod tests {
         let now = Instant::now();
         session.handle(Input::Pressed, now);
         assert_eq!(
-            session.handle(Input::Released, now + Duration::from_secs(1)),
+            session.handle(local_release(), now + Duration::from_secs(1)),
             vec![
                 Output::StopMic,
                 Output::EndUtterance {
@@ -379,7 +413,7 @@ mod tests {
     #[test]
     fn released_while_idle_is_ignored() {
         let mut session = session();
-        assert!(session.handle(Input::Released, Instant::now()).is_empty());
+        assert!(session.handle(local_release(), Instant::now()).is_empty());
     }
 
     #[test]
@@ -389,7 +423,7 @@ mod tests {
         let released = pressed + Duration::from_millis(1_000);
         let finalized = released + Duration::from_millis(120);
         session.handle(Input::Pressed, pressed);
-        session.handle(Input::Released, released);
+        session.handle(local_release(), released);
 
         assert_eq!(
             session.handle(Input::Engine(final_event("こんにちは。")), finalized),
@@ -427,7 +461,7 @@ mod tests {
         let released = pressed + Duration::from_millis(500);
         let finalized = released + Duration::from_millis(40);
         session.handle(Input::Pressed, pressed);
-        session.handle(Input::Released, released);
+        session.handle(local_release(), released);
 
         assert_eq!(
             session.handle(Input::Engine(final_event("")), finalized),
@@ -546,7 +580,7 @@ mod tests {
         let second_final = pressed + Duration::from_millis(300);
         session.handle(Input::Pressed, pressed);
         session.handle(Input::Engine(final_event("一")), first_final);
-        session.handle(Input::Released, released);
+        session.handle(local_release(), released);
         session.handle(Input::Engine(final_event("二文")), second_final);
 
         assert!(matches!(
@@ -618,7 +652,7 @@ mod tests {
         let released = pressed + Duration::from_millis(500);
         let repressed = released + Duration::from_millis(100);
         session.handle(Input::Pressed, pressed);
-        session.handle(Input::Released, released);
+        session.handle(local_release(), released);
 
         assert_eq!(
             session.handle(Input::Pressed, repressed),
@@ -643,7 +677,7 @@ mod tests {
         let repressed = released + Duration::from_millis(100);
         let finalized = repressed + Duration::from_millis(80);
         session.handle(Input::Pressed, pressed);
-        session.handle(Input::Released, released);
+        session.handle(local_release(), released);
         session.handle(Input::Pressed, repressed);
 
         assert_eq!(
@@ -666,7 +700,7 @@ mod tests {
         let pressed = Instant::now();
         let released = pressed + Duration::from_millis(1_000);
         session.handle(Input::Pressed, pressed);
-        session.handle(Input::Released, released);
+        session.handle(local_release(), released);
 
         assert!(session
             .handle(Input::Tick, released + Duration::from_millis(2_999))
@@ -697,12 +731,56 @@ mod tests {
     }
 
     #[test]
+    fn whisper_final_timeout_scales_with_recorded_audio() {
+        assert_eq!(final_timeout_ms(3_000, 1_000, EngineKind::Whisper), 3_500);
+        assert_eq!(final_timeout_ms(3_000, 24_000, EngineKind::Whisper), 15_000);
+        assert_eq!(final_timeout_ms(3_000, 24_000, EngineKind::Local), 3_000);
+    }
+
+    #[test]
+    fn long_whisper_recording_accepts_a_late_final_while_local_times_out() {
+        let pressed = Instant::now();
+        let released = pressed + Duration::from_secs(24);
+        let late = released + Duration::from_millis(3_500);
+
+        let mut whisper = session();
+        whisper.handle(Input::Pressed, pressed);
+        whisper.handle(
+            Input::Released {
+                engine: EngineKind::Whisper,
+            },
+            released,
+        );
+        assert!(whisper.handle(Input::Tick, late).is_empty());
+        assert_eq!(
+            whisper.handle(Input::Engine(final_event("遅延")), late),
+            vec![Output::Paste("遅延".into()), Output::SetState(State::Idle)]
+        );
+
+        let mut local = session();
+        local.handle(Input::Pressed, pressed);
+        local.handle(
+            Input::Released {
+                engine: EngineKind::Local,
+            },
+            released,
+        );
+        assert!(matches!(
+            local.handle(Input::Tick, late).as_slice(),
+            [Output::Record(row), Output::SetState(State::Idle)] if row.timeout
+        ));
+        assert!(local
+            .handle(Input::Engine(final_event("遅延")), late)
+            .is_empty());
+    }
+
+    #[test]
     fn error_event_records_timeout_row_and_returns_idle() {
         let mut session = session();
         let pressed = Instant::now();
         let released = pressed + Duration::from_millis(800);
         session.handle(Input::Pressed, pressed);
-        session.handle(Input::Released, released);
+        session.handle(local_release(), released);
 
         assert_eq!(
             session.handle(
@@ -778,7 +856,7 @@ mod tests {
         let mut session = session();
         let now = Instant::now();
         session.handle(Input::Pressed, now);
-        session.handle(Input::Released, now + Duration::from_millis(10));
+        session.handle(local_release(), now + Duration::from_millis(10));
         session.handle(Input::Pressed, now + Duration::from_millis(20));
 
         assert!(session
@@ -795,7 +873,7 @@ mod tests {
         let mut session = session();
         let now = Instant::now();
         session.handle(Input::Pressed, now);
-        session.handle(Input::Released, now + Duration::from_millis(10));
+        session.handle(local_release(), now + Duration::from_millis(10));
 
         assert_eq!(
             session.handle(Input::Pressed, now + Duration::from_millis(20)),

@@ -19,10 +19,15 @@ pub struct Config {
     pub strip_trailing_period: bool,
     /// Silence appended after hotkey release, in milliseconds.
     pub silence_pad_ms: u64,
-    /// Maximum wait for a final transcription, in milliseconds.
+    /// Maximum wait for a final transcription, in milliseconds. Whisper extends this by half the
+    /// recorded utterance duration to accommodate whole-utterance decoding.
     pub final_timeout_ms: u64,
     /// Enable the built-in katakana→English replacement dictionary tier. Default false (opt-in).
     pub builtin_replace_dict: bool,
+    /// Persist successful transcriptions as local JSONL records. Default false (opt-in).
+    pub transcript_log: bool,
+    /// Directory containing date-partitioned transcript logs.
+    pub transcript_dir: PathBuf,
     /// Replacement dictionary used during transcription post-processing.
     pub replace_file: PathBuf,
     /// Destination JSONL file for latency records.
@@ -37,7 +42,7 @@ pub struct Config {
     pub punct: PunctConfig,
     /// Remote hayamimi engine settings.
     pub remote: RemoteConfig,
-    /// Learned correction rules, merged over `replace_file` with priority (§5).
+    /// Hand-edited personal replacement rules, merged over `replace_file` with priority (§5).
     pub learned_file: PathBuf,
 }
 
@@ -49,6 +54,8 @@ pub enum EngineKind {
     Local,
     /// Connect to a hayamimi WebSocket server.
     Remote,
+    /// Run Whisper large-v3-turbo in this process via whisper-rs.
+    Whisper,
 }
 
 /// Method used to insert transcribed text into the frontmost application.
@@ -266,6 +273,8 @@ pub struct Capabilities {
     pub punct: bool,
     /// Whether the remote WebSocket engine is available.
     pub remote_engine: bool,
+    /// Whether the Whisper engine (whisper-rs) is compiled into this build.
+    pub whisper: bool,
 }
 
 impl Default for Config {
@@ -279,6 +288,8 @@ impl Default for Config {
             silence_pad_ms: 500,
             final_timeout_ms: 3_000,
             builtin_replace_dict: false,
+            transcript_log: false,
+            transcript_dir: home.join(".config/kikigaki/transcripts"),
             replace_file: home.join(".config/kikigaki/replace.toml"),
             metrics_path: home.join("Library/Logs/kikigaki/latency.jsonl"),
             models_dir: dirs::data_local_dir()
@@ -359,6 +370,9 @@ impl Config {
         if self.engine == EngineKind::Remote && !caps.remote_engine {
             bail!("engine = \"remote\" requires a build with the remote-engine feature");
         }
+        if self.engine == EngineKind::Whisper && !caps.whisper {
+            bail!("engine = \"whisper\" requires a build with the whisper feature");
+        }
         if self.remote.spawn_sidecar {
             let (host, _) = sidecar_endpoint(&self.remote.ws_url)?;
             let loopback = host == "localhost"
@@ -372,23 +386,30 @@ impl Config {
         Ok(())
     }
 
+    /// Returns whether the selected engine already punctuates its own output, making local
+    /// punctuation redundant (and, for Whisper, actively wrong to layer on top of).
+    pub fn engine_punctuates(&self) -> bool {
+        match self.engine {
+            EngineKind::Remote => self.remote.server_punctuates,
+            EngineKind::Whisper => true,
+            EngineKind::Local => false,
+        }
+    }
+
     fn expand_paths(&mut self) {
         self.replace_file = expand_tilde(&self.replace_file);
         self.metrics_path = expand_tilde(&self.metrics_path);
         self.models_dir = expand_tilde(&self.models_dir);
         self.learned_file = expand_tilde(&self.learned_file);
+        self.transcript_dir = expand_tilde(&self.transcript_dir);
         self.remote.hayamimi_dir = expand_tilde(&self.remote.hayamimi_dir);
         self.remote.python = expand_tilde(&self.remote.python);
     }
 }
 
 /// Returns whether this process should run punctuation for the selected engine.
-///
-/// A remote server that already punctuates its output suppresses local punctuation even when
-/// punctuation support is otherwise enabled.
 pub fn punct_effective(config: &Config, caps: Capabilities) -> bool {
-    config.punct.effective(caps)
-        && !(config.engine == EngineKind::Remote && config.remote.server_punctuates)
+    config.punct.effective(caps) && !config.engine_punctuates()
 }
 
 const LEGACY_REMOTE_KEYS: &[&str] = &[
@@ -480,9 +501,11 @@ mod tests {
     fn default_round_trips_through_toml() {
         let expected = Config::default();
         assert!(!expected.builtin_replace_dict);
+        assert!(!expected.transcript_log);
         let actual: Config = toml::from_str(&toml::to_string(&expected).unwrap()).unwrap();
         assert_eq!(actual, expected);
         assert!(!actual.builtin_replace_dict);
+        assert!(!actual.transcript_log);
         assert_eq!(actual.engine, EngineKind::Local);
         assert_eq!(actual.asr.num_threads, 4);
         assert_eq!(actual.asr.hotwords_score, 3.0);
@@ -503,7 +526,22 @@ mod tests {
         assert!(actual
             .learned_file
             .ends_with(".config/kikigaki/learned.toml"));
+        assert!(actual
+            .transcript_dir
+            .ends_with(".config/kikigaki/transcripts"));
         assert!(default_path().ends_with(".config/kikigaki/config.toml"));
+    }
+
+    #[test]
+    fn engine_kind_whisper_round_trips_through_toml() {
+        let cfg = Config {
+            engine: EngineKind::Whisper,
+            ..Config::default()
+        };
+        let actual: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(actual.engine, EngineKind::Whisper);
+        let raw = toml::to_string(&cfg).unwrap();
+        assert!(raw.contains("engine = \"whisper\""), "{raw}");
     }
 
     #[test]
@@ -513,6 +551,21 @@ mod tests {
         let actual = Config::load(Some(&path)).unwrap();
         assert!(actual.builtin_replace_dict);
         assert_eq!(actual.engine, Config::default().engine);
+    }
+
+    #[test]
+    fn transcript_log_settings_load_and_expand_tilde() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(
+            &temp,
+            "transcript_log = true\ntranscript_dir = \"~/private-transcripts\"\n",
+        );
+        let actual = Config::load(Some(&path)).unwrap();
+        assert!(actual.transcript_log);
+        assert_eq!(
+            actual.transcript_dir,
+            home_dir().join("private-transcripts")
+        );
     }
 
     #[test]
@@ -552,6 +605,7 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         };
         for hotwords_score in [0.0, f32::INFINITY, f32::NAN, -1.0] {
             let mut config = Config::default();
@@ -610,6 +664,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -618,6 +673,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -626,6 +682,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         let cfg = Config {
@@ -636,6 +693,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -644,12 +702,14 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_err());
         assert!(Config::default()
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
+                whisper: false,
             })
             .is_ok());
     }
@@ -662,6 +722,7 @@ mod tests {
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
+                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("punct"));
@@ -669,6 +730,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_ok());
     }
@@ -683,6 +745,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: false,
+                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("remote-engine"));
@@ -690,6 +753,30 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_whisper_engine_without_the_feature_when_capabilities_say_so() {
+        let cfg = Config {
+            engine: EngineKind::Whisper,
+            ..Config::default()
+        };
+        let error = cfg
+            .validate(Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: false,
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("whisper"));
+        assert!(cfg
+            .validate(Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
             })
             .is_ok());
     }
@@ -702,6 +789,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("loopback"));
@@ -716,6 +804,7 @@ mod tests {
                 cfg.validate(Capabilities {
                     punct: true,
                     remote_engine: true,
+                    whisper: false,
                 })
                 .is_ok(),
                 "{url}"
@@ -728,6 +817,7 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             })
             .is_ok());
     }
@@ -738,15 +828,18 @@ mod tests {
         assert!(cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         }));
         assert!(!cfg.punct.effective(Capabilities {
             punct: false,
             remote_engine: true,
+            whisper: false,
         }));
         cfg.punct.enabled = PunctEnabled::Off;
         assert!(!cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
+            whisper: false,
         }));
 
         cfg.punct.enabled = PunctEnabled::On;
@@ -757,6 +850,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             }
         ));
         cfg.remote.server_punctuates = false;
@@ -765,8 +859,26 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             }
         ));
+    }
+
+    #[test]
+    fn whisper_engine_always_suppresses_local_punctuation() {
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            whisper: true,
+        };
+        let mut cfg = Config {
+            engine: EngineKind::Whisper,
+            ..Config::default()
+        };
+        cfg.punct.enabled = PunctEnabled::On;
+        assert!(!punct_effective(&cfg, caps));
+        cfg.punct.enabled = PunctEnabled::Off;
+        assert!(!punct_effective(&cfg, caps));
     }
 
     #[test]

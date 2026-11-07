@@ -13,6 +13,7 @@ required_files=(
   "silero-vad/silero_vad.onnx"
   "mojicast-punct/punct_bert.int8.onnx"
   "mojicast-punct/vocab.txt"
+  "whisper-large-v3-turbo-q8_0/ggml-large-v3-turbo-q8_0.bin"
 )
 
 if [[ ! -d "$KIKIGAKI_MODELS_DIR" ]]; then
@@ -22,6 +23,11 @@ fi
 for relative in "${required_files[@]}"; do
   if [[ ! -f "$KIKIGAKI_MODELS_DIR/$relative" ]]; then
     echo "required model file missing: $KIKIGAKI_MODELS_DIR/$relative" >&2
+    if [[ "$relative" == "whisper-large-v3-turbo-q8_0/ggml-large-v3-turbo-q8_0.bin" ]]; then
+      # Keep this pinned URL in sync with the Whisper entry in
+      # crates/kikigaki-core/src/models/mod.rs.
+      echo "download it from: https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q8_0.bin" >&2
+    fi
     exit 1
   fi
 done
@@ -36,7 +42,12 @@ done
 
 test_output="$(mktemp)"
 trap 'rm -f "$test_output"' EXIT
-cargo test --offline --locked -p kikigaki-engine --all-features -- --nocapture 2>&1 | tee "$test_output"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  features="punct,whisper,whisper-metal"
+else
+  features="punct,whisper"
+fi
+cargo test --offline --locked -p kikigaki-engine --features "$features" -- --nocapture 2>&1 | tee "$test_output"
 
 if grep -q "SKIPPED" "$test_output"; then
   echo "real-model test run contained SKIPPED" >&2

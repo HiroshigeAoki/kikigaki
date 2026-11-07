@@ -5,13 +5,16 @@ use std::path::{Path, PathBuf};
 use kikigaki_core::config::{Capabilities, Config, PunctEnabled};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
     pub hotkey: Option<String>,
     pub punctuation: Option<PunctSetting>,
+    pub strip_trailing_period: Option<bool>,
     /// JSON uses `builtinReplaceDict`; snapshots and persisted TOML stay snake_case.
     pub builtin_replace_dict: Option<bool>,
+    pub transcript_log: Option<bool>,
+    pub engine: Option<kikigaki_core::config::EngineKind>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
@@ -28,7 +31,13 @@ pub struct SettingsSnapshot {
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
     pub builtin_replace_dict: bool,
+    pub transcript_log: bool,
+    pub transcript_dir: PathBuf,
     pub paste_method: kikigaki_core::config::PasteMethod,
+    pub engine: kikigaki_core::config::EngineKind,
+    pub active_engine: kikigaki_core::config::EngineKind,
+    pub engine_punctuates: bool,
+    pub whisper_available: bool,
 }
 
 pub struct SettingsCoordinator {
@@ -50,13 +59,20 @@ impl SettingsCoordinator {
         })
     }
 
+    /// UI-bound snapshots must use the controller's active-engine-aware `settings_snapshot()`.
     pub fn snapshot(&self) -> SettingsSnapshot {
         SettingsSnapshot {
             hotkey: self.config.hotkey.clone(),
             punct_enabled: kikigaki_core::config::punct_effective(&self.config, self.capabilities),
             strip_trailing_period: self.config.strip_trailing_period,
             builtin_replace_dict: self.config.builtin_replace_dict,
+            transcript_log: self.config.transcript_log,
+            transcript_dir: self.config.transcript_dir.clone(),
             paste_method: self.config.paste_method,
+            engine: self.config.engine,
+            active_engine: self.config.engine,
+            engine_punctuates: self.config.engine_punctuates(),
+            whisper_available: self.capabilities.whisper && cfg!(target_os = "macos"),
         }
     }
 
@@ -107,9 +123,31 @@ impl SettingsCoordinator {
             };
             candidate.strip_trailing_period = strip;
         }
+        if let Some(strip) = patch.strip_trailing_period {
+            document["strip_trailing_period"] = toml_edit::value(strip);
+            candidate.strip_trailing_period = strip;
+        }
         if let Some(enabled) = patch.builtin_replace_dict {
             document["builtin_replace_dict"] = toml_edit::value(enabled);
             candidate.builtin_replace_dict = enabled;
+        }
+        if let Some(enabled) = patch.transcript_log {
+            document["transcript_log"] = toml_edit::value(enabled);
+            candidate.transcript_log = enabled;
+        }
+        if let Some(engine) = patch.engine {
+            candidate.engine = engine;
+            candidate
+                .validate(self.capabilities)
+                .map_err(|_error| crate::status::UiError {
+                    code: "unsupported_engine",
+                    message: "この機能はこのビルドでは利用できません".into(),
+                })?;
+            document["engine"] = toml_edit::value(match engine {
+                kikigaki_core::config::EngineKind::Local => "local",
+                kikigaki_core::config::EngineKind::Remote => "remote",
+                kikigaki_core::config::EngineKind::Whisper => "whisper",
+            });
         }
 
         let body = document.to_string();
@@ -180,7 +218,7 @@ pub fn parse_chord(chord: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kikigaki_core::config::Capabilities;
+    use kikigaki_core::config::{Capabilities, EngineKind};
 
     #[test]
     fn builtin_replace_dict_patch_uses_camel_case_json_wire_key() {
@@ -191,6 +229,46 @@ mod tests {
         let snake_case: SettingsPatch =
             serde_json::from_str(r#"{"builtin_replace_dict": true}"#).unwrap();
         assert_eq!(snake_case.builtin_replace_dict, None);
+    }
+
+    #[test]
+    fn transcript_log_patch_uses_camel_case_json_wire_key() {
+        let patch: SettingsPatch = serde_json::from_str(r#"{"transcriptLog": true}"#).unwrap();
+        assert_eq!(patch.transcript_log, Some(true));
+        let snake_case: SettingsPatch =
+            serde_json::from_str(r#"{"transcript_log": true}"#).unwrap();
+        assert_eq!(snake_case.transcript_log, None);
+    }
+
+    #[test]
+    fn settings_patch_default_changes_nothing() {
+        let patch = SettingsPatch::default();
+
+        assert!(patch.hotkey.is_none());
+        assert!(patch.punctuation.is_none());
+        assert!(patch.strip_trailing_period.is_none());
+        assert!(patch.builtin_replace_dict.is_none());
+        assert!(patch.engine.is_none());
+    }
+
+    #[test]
+    fn coordinator_snapshot_initializes_active_engine_from_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "engine = \"local\"\n").unwrap();
+        let coordinator = SettingsCoordinator::load(
+            path,
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
+            },
+        )
+        .unwrap();
+
+        let snapshot = coordinator.snapshot();
+        assert_eq!(snapshot.engine, EngineKind::Local);
+        assert_eq!(snapshot.active_engine, EngineKind::Local);
     }
 
     #[test]
@@ -251,6 +329,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -258,7 +337,10 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Cmd+Shift+Space".into()),
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
+                transcript_log: None,
+                engine: None,
             })
             .unwrap();
         let on_disk = std::fs::read_to_string(path).unwrap();
@@ -281,6 +363,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -289,7 +372,10 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: Some(true),
+                transcript_log: None,
+                engine: None,
             })
             .unwrap();
 
@@ -302,6 +388,115 @@ mod tests {
     }
 
     #[test]
+    fn transcript_log_patch_persists_and_updates_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: false,
+            },
+        )
+        .unwrap();
+        let snapshot = coordinator
+            .apply(SettingsPatch {
+                transcript_log: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(snapshot.transcript_log);
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("transcript_log = true"));
+    }
+
+    #[test]
+    fn engine_patch_persists_and_updates_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
+            },
+        )
+        .unwrap();
+
+        let snapshot = coordinator
+            .apply(SettingsPatch {
+                hotkey: None,
+                punctuation: None,
+                strip_trailing_period: None,
+                builtin_replace_dict: None,
+                transcript_log: None,
+                engine: Some(kikigaki_core::config::EngineKind::Whisper),
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.engine, kikigaki_core::config::EngineKind::Whisper);
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert!(on_disk.contains("engine = \"whisper\""), "{on_disk}");
+    }
+
+    #[test]
+    fn engine_patch_to_whisper_is_rejected_without_the_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path,
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: false,
+            },
+        )
+        .unwrap();
+
+        let error = coordinator
+            .apply(SettingsPatch {
+                hotkey: None,
+                punctuation: None,
+                strip_trailing_period: None,
+                builtin_replace_dict: None,
+                transcript_log: None,
+                engine: Some(kikigaki_core::config::EngineKind::Whisper),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "unsupported_engine");
+        assert_eq!(
+            coordinator.config().engine,
+            kikigaki_core::config::EngineKind::Local
+        );
+    }
+
+    #[test]
+    fn whisper_ui_availability_is_os_gated_independently_of_config_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "engine = \"whisper\"\n").unwrap();
+        let capabilities = Capabilities {
+            punct: true,
+            remote_engine: true,
+            whisper: true,
+        };
+        let coordinator = SettingsCoordinator::load(path, capabilities).unwrap();
+
+        assert!(coordinator.config().validate(capabilities).is_ok());
+        assert_eq!(
+            coordinator.snapshot().whisper_available,
+            cfg!(target_os = "macos")
+        );
+    }
+
+    #[test]
     fn absent_builtin_replace_dict_patch_leaves_file_and_config_value_unchanged() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
@@ -311,6 +506,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -320,7 +516,10 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
+                transcript_log: None,
+                engine: None,
             })
             .unwrap();
 
@@ -340,6 +539,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -347,10 +547,50 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: Some(PunctSetting::OnStrip),
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
+                transcript_log: None,
+                engine: None,
             })
             .unwrap();
         assert!(snapshot.punct_enabled && snapshot.strip_trailing_period);
+    }
+
+    #[test]
+    fn strip_trailing_period_patch_persists_without_changing_punct_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "strip_trailing_period = true\n[punct]\nenabled = false\n",
+        )
+        .unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: true,
+                whisper: true,
+            },
+        )
+        .unwrap();
+
+        let snapshot = coordinator
+            .apply(SettingsPatch {
+                strip_trailing_period: Some(false),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+
+        assert!(!snapshot.punct_enabled);
+        assert!(!snapshot.strip_trailing_period);
+        assert_eq!(coordinator.config().punct.enabled, PunctEnabled::Off);
+        let on_disk = std::fs::read_to_string(path).unwrap();
+        assert!(
+            on_disk.contains("strip_trailing_period = false"),
+            "{on_disk}"
+        );
+        assert!(on_disk.contains("enabled = false"), "{on_disk}");
     }
 
     #[test]
@@ -367,6 +607,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -384,6 +625,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -392,7 +634,10 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Ctrl+Space".into()),
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
+                transcript_log: None,
+                engine: None,
             })
             .unwrap_err();
         assert_eq!(error.code, "external_change");
@@ -408,6 +653,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -418,7 +664,10 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: None,
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: Some(true),
+                transcript_log: None,
+                engine: None,
             })
             .unwrap_err();
 
@@ -439,6 +688,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
+                whisper: false,
             },
         )
         .unwrap();
@@ -447,7 +697,10 @@ mod tests {
             .apply(SettingsPatch {
                 hotkey: Some("Cmd+Space".into()),
                 punctuation: None,
+                strip_trailing_period: None,
                 builtin_replace_dict: None,
+                transcript_log: None,
+                engine: None,
             })
             .is_err());
         assert_eq!(coordinator.snapshot().hotkey, "Alt+Space");

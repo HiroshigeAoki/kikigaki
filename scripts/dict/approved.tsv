@@ -74,6 +74,7 @@
 クラウドフロント	CloudFront	neologd	neologd-seed.csv.xz:276875	well-known dev term; reading verified
 クロミウム	Chromium	neologd	neologd-seed.csv.xz:142377	well-known dev term; reading verified
 クロード	Claude	curated-extra	curated-extra.tsv (Stage C gap addition)	ambiguity resolved: person-name co-claimants in seed
+クロードコード	Claude Code	curated-extra	curated-extra.tsv (user request 2026-10-11)	human-authored curated entry
 クロームキャスト	Chromecast	neologd	neologd-seed.csv.xz:276077	well-known dev term; reading verified
 クーバネティス	Kubernetes	curated-extra	curated-extra.tsv:6: Long-vowel variant	human-authored curated entry
 クーベネティス	Kubernetes	curated-extra	curated-extra.tsv:7: Alternative long-vowel variant	human-authored curated entry

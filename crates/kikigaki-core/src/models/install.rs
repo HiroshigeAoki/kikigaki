@@ -656,6 +656,19 @@ mod tests {
 
     fn no_progress(_: Progress<'_>) {}
 
+    struct FailingFetcher;
+
+    impl Fetcher for FailingFetcher {
+        fn fetch(
+            &self,
+            _url: &str,
+            _dest: &mut dyn Write,
+            _progress: &mut dyn FnMut(u64),
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("fixture download failed")
+        }
+    }
+
     #[test]
     fn installs_single_file_and_writes_marker() {
         let temp = tempfile::tempdir().unwrap();
@@ -676,6 +689,24 @@ mod tests {
             std::fs::read_to_string(temp.path().join("single/.ok")).unwrap(),
             crate::models::ok_marker(&model)
         );
+        assert!(crate::models::is_installed(temp.path(), &model));
+    }
+
+    #[test]
+    fn a_failed_download_leaves_no_partial_install_and_a_later_retry_can_still_succeed() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = tempfile::tempdir().unwrap();
+        write_download(downloads.path(), "model.bin", b"model-data");
+        let model = file_model("single", "model.bin", b"model-data");
+        let mut progress = no_progress;
+
+        assert!(install(temp.path(), &model, &FailingFetcher, &mut progress).is_err());
+        assert!(!crate::models::is_installed(temp.path(), &model));
+
+        let fetcher = FileFetcher {
+            root: downloads.path().to_path_buf(),
+        };
+        assert!(install(temp.path(), &model, &fetcher, &mut progress).unwrap());
         assert!(crate::models::is_installed(temp.path(), &model));
     }
 

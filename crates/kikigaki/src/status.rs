@@ -9,6 +9,7 @@ pub struct UiStatus {
     pub hotkey: String,
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
+    pub engine_punctuates: bool,
     pub engine: &'static str,
 }
 
@@ -52,7 +53,6 @@ pub struct UiSnapshot {
     pub autostart: AutostartState,
     pub onboarding: Option<OnboardingState>,
     pub history: Vec<crate::history::HistoryEntry>,
-    pub learned_rules: Vec<crate::learned::LearnedRule>,
     pub bootstrap_error: Option<BootstrapError>,
 }
 

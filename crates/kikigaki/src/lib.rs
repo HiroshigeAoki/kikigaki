@@ -6,12 +6,12 @@
 //! to Tauri without exposing platform handles to the controller thread.
 
 pub mod controller;
-pub mod correction;
 pub mod history;
 pub mod learned;
 pub mod settings;
 mod shutdown;
 pub mod status;
+pub mod transcript;
 pub mod tray;
 
 mod cli;

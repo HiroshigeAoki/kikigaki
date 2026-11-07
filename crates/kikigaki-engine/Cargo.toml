@@ -8,6 +8,8 @@ license.workspace = true
 default = []
 # Mojicast punctuation inference through `ort` (dlopen of a separate libonnxruntime).
 punct = ["dep:ort"]
+whisper = ["dep:whisper-rs"]
+whisper-metal = ["whisper", "whisper-rs/metal"]
 
 [dependencies]
 kikigaki-core = { path = "../kikigaki-core" }
@@ -20,3 +22,4 @@ tempfile.workspace = true
 sha2 = "0.10"
 hex = "0.4"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic"], optional = true }
+whisper-rs = { version = "=0.16.0", optional = true, default-features = false }

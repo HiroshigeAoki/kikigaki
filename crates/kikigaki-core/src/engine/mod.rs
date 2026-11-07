@@ -210,6 +210,11 @@ pub trait Engine: Send {
     ///
     /// Implementations that cannot provide producer-side wakeups may keep the default no-op.
     fn set_waker(&mut self, _waker: Option<Waker>) {}
+    /// Best-effort request to abort the in-flight decode for `gen`, if any.
+    ///
+    /// Implementations that cannot preempt a blocking decode keep the default no-op; the ordered
+    /// [`EngineCmd::Cancel`] remains the fallback path once the current call returns.
+    fn cancel(&self, _gen: u64) {}
     /// Requests shutdown and waits at most two seconds for the worker.
     ///
     /// Implementations send `Shutdown` best-effort, wait on a done channel, and join only after
@@ -310,6 +315,16 @@ impl EngineSupervisor {
     /// Returns a command sink when an engine currently exists.
     pub fn sink(&self) -> Option<AudioSink> {
         self.current.as_ref().map(|engine| engine.sink())
+    }
+
+    /// Best-effort request to abort the in-flight decode for `gen`.
+    ///
+    /// This is a no-op when there is no current engine, or when the current engine keeps the
+    /// default [`Engine::cancel`] implementation.
+    pub fn cancel(&self, gen: u64) {
+        if let Some(engine) = self.current.as_ref() {
+            engine.cancel(gen);
+        }
     }
 
     /// Returns the current engine phase.
@@ -610,6 +625,46 @@ mod tests {
             Some(EngineMsg::Disconnected { .. })
         ));
         assert_eq!(failed.phase(), EnginePhase::Failed);
+    }
+
+    #[test]
+    fn supervisor_cancel_forwards_to_the_current_engine_and_is_a_noop_without_one() {
+        struct CancelTrackingEngine {
+            inner: FakeEngine,
+            canceled: Arc<std::sync::Mutex<Vec<u64>>>,
+        }
+
+        impl Engine for CancelTrackingEngine {
+            fn sink(&self) -> AudioSink {
+                self.inner.sink()
+            }
+
+            fn events(&mut self) -> &mut Receiver<EngineMsg> {
+                self.inner.events()
+            }
+
+            fn cancel(&self, gen: u64) {
+                self.canceled.lock().unwrap().push(gen);
+            }
+
+            fn shutdown(self: Box<Self>) {}
+        }
+
+        let canceled = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine_canceled = Arc::clone(&canceled);
+        let mut supervisor = EngineSupervisor::new(Box::new(move || {
+            Ok(Box::new(CancelTrackingEngine {
+                inner: FakeEngine::new(),
+                canceled: Arc::clone(&engine_canceled),
+            }))
+        }));
+
+        supervisor.cancel(6);
+        assert!(canceled.lock().unwrap().is_empty());
+
+        supervisor.start().unwrap();
+        supervisor.cancel(7);
+        assert_eq!(*canceled.lock().unwrap(), vec![7]);
     }
 
     #[test]

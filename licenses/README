@@ -9,6 +9,7 @@ Files here:
 
 - sherpa-onnx.LICENSE  — Apache License 2.0 (k2-fsa/sherpa-onnx)
 - onnxruntime.LICENSE  — MIT License (microsoft/onnxruntime)
+- whisper-cpp.LICENSE — MIT License (ggerganov/whisper.cpp and ggml)
 - silero-vad.LICENSE   — MIT License (snakers4/silero-vad)
 - hayamimi.LICENSE     — MIT License (oboroge0/hayamimi)
 

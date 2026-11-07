@@ -1,31 +1,27 @@
-/// Removes Whisper's Japanese punctuation and question marks, and whitespace except
-/// between ASCII alphanumeric characters. Preserved whitespace runs remain unchanged.
+/// Removes Whisper's Japanese punctuation and question marks, then removes whitespace
+/// unless both neighbouring characters are ASCII (so English phrases keep their spaces
+/// while spaces next to Japanese text go). Preserved whitespace runs remain unchanged.
 pub fn strip_whisper_punct(s: &str) -> String {
+    let chars: Vec<char> = s
+        .chars()
+        .filter(|ch| !matches!(ch, '、' | '。' | '?' | '？'))
+        .collect();
+    let is_ascii = |ch: Option<&char>| ch.is_some_and(char::is_ascii_graphic);
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.char_indices().peekable();
-    let mut previous = None::<char>;
-    while let Some((start, ch)) = chars.next() {
-        if ch.is_whitespace() {
-            let mut end = start + ch.len_utf8();
-            while let Some(&(index, next)) = chars.peek() {
-                if !next.is_whitespace() {
-                    break;
-                }
-                end = index + next.len_utf8();
-                chars.next();
-            }
-            if previous.is_some_and(|ch| ch.is_ascii_alphanumeric())
-                && chars
-                    .peek()
-                    .is_some_and(|(_, ch)| ch.is_ascii_alphanumeric())
-            {
-                result.push_str(&s[start..end]);
-            }
-        } else {
-            if !matches!(ch, '、' | '。' | '?' | '？') {
-                result.push(ch);
-            }
-            previous = Some(ch);
+    let mut index = 0;
+    while index < chars.len() {
+        if !chars[index].is_whitespace() {
+            result.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+            index += 1;
+        }
+        let before = start.checked_sub(1).and_then(|i| chars.get(i));
+        if is_ascii(before) && is_ascii(chars.get(index)) {
+            result.extend(&chars[start..index]);
         }
     }
     result
@@ -65,8 +61,24 @@ mod tests {
             ("Shift Alt Space", "Shift Alt Space"),
             (" \t\u{3000}a \t\u{3000}B 12\t3 ", "a \t\u{3000}B 12\t3"),
             ("甲 \t\u{3000}乙", "甲乙"),
-            ("a ! b . c , d 「 e 」", "a!b.c,d「e」"),
+            ("a ! b . c , d 「 e 」", "a ! b . c , d「e」"),
             (" \t\u{3000}", ""),
+        ] {
+            assert_eq!(strip_whisper_punct(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_whitespace_between_ascii_words_around_stripped_question_marks() {
+        for (input, expected) in [
+            ("a? b", "a b"),
+            ("a ?b", "a b"),
+            ("甲 ? 乙", "甲乙"),
+            ("これは test? です", "これはtestです"),
+            (
+                "Run kubectl apply. Then check the pods, ok",
+                "Run kubectl apply. Then check the pods, ok",
+            ),
         ] {
             assert_eq!(strip_whisper_punct(input), expected, "{input:?}");
         }

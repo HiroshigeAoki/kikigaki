@@ -822,8 +822,10 @@ fn spawn_controller_death_monitor(
                         tracing::info!(source = "controller death", "quit requested");
                         let mut snapshot = state.latest.lock().unwrap().clone();
                         snapshot.status.state = "disconnected";
+                        snapshot.status.level = "error";
                         snapshot.status.phase = "failed";
-                        snapshot.status.message = Some("controller stopped".into());
+                        snapshot.status.message = Some("内部エラーが発生したため終了します".into());
+                        snapshot.status.detail = Some("controller stopped".into());
                         TauriSink(app.clone()).publish(snapshot);
                     }
                 }

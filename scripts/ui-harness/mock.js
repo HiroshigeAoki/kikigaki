@@ -89,7 +89,8 @@
       settings: { ...WORST_HOTKEYS, long_state: { kind: 'failed', message: LONG_PATH_ERROR }, transcript_log: true },
       status: {
         state: 'disconnected', level: 'error', phase: 'failed',
-        message: `Startup failed — ${LONG_PATH_ERROR}`,
+        message: '音声エンジンを起動できませんでした',
+        detail: LONG_PATH_ERROR,
       },
       autostart: { enabled: false, available: false },
       history: WORST_HISTORY,

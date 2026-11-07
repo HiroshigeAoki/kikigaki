@@ -1595,8 +1595,9 @@ impl Controller {
                             Ok(()) => true,
                             Err(error) => {
                                 tracing::error!(error = %format!("{error:#}"), "failed to start transcription engine");
-                                self.status =
-                                    Status::startup_failed(error.to_string());
+                                self.status = Status::startup_failed(format!(
+                                    "Engine start failed — {error}"
+                                ));
                                 false
                             }
                         }

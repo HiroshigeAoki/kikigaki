@@ -3551,9 +3551,17 @@ mod tests {
                 Some(notice)
             );
             finish(&mut h, &rx, EngineKind::Local, 1, text);
+            // StartMic consults the real macOS microphone permission even under test. An
+            // unprivileged test process gets the permission warning, and an empty result pastes
+            // nothing that would clear it, so the warning rightly outranks the notice.
+            let expected = if text.is_empty() && crate::controller::microphone_permission_denied() {
+                crate::controller::MICROPHONE_PERMISSION_DENIED
+            } else {
+                notice
+            };
             assert_eq!(
                 h.controller.snapshot().status.message.as_deref(),
-                Some(notice)
+                Some(expected)
             );
             assert!(commands(&h, EngineKind::Whisper).is_empty());
             edges(&mut h, [HotkeyEdge::Pressed(HotkeyKey::Standard)]);

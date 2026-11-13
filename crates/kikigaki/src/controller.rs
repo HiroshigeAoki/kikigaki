@@ -4954,8 +4954,16 @@ mod tests {
             None,
             poll_interval,
         );
-        wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
-        harness
+        // Fake startup and engine progress never wakes the controller, so drive
+        // the loop with explicit wakes: a slow poll tick would outlast any wait.
+        for _ in 0..300 {
+            if latest(&harness).is_some_and(|snapshot| snapshot.status.state == "idle") {
+                return harness;
+            }
+            harness.client.wake();
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("harness never became idle; latest={:?}", latest(&harness));
     }
 
     fn ready_harness_with_builtin_enabled() -> Harness {
@@ -6009,9 +6017,15 @@ mod tests {
         assert_eq!(session.state(), State::Idle);
     }
 
+    // The two tests below prove the controller handles an input on its own wake,
+    // not on the next poll tick. The tick is far beyond the bound, so a missed wake still
+    // fails, while the wide bound tolerates a heavily loaded test host.
+    const SLOW_POLL_INTERVAL: Duration = Duration::from_secs(5);
+    const WAKE_HANDLING_BOUND: Duration = Duration::from_secs(1);
+
     #[test]
     fn engine_final_is_processed_without_waiting_for_the_poll_tick() {
-        let harness = ready_harness_with_poll_interval(Duration::from_millis(500));
+        let harness = ready_harness_with_poll_interval(SLOW_POLL_INTERVAL);
         harness
             .hotkey
             .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
@@ -6028,7 +6042,7 @@ mod tests {
         harness.client.wake();
         while harness.pastes.attempts.lock().unwrap().is_empty() {
             assert!(
-                started.elapsed() < Duration::from_millis(100),
+                started.elapsed() < WAKE_HANDLING_BOUND,
                 "engine final waited for the poll tick"
             );
             thread::yield_now();
@@ -6037,14 +6051,14 @@ mod tests {
 
     #[test]
     fn hotkey_edge_is_handled_without_waiting_for_the_poll_tick() {
-        let harness = ready_harness_with_poll_interval(Duration::from_millis(500));
+        let harness = ready_harness_with_poll_interval(SLOW_POLL_INTERVAL);
         let started = Instant::now();
         harness
             .hotkey
             .send(HotkeyEdge::Pressed(HotkeyKey::Standard));
         while latest(&harness).unwrap().status.state != "recording" {
             assert!(
-                started.elapsed() < Duration::from_millis(100),
+                started.elapsed() < WAKE_HANDLING_BOUND,
                 "hotkey edge waited for the poll tick"
             );
             thread::yield_now();

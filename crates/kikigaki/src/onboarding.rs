@@ -57,7 +57,7 @@ fn consent_copy(required: &[&'static kikigaki_core::models::Model]) -> String {
         }
     }
     format!(
-        "{} MB のダウンロード（インストール後 {} MB）",
+        "{}\u{a0}MB のダウンロード（インストール後 {}\u{a0}MB）",
         transfer_bytes / 1_000_000,
         installed_bytes / 1_000_000,
     )
@@ -164,11 +164,11 @@ mod tests {
     fn consent_copy_sums_transfer_and_installed_bytes_from_required_payloads() {
         assert_eq!(
             consent_copy(&[&MODELS[0], &MODELS[1]]),
-            "438 MB のダウンロード（インストール後 73 MB）"
+            "438\u{a0}MB のダウンロード（インストール後 73\u{a0}MB）"
         );
         assert_eq!(
             consent_copy(&[]),
-            "0 MB のダウンロード（インストール後 0 MB）"
+            "0\u{a0}MB のダウンロード（インストール後 0\u{a0}MB）"
         );
     }
 }

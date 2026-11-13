@@ -375,7 +375,10 @@ fn default_snapshot(
                 "ok"
             },
             phase,
-            message: bootstrap_error.as_ref().map(|error| error.message.clone()),
+            message: bootstrap_error
+                .as_ref()
+                .map(|_| "設定ファイルを読み込めませんでした".to_owned()),
+            detail: bootstrap_error.as_ref().map(|error| error.message.clone()),
             hotkey: settings_snapshot.hotkey.clone(),
             punct_enabled: settings_snapshot.punct_enabled,
             strip_trailing_period: settings_snapshot.strip_trailing_period,
@@ -819,8 +822,10 @@ fn spawn_controller_death_monitor(
                         tracing::info!(source = "controller death", "quit requested");
                         let mut snapshot = state.latest.lock().unwrap().clone();
                         snapshot.status.state = "disconnected";
+                        snapshot.status.level = "error";
                         snapshot.status.phase = "failed";
-                        snapshot.status.message = Some("controller stopped".into());
+                        snapshot.status.message = Some("内部エラーが発生したため終了します".into());
+                        snapshot.status.detail = Some("controller stopped".into());
                         TauriSink(app.clone()).publish(snapshot);
                     }
                 }

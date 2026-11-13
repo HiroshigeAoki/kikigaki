@@ -8,8 +8,14 @@ use sherpa_onnx::{
     VoiceActivityDetector,
 };
 
-use crate::hotwords::materialize;
+use crate::hotwords::{atomic_write, materialize};
 use crate::local::{Recognizer, Vad, VadSegment};
+
+/// ONNX Runtime session entries that park idle worker threads instead of spinning. sherpa-onnx
+/// gives the encoder, decoder and joiner their own intra- and inter-op pools, and spinning pools
+/// contend for cores: on an M1 decoding was about 25% slower with spinning left on.
+const NO_SPIN_PROVIDER_CONFIG: &str = "SessionConfig.session.intra_op.allow_spinning=0\n\
+                                       SessionConfig.session.inter_op.allow_spinning=0\n";
 
 /// A loaded sherpa-onnx voice activity detector.
 pub struct SherpaVad {
@@ -46,11 +52,7 @@ pub fn build_vad(models_dir: &Path, config: &VadConfig) -> anyhow::Result<Sherpa
 
 /// Loads the configured ReazonSpeech transducer from `models_dir`.
 pub fn build_recognizer(models_dir: &Path, config: &AsrConfig) -> anyhow::Result<SherpaAsr> {
-    let sherpa_config = recognizer_config(models_dir, config, None)?;
-    let path = models_dir.join(ASR_MODEL_ID);
-    let recognizer = OfflineRecognizer::create(&sherpa_config)
-        .ok_or_else(|| anyhow!("failed to load {ASR_MODEL_ID} from {}", path.display()))?;
-    Ok(SherpaAsr { recognizer })
+    create_recognizer(models_dir, recognizer_config(models_dir, config, None)?)
 }
 
 /// Loads the configured recognizer, optionally enabling embedded hotword biasing.
@@ -111,10 +113,43 @@ pub fn build_recognizer_with_hotwords(
 
     let sherpa_config =
         recognizer_config(models_dir, config, Some((hotwords_file, score, bpe_vocab)))?;
+    create_recognizer(models_dir, sherpa_config)
+}
+
+fn create_recognizer(
+    models_dir: &Path,
+    mut sherpa_config: OfflineRecognizerConfig,
+) -> anyhow::Result<SherpaAsr> {
+    sherpa_config.model_config.provider = Some(cpu_provider(models_dir));
     let path = models_dir.join(ASR_MODEL_ID);
     let recognizer = OfflineRecognizer::create(&sherpa_config)
         .ok_or_else(|| anyhow!("failed to load {ASR_MODEL_ID} from {}", path.display()))?;
     Ok(SherpaAsr { recognizer })
+}
+
+/// Returns the sherpa-onnx CPU provider string, pointing it at a freshly written no-spin config.
+///
+/// sherpa-onnx splits `cpu:<path>` at the first `:` and exits the process when the config file
+/// cannot be opened, so this only returns a path after writing it, and falls back to plain `"cpu"`
+/// (spinning on, as before) for unwritable or colon-containing paths.
+pub(crate) fn cpu_provider(models_dir: &Path) -> String {
+    let dir = models_dir.join("ort");
+    let path = dir.join("cpu-no-spin.cfg");
+    let path_str = path.to_string_lossy();
+    if path.to_str().is_none() || path_str.contains(':') {
+        tracing::warn!(path = %path_str, "ORT provider config path unusable; threads keep spinning");
+        return "cpu".into();
+    }
+    let written = std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create {}", dir.display()))
+        .and_then(|()| atomic_write(&dir, &path, NO_SPIN_PROVIDER_CONFIG.as_bytes()));
+    match written {
+        Ok(()) => format!("cpu:{path_str}"),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "ORT provider config not written; threads keep spinning");
+            "cpu".into()
+        }
+    }
 }
 
 pub(crate) fn recognizer_config(
@@ -334,6 +369,39 @@ mod tests {
             Some(hotwords_file.to_str().unwrap())
         );
         assert_eq!(actual.hotwords_score, 2.0);
+    }
+
+    #[test]
+    fn cpu_provider_points_sherpa_at_a_no_spin_config() {
+        let models_dir = tempfile::tempdir().unwrap();
+
+        let provider = cpu_provider(models_dir.path());
+
+        let config_path = models_dir.path().join("ort").join("cpu-no-spin.cfg");
+        assert_eq!(provider, format!("cpu:{}", config_path.display()));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "SessionConfig.session.intra_op.allow_spinning=0\n\
+             SessionConfig.session.inter_op.allow_spinning=0\n"
+        );
+    }
+
+    #[test]
+    fn cpu_provider_falls_back_to_plain_cpu_when_config_cannot_be_written() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let not_a_dir = models_dir.path().join("models-file");
+        std::fs::write(&not_a_dir, b"").unwrap();
+
+        assert_eq!(cpu_provider(&not_a_dir), "cpu");
+    }
+
+    #[test]
+    fn cpu_provider_falls_back_for_paths_sherpa_would_split() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let colon_dir = models_dir.path().join("a:b");
+
+        assert_eq!(cpu_provider(&colon_dir), "cpu");
+        assert!(!colon_dir.exists());
     }
 
     #[test]

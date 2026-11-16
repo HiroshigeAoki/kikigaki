@@ -22,3 +22,9 @@ project ships its own copy of the license text in a redistributable location.
 They are covered by the Apache-2.0 text in sherpa-onnx.LICENSE — the same
 license, verbatim — plus the attribution lines for each in NOTICE. No separate
 license file is duplicated here for them.
+
+Haas-ja v1.0 (Third Intelligence) and Haas-ja-v1.0-onnx-quantized (ONNX
+conversion and quantization by oboroge0) are also distributed under the Apache
+License 2.0. They are covered by the same verbatim Apache-2.0 text in
+sherpa-onnx.LICENSE plus their attribution lines in NOTICE. No separate license
+file is duplicated here for them.

@@ -50,7 +50,12 @@ fi
 # Download only missing files; reject corrupt cached files instead of trusting their presence.
 mkdir -p "$KIKIGAKI_MODELS_DIR/$haas_id"
 haas_temporary=""
-trap 'if [[ -n "$haas_temporary" ]]; then rm -f "$haas_temporary"; fi' EXIT
+test_output=""
+cleanup() {
+  if [[ -n "$haas_temporary" ]]; then rm -f "$haas_temporary"; fi
+  if [[ -n "$test_output" ]]; then rm -f "$test_output"; fi
+}
+trap cleanup EXIT
 for index in "${!haas_files[@]}"; do
   file="${haas_files[$index]}"
   destination="$KIKIGAKI_MODELS_DIR/$haas_id/$file"
@@ -87,7 +92,6 @@ for wav in test_ja_1.wav test_ja_2.wav; do
 done
 
 test_output="$(mktemp)"
-trap 'rm -f "$test_output"' EXIT
 if [[ "$(uname -s)" == "Darwin" ]]; then
   features="punct,whisper,whisper-metal"
 else

@@ -46,7 +46,7 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 ### 認識モデル
 
-設定画面の「認識モデル」で、標準キーが使うモデルを「標準」(ReazonSpeech、既定)と「高精度（Haas）」(Haas-ja v1.0)から選べる。
+設定画面の「認識モデル」で、標準キーが使うモデルを「標準」(ReazonSpeech、既定)と「Haas」(Haas-ja v1.0)から選べる。
 
 - Haasは一般的な日本語の読み上げ音声で誤りが約半分になる。FLEURS日本語テストセットの文字誤り率はHaasが4.8%、ReazonSpeechが9.0%で、固有名詞や専門用語にも強い
 - 標準はキーを離してから貼り付けまで約0.2秒。Haasはそれより遅く、Apple Silicon搭載Macで短い発話なら約0.4秒が目安となる

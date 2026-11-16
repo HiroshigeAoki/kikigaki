@@ -262,6 +262,7 @@ mod tests {
         let mut ids = HashSet::new();
         for model in MODELS {
             assert_ne!(model.id, "hotwords", "model id is reserved: hotwords");
+            assert_ne!(model.id, "ort", "model id is reserved: ort");
             assert!(ids.insert(model.id), "duplicate model id: {}", model.id);
             for file in model.files() {
                 assert!(!file.name.is_empty());

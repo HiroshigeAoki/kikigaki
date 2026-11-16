@@ -146,7 +146,11 @@ fn render_vocab(pieces: impl IntoIterator<Item = String>) -> anyhow::Result<Vec<
     Ok(output)
 }
 
-fn atomic_write(directory: &Path, destination: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(
+    directory: &Path,
+    destination: &Path,
+    contents: &[u8],
+) -> anyhow::Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(directory)
         .with_context(|| format!("create temporary file in {}", directory.display()))?;
     temporary

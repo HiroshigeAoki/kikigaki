@@ -16,12 +16,82 @@ use sherpa_onnx::LinearResampler;
 use common::load_wav_16k;
 
 #[test]
+fn haas_materialized_hotwords_match_real_model_tokens() {
+    let Some(dir) = common::haas_models_dir() else {
+        return;
+    };
+    let setup = materialize(&dir, kikigaki_core::config::AsrModel::Haas).unwrap();
+    let vocab = std::fs::read(&setup.bpe_vocab).unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(vocab)),
+        "f2322022f23b5fbfac30ec67d21817086b818b077c2095392f56abc686feedc6"
+    );
+    assert_eq!(
+        std::fs::read_to_string(setup.hotwords_file).unwrap(),
+        include_str!("../data/hotwords.txt")
+    );
+}
+
+#[test]
+fn haas_transcribe_test_ja_1_golden() {
+    let Some(dir) = common::haas_models_dir() else {
+        return;
+    };
+    let config = AsrConfig {
+        model: kikigaki_core::config::AsrModel::Haas,
+        ..AsrConfig::default()
+    };
+    let mut recognizer = build_recognizer(&dir, &config).unwrap();
+    let actual = recognizer
+        .transcribe(&load_wav_16k("test_ja_1.wav"))
+        .expect("Haas returned no result");
+    eprintln!("Haas golden: {actual}");
+    // Measured 2026-11-16 on Linux through load_wav_16k (product resampler),
+    // pinned quantized Haas, modified_beam_search, four CPU threads, no onset pad.
+    // The question marks are emitted by Haas itself, without punctuation postprocessing.
+    assert_eq!(actual, "日本語ちゃんと聞いといてますかちゃんと聞こえてんの?ちゃんと聞こえてんの?でマイクを持ってもらって");
+}
+
+#[test]
+fn haas_production_hotword_path_biases_known_eval_wav() {
+    let Some(dir) = common::haas_models_dir() else {
+        return;
+    };
+    let Some(samples) = optional_wav_16k(&dir, "t09.wav") else {
+        return;
+    };
+    let config = AsrConfig {
+        model: kikigaki_core::config::AsrModel::Haas,
+        ..AsrConfig::default()
+    };
+    let mut baseline = build_recognizer(&dir, &config).unwrap();
+    let baseline_text = baseline
+        .transcribe(&samples)
+        .expect("Haas baseline returned no result");
+    drop(baseline);
+    let mut boosted = build_recognizer_auto(&dir, &config, Some(1.5)).unwrap();
+    let boosted_text = boosted
+        .transcribe(&samples)
+        .expect("Haas hotword recognizer returned no result");
+    eprintln!("Haas t09: baseline={baseline_text:?}, boosted={boosted_text:?}");
+    assert!(
+        boosted_text.contains("ドッカー"),
+        "baseline={baseline_text:?}, boosted={boosted_text:?}"
+    );
+    assert_ne!(boosted_text, baseline_text);
+}
+
+#[test]
 fn materialized_hotwords_match_real_model_tokens() {
     let Some(dir) = std::env::var_os("KIKIGAKI_MODELS_DIR") else {
         eprintln!("SKIPPED: models missing (KIKIGAKI_MODELS_DIR unset)");
         return;
     };
-    let setup = materialize(&PathBuf::from(dir)).unwrap();
+    let setup = materialize(
+        &PathBuf::from(dir),
+        kikigaki_core::config::AsrModel::ReazonSpeech,
+    )
+    .unwrap();
     let vocab = std::fs::read(&setup.bpe_vocab).unwrap();
     // Tied to the current ASR_MODEL_ID tokens.txt. Model updates must regenerate this value and
     // rerun the hotword evaluation harness against the new tokenization.

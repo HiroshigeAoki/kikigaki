@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use anyhow::{anyhow, ensure, Context};
-use kikigaki_core::config::{AsrConfig, DecodingMethod, VadConfig};
-use kikigaki_core::models::{ASR_MODEL_ID, VAD_MODEL_ID};
+use kikigaki_core::config::{AsrConfig, AsrModel, DecodingMethod, VadConfig};
+use kikigaki_core::models::{ASR_MODEL_ID, HAAS_MODEL_ID, VAD_MODEL_ID};
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, SileroVadModelConfig, VadModelConfig,
     VoiceActivityDetector,
@@ -10,6 +10,50 @@ use sherpa_onnx::{
 
 use crate::hotwords::{atomic_write, materialize};
 use crate::local::{Recognizer, Vad, VadSegment};
+
+/// Model-specific files and decoding metadata.
+#[derive(Clone, Copy)]
+pub(crate) struct ModelSpec {
+    pub id: &'static str,
+    encoder: &'static str,
+    decoder: &'static str,
+    joiner: &'static str,
+    tokens: &'static str,
+    model_type: &'static str,
+    feature_dim: i32,
+    modeling_unit: Option<&'static str>,
+    hotword_modeling_unit: &'static str,
+    pub onset_pad_samples: usize,
+}
+
+pub(crate) fn model_spec(model: AsrModel) -> ModelSpec {
+    match model {
+        AsrModel::ReazonSpeech => ModelSpec {
+            id: ASR_MODEL_ID,
+            encoder: "encoder-epoch-35-avg-1.int8.onnx",
+            decoder: "decoder-epoch-35-avg-1.int8.onnx",
+            joiner: "joiner-epoch-35-avg-1.int8.onnx",
+            tokens: "tokens.txt",
+            model_type: "zipformer",
+            feature_dim: 80,
+            modeling_unit: Some("cjkchar"),
+            hotword_modeling_unit: "bbpe",
+            onset_pad_samples: 6_400,
+        },
+        AsrModel::Haas => ModelSpec {
+            id: HAAS_MODEL_ID,
+            encoder: "encoder.quantized.onnx",
+            decoder: "decoder.onnx",
+            joiner: "joiner.onnx",
+            tokens: "tokens.txt",
+            model_type: "nemo_transducer",
+            feature_dim: 128,
+            modeling_unit: None,
+            hotword_modeling_unit: "bpe",
+            onset_pad_samples: 0,
+        },
+    }
+}
 
 /// ONNX Runtime session entries that park idle worker threads instead of spinning. sherpa-onnx
 /// gives the encoder, decoder and joiner their own intra- and inter-op pools, and spinning pools
@@ -25,6 +69,7 @@ pub struct SherpaVad {
 /// A loaded sherpa-onnx offline speech recognizer.
 pub struct SherpaAsr {
     recognizer: OfflineRecognizer,
+    spec: ModelSpec,
 }
 
 /// Loads the configured Silero voice activity detector from `models_dir`.
@@ -50,9 +95,13 @@ pub fn build_vad(models_dir: &Path, config: &VadConfig) -> anyhow::Result<Sherpa
     Ok(SherpaVad { detector })
 }
 
-/// Loads the configured ReazonSpeech transducer from `models_dir`.
+/// Loads the configured transducer from `models_dir`.
 pub fn build_recognizer(models_dir: &Path, config: &AsrConfig) -> anyhow::Result<SherpaAsr> {
-    create_recognizer(models_dir, recognizer_config(models_dir, config, None)?)
+    create_recognizer(
+        models_dir,
+        model_spec(config.model),
+        recognizer_config(models_dir, config, None)?,
+    )
 }
 
 /// Loads the configured recognizer, optionally enabling embedded hotword biasing.
@@ -67,7 +116,7 @@ pub fn build_recognizer_auto(
 ) -> anyhow::Result<SherpaAsr> {
     crate::local::with_hotword_fallback(
         hotwords,
-        || materialize(models_dir),
+        || materialize(models_dir, config.model),
         || build_recognizer(models_dir, config),
         |setup, score| {
             build_recognizer_with_hotwords(
@@ -81,7 +130,7 @@ pub fn build_recognizer_auto(
     )
 }
 
-/// Loads the configured ReazonSpeech transducer with hotword biasing enabled.
+/// Loads the configured transducer with hotword biasing enabled.
 ///
 /// `bpe_vocab` supplies the sentencepiece-style vocabulary required to encode
 /// hotwords for the model's byte-level BPE tokens.
@@ -113,18 +162,19 @@ pub fn build_recognizer_with_hotwords(
 
     let sherpa_config =
         recognizer_config(models_dir, config, Some((hotwords_file, score, bpe_vocab)))?;
-    create_recognizer(models_dir, sherpa_config)
+    create_recognizer(models_dir, model_spec(config.model), sherpa_config)
 }
 
 fn create_recognizer(
     models_dir: &Path,
+    spec: ModelSpec,
     mut sherpa_config: OfflineRecognizerConfig,
 ) -> anyhow::Result<SherpaAsr> {
     sherpa_config.model_config.provider = Some(cpu_provider(models_dir));
-    let path = models_dir.join(ASR_MODEL_ID);
+    let path = models_dir.join(spec.id);
     let recognizer = OfflineRecognizer::create(&sherpa_config)
-        .ok_or_else(|| anyhow!("failed to load {ASR_MODEL_ID} from {}", path.display()))?;
-    Ok(SherpaAsr { recognizer })
+        .ok_or_else(|| anyhow!("failed to load {} from {}", spec.id, path.display()))?;
+    Ok(SherpaAsr { recognizer, spec })
 }
 
 /// Returns the sherpa-onnx CPU provider string, pointing it at a freshly written no-spin config.
@@ -157,36 +207,27 @@ pub(crate) fn recognizer_config(
     config: &AsrConfig,
     hotwords: Option<(&Path, f32, &Path)>,
 ) -> anyhow::Result<OfflineRecognizerConfig> {
+    let spec = model_spec(config.model);
     let mut sherpa_config = OfflineRecognizerConfig::default();
-    let path = models_dir.join(ASR_MODEL_ID);
+    let path = models_dir.join(spec.id);
     sherpa_config.feat_config.sample_rate = 16_000;
-    sherpa_config.feat_config.feature_dim = 80;
-    sherpa_config.model_config.transducer.encoder = Some(
-        path.join("encoder-epoch-35-avg-1.int8.onnx")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    sherpa_config.model_config.transducer.decoder = Some(
-        path.join("decoder-epoch-35-avg-1.int8.onnx")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    sherpa_config.model_config.transducer.joiner = Some(
-        path.join("joiner-epoch-35-avg-1.int8.onnx")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    sherpa_config.model_config.tokens =
-        Some(path.join("tokens.txt").to_string_lossy().into_owned());
+    sherpa_config.feat_config.feature_dim = spec.feature_dim;
+    sherpa_config.model_config.transducer.encoder =
+        Some(path.join(spec.encoder).to_string_lossy().into_owned());
+    sherpa_config.model_config.transducer.decoder =
+        Some(path.join(spec.decoder).to_string_lossy().into_owned());
+    sherpa_config.model_config.transducer.joiner =
+        Some(path.join(spec.joiner).to_string_lossy().into_owned());
+    sherpa_config.model_config.tokens = Some(path.join(spec.tokens).to_string_lossy().into_owned());
     sherpa_config.model_config.num_threads =
         i32::try_from(config.num_threads).context("ASR thread count exceeds sherpa-onnx range")?;
     sherpa_config.model_config.provider = Some("cpu".into());
-    sherpa_config.model_config.model_type = Some("zipformer".into());
-    sherpa_config.model_config.modeling_unit = Some("cjkchar".into());
+    sherpa_config.model_config.model_type = Some(spec.model_type.into());
+    sherpa_config.model_config.modeling_unit = spec.modeling_unit.map(str::to_owned);
     sherpa_config.decoding_method = Some(config.decoding_method.as_sherpa_str().into());
     sherpa_config.max_active_paths = 4;
     if let Some((hotwords_file, score, bpe_vocab)) = hotwords {
-        sherpa_config.model_config.modeling_unit = Some("bbpe".into());
+        sherpa_config.model_config.modeling_unit = Some(spec.hotword_modeling_unit.into());
         sherpa_config.model_config.bpe_vocab = Some(bpe_vocab.to_string_lossy().into_owned());
         sherpa_config.hotwords_file = Some(hotwords_file.to_string_lossy().into_owned());
         sherpa_config.hotwords_score = score;
@@ -232,6 +273,10 @@ impl Vad for SherpaVad {
 }
 
 impl Recognizer for SherpaAsr {
+    fn onset_pad_samples(&self) -> usize {
+        self.spec.onset_pad_samples
+    }
+
     fn transcribe(&mut self, samples: &[f32]) -> Option<String> {
         decode(&self.recognizer, samples)
     }
@@ -240,6 +285,75 @@ impl Recognizer for SherpaAsr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_specs_and_haas_recognizer_fields() {
+        use kikigaki_core::config::AsrModel;
+        use kikigaki_core::models::HAAS_MODEL_ID;
+        let reazon = model_spec(AsrModel::ReazonSpeech);
+        assert_eq!(reazon.id, ASR_MODEL_ID);
+        assert_eq!(reazon.onset_pad_samples, 6_400);
+        let haas = model_spec(AsrModel::Haas);
+        assert_eq!(haas.id, HAAS_MODEL_ID);
+        assert_eq!(haas.onset_pad_samples, 0);
+        let config = AsrConfig {
+            model: AsrModel::Haas,
+            num_threads: 2,
+            ..AsrConfig::default()
+        };
+        for hotwords in [
+            None,
+            Some((Path::new("/hotwords.txt"), 1.5, Path::new("/bpe.vocab"))),
+        ] {
+            let actual = recognizer_config(Path::new("/models"), &config, hotwords).unwrap();
+            let base = Path::new("/models").join(HAAS_MODEL_ID);
+            assert_eq!(actual.feat_config.sample_rate, 16_000);
+            assert_eq!(actual.feat_config.feature_dim, 128);
+            assert_eq!(
+                actual.model_config.model_type.as_deref(),
+                Some("nemo_transducer")
+            );
+            assert_eq!(
+                actual.model_config.transducer.encoder.as_deref(),
+                base.join("encoder.quantized.onnx").to_str()
+            );
+            assert_eq!(
+                actual.model_config.transducer.decoder.as_deref(),
+                base.join("decoder.onnx").to_str()
+            );
+            assert_eq!(
+                actual.model_config.transducer.joiner.as_deref(),
+                base.join("joiner.onnx").to_str()
+            );
+            assert_eq!(
+                actual.model_config.tokens.as_deref(),
+                base.join("tokens.txt").to_str()
+            );
+            assert_eq!(actual.model_config.num_threads, 2);
+            assert_eq!(actual.model_config.provider.as_deref(), Some("cpu"));
+            assert_eq!(
+                actual.decoding_method.as_deref(),
+                Some("modified_beam_search")
+            );
+            assert_eq!(actual.max_active_paths, 4);
+            assert_eq!(
+                actual.model_config.modeling_unit.as_deref(),
+                hotwords.map(|_| "bpe")
+            );
+            assert_eq!(
+                actual.model_config.bpe_vocab.as_deref(),
+                hotwords.map(|_| "/bpe.vocab")
+            );
+            assert_eq!(
+                actual.hotwords_file.as_deref(),
+                hotwords.map(|_| "/hotwords.txt")
+            );
+            assert_eq!(
+                actual.hotwords_score,
+                if hotwords.is_some() { 1.5 } else { 0.0 }
+            );
+        }
+    }
 
     fn assert_baseline_configs_match(
         actual: &OfflineRecognizerConfig,

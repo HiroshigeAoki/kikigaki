@@ -111,6 +111,16 @@ pub struct AsrConfig {
     pub hotwords_score: f32,
 }
 
+impl AsrConfig {
+    /// Returns the hotword score for the selected local model.
+    pub fn active_hotwords_score(&self) -> f32 {
+        match self.model {
+            AsrModel::Haas => self.haas_hotwords_score,
+            AsrModel::ReazonSpeech => self.hotwords_score,
+        }
+    }
+}
+
 impl Default for AsrConfig {
     fn default() -> Self {
         Self {
@@ -602,6 +612,25 @@ pub fn sidecar_endpoint(ws_url: &str) -> anyhow::Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_hotwords_score_follows_model_and_custom_scores() {
+        let mut config = AsrConfig::default();
+        assert_eq!(config.active_hotwords_score(), 3.0);
+        config.hotwords_score = 4.5;
+        config.haas_hotwords_score = 2.5;
+        assert_eq!(config.active_hotwords_score(), 4.5);
+        config.model = AsrModel::Haas;
+        assert_eq!(config.active_hotwords_score(), 2.5);
+        assert_eq!(
+            AsrConfig {
+                model: AsrModel::Haas,
+                ..AsrConfig::default()
+            }
+            .active_hotwords_score(),
+            1.5
+        );
+    }
 
     #[test]
     fn haas_punctuation_uses_applied_model_and_effective_choice() {

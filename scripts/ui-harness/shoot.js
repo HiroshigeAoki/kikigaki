@@ -83,7 +83,7 @@ async function shoot(harnessFile) {
       await page.goto(url(`data=${name}`));
       await page.waitForTimeout(150);
       await shot(page, `${scheme}-${name}`);
-      if (scheme === 'light' && (name === 'worst' || name === 'demo')) await shot(page, `${scheme}-${name}-full`, true);
+      if (scheme === 'light' && (name === 'worst' || name === 'demo' || name === 'haas-applied')) await shot(page, `${scheme}-${name}-full`, true);
     }
     if (scheme === 'light') {
       await page.goto(url('data=hotkeys-long'));

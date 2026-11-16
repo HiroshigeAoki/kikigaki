@@ -288,8 +288,6 @@ mod tests {
 
     #[test]
     fn model_specs_and_haas_recognizer_fields() {
-        use kikigaki_core::config::AsrModel;
-        use kikigaki_core::models::HAAS_MODEL_ID;
         let reazon = model_spec(AsrModel::ReazonSpeech);
         assert_eq!(reazon.id, ASR_MODEL_ID);
         assert_eq!(reazon.onset_pad_samples, 6_400);

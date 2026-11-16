@@ -315,18 +315,27 @@ mod tests {
     fn asr_model_apply_round_trip_preserves_original_bytes() {
         for raw in [
             "# keep\nhotkey = \"Alt+Space\"\n[vad]\nthreshold = 0.6\n",
-            "# keep\nhotkey = \"Alt+Space\"\n[asr] # tuning\nhotwords_score = 2.5 # keep score\n[vad]\nthreshold = 0.6\n",
+            concat!(
+                "# keep\nhotkey = \"Alt+Space\"\n[asr] # tuning\n",
+                "hotwords_score = 2.5 # keep score\n[vad]\nthreshold = 0.6\n",
+            ),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("config.toml");
             std::fs::write(&path, raw).unwrap();
-            let caps = Capabilities { punct: true, remote_engine: false, long_key: false };
+            let caps = Capabilities {
+                punct: true,
+                remote_engine: false,
+                long_key: false,
+            };
             let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
             let before = coordinator.snapshot();
-            let saved = coordinator.apply(SettingsPatch {
-                asr_model: Some(AsrModel::Haas),
-                ..SettingsPatch::default()
-            }).unwrap();
+            let saved = coordinator
+                .apply(SettingsPatch {
+                    asr_model: Some(AsrModel::Haas),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
             assert_eq!(coordinator.config().asr.model, AsrModel::Haas);
             assert_eq!(saved.asr_model, AsrModel::Haas);
             assert_eq!(saved.asr_model_applied, AsrModel::ReazonSpeech);
@@ -334,11 +343,14 @@ mod tests {
             let json = serde_json::to_value(&saved).unwrap();
             assert_eq!(json["asr_model"], "haas");
             assert_eq!(json["asr_model_applied"], "reazonspeech");
-            assert_eq!(SettingsCoordinator::load(path.clone(), caps).unwrap().config().asr.model, AsrModel::Haas);
-            coordinator.apply(SettingsPatch {
-                asr_model: Some(AsrModel::ReazonSpeech),
-                ..SettingsPatch::default()
-            }).unwrap();
+            let reloaded = SettingsCoordinator::load(path.clone(), caps).unwrap();
+            assert_eq!(reloaded.config().asr.model, AsrModel::Haas);
+            coordinator
+                .apply(SettingsPatch {
+                    asr_model: Some(AsrModel::ReazonSpeech),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
             assert_eq!(coordinator.config().asr.model, AsrModel::ReazonSpeech);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
         }

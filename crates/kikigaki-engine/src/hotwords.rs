@@ -195,7 +195,6 @@ mod tests {
 
     #[test]
     fn model_vocab_paths_are_separate_and_use_each_manifest_digest() {
-        use kikigaki_core::config::AsrModel;
         let dir = fixture_models_dir();
         let haas_id = kikigaki_core::models::HAAS_MODEL_ID;
         fs::create_dir_all(dir.path().join(haas_id)).unwrap();

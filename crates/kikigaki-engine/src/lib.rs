@@ -1,5 +1,5 @@
-//! In-process speech engine for kikigaki: silero VAD + ReazonSpeech or Haas transducer on `sherpa-onnx`,
-//! and (feature `punct`) mojicast punctuation on `ort`.
+//! In-process speech engine for kikigaki: silero VAD + ReazonSpeech or Haas transducer on
+//! `sherpa-onnx`, and (feature `punct`) mojicast punctuation on `ort`.
 //!
 //! Implemented in Phase 2 Task 4 (`LocalEngine`) and Task 6 (`MojicastPunctuator`).
 

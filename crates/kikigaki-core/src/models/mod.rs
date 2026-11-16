@@ -299,10 +299,7 @@ mod tests {
 
     #[test]
     fn haas_manifest_matches_pinned_files() {
-        let model = MODELS
-            .iter()
-            .find(|m| m.id == "haas-ja-v1.0-onnx-quantized")
-            .unwrap();
+        let model = MODELS.iter().find(|m| m.id == HAAS_MODEL_ID).unwrap();
         assert_eq!(model.required_for, Requirement::Asr(AsrModel::Haas));
         assert_eq!(
             model.source,

@@ -1063,7 +1063,12 @@ impl Controller {
             let result = worker.submit(
                 gen,
                 message,
-                postprocess_settings(self.settings.config(), self.capabilities, owner.engine),
+                postprocess_settings(
+                    self.settings.config(),
+                    self.capabilities,
+                    owner.engine,
+                    self.settings.applied_asr_model(),
+                ),
             );
             if let Err(error) = result {
                 tracing::error!(%error, "submit configured final for post-processing");
@@ -1233,12 +1238,14 @@ impl Controller {
     fn start_long(&mut self, origin: LongOrigin) {
         let plan = StartupPlan::for_target(
             EngineKind::Whisper,
+            self.settings.applied_asr_model(),
             self.models_dir.clone(),
             self.capabilities,
             kikigaki_core::config::punct_effective(
                 self.settings.config(),
                 self.capabilities,
                 EngineKind::Whisper,
+                self.settings.applied_asr_model(),
             ),
         );
         let factory = Arc::clone(&self.engine_factory);

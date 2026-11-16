@@ -78,6 +78,49 @@ impl AudioHistory {
     }
 }
 
+/// What the microphone delivered for one utterance, logged with the End final so an empty
+/// result can be told apart: no audio arrived, it arrived late, it was silent, or the VAD
+/// rejected audible input.
+struct CaptureStats {
+    begun_at: Instant,
+    first_audio_at: Option<Instant>,
+    /// Samples received since Begin; unlike `AudioHistory`, this includes the framer's carry.
+    samples: usize,
+    /// Largest absolute sample value received (full scale is 1.0).
+    peak: f32,
+}
+
+impl CaptureStats {
+    fn begin(now: Instant) -> Self {
+        Self {
+            begun_at: now,
+            first_audio_at: None,
+            samples: 0,
+            peak: 0.0,
+        }
+    }
+
+    fn record(&mut self, samples: &[f32], now: Instant) {
+        if samples.is_empty() {
+            return;
+        }
+        self.first_audio_at.get_or_insert(now);
+        self.samples = self.samples.saturating_add(samples.len());
+        // `f32::max` drops a NaN operand, so a corrupt sample cannot poison the peak.
+        self.peak = samples
+            .iter()
+            .fold(self.peak, |peak, sample| peak.max(sample.abs()));
+    }
+
+    /// Milliseconds from Begin to the first non-empty audio chunk, if any arrived. Measured
+    /// when this worker dequeues the chunk, so it covers opening the microphone stream and the
+    /// device's start-up latency plus any queueing, not the device timestamp.
+    fn first_audio_ms(&self) -> Option<u128> {
+        self.first_audio_at
+            .map(|at| at.duration_since(self.begun_at).as_millis())
+    }
+}
+
 fn accept_frame(history: &mut AudioHistory, vad: &mut dyn Vad, frame: &[f32]) {
     history.push(frame);
     vad.accept(frame);
@@ -304,8 +347,7 @@ pub fn run_local_worker(
     let min_real_samples = usize::try_from(vad_config.min_speech_ms.saturating_mul(16))
         .context("minimum speech sample count exceeds address space")?;
     let mut last_segment_end = 0;
-    // Samples received since Begin; unlike `history`, this includes the framer's carry.
-    let mut received_samples = 0usize;
+    let mut capture = CaptureStats::begin(Instant::now());
     let mut current = None;
 
     while let Ok(command) = cmds.recv() {
@@ -317,10 +359,10 @@ pub fn run_local_worker(
                 current = Some(gen);
                 history.clear();
                 last_segment_end = 0;
-                received_samples = 0;
+                capture = CaptureStats::begin(Instant::now());
             }
             EngineCmd::Audio(samples) if current.is_some() => {
-                received_samples = received_samples.saturating_add(samples.len());
+                capture.record(&samples, Instant::now());
                 framer.push(&samples, |frame| {
                     accept_frame(&mut history, vad.as_mut(), frame)
                 });
@@ -371,7 +413,7 @@ pub fn run_local_worker(
                     &history,
                     &mut last_segment_end,
                     Some(RealAudioEnd {
-                        end: received_samples,
+                        end: capture.samples,
                         min_samples: min_real_samples,
                     }),
                 )?;
@@ -386,6 +428,15 @@ pub fn run_local_worker(
                     segments = segment_count,
                     %text,
                     "local-engine final"
+                );
+                // Info, not debug: the default filter drops debug, and these numbers are what
+                // tells a late or silent microphone from a VAD rejection when nothing was heard.
+                tracing::info!(
+                    segments = segment_count,
+                    received_samples = capture.samples,
+                    first_audio_ms = ?capture.first_audio_ms(),
+                    peak = format_args!("{:.4}", capture.peak),
+                    "local-engine capture"
                 );
                 let dropped_chunks = sink.take_dropped();
                 events
@@ -404,7 +455,7 @@ pub fn run_local_worker(
                 current = None;
                 history.clear();
                 last_segment_end = 0;
-                received_samples = 0;
+                capture = CaptureStats::begin(Instant::now());
             }
             EngineCmd::End { .. } => {
                 tracing::debug!("ignoring stale local-engine end command");
@@ -415,7 +466,7 @@ pub fn run_local_worker(
                 reset_or_rebuild(&mut vad, make_vad.as_mut())?;
                 history.clear();
                 last_segment_end = 0;
-                received_samples = 0;
+                capture = CaptureStats::begin(Instant::now());
                 let _ = sink.take_dropped();
             }
             EngineCmd::Shutdown => return Ok(()),
@@ -513,13 +564,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use kikigaki_core::engine::{self, EngineCmd, EngineMsg};
     use kikigaki_core::models::{ASR_MODEL_ID, VAD_MODEL_ID};
 
     use super::{
         drain_and_transcribe, report_model_load_failure, run_local_worker, run_with_loaders,
-        with_hotword_fallback, AudioHistory, Recognizer, Vad, VadSegment,
+        with_hotword_fallback, AudioHistory, CaptureStats, Recognizer, Vad, VadSegment,
     };
 
     #[test]
@@ -1059,6 +1111,61 @@ mod tests {
         );
         assert_eq!(final_text_and_gen(&events), (1, String::new()));
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn capture_stats_report_nothing_received_before_any_audio() {
+        let begun = Instant::now();
+        let stats = CaptureStats::begin(begun);
+
+        assert_eq!(stats.samples, 0);
+        assert_eq!(stats.first_audio_ms(), None);
+        assert_eq!(stats.peak, 0.0);
+    }
+
+    #[test]
+    fn capture_stats_time_the_first_chunk_and_count_every_sample() {
+        let begun = Instant::now();
+        let mut stats = CaptureStats::begin(begun);
+
+        stats.record(&[0.0, 0.0], begun + Duration::from_millis(180));
+        stats.record(&[0.0; 3], begun + Duration::from_millis(900));
+
+        assert_eq!(stats.samples, 5);
+        assert_eq!(stats.first_audio_ms(), Some(180));
+    }
+
+    #[test]
+    fn capture_stats_peak_is_the_largest_magnitude_of_either_sign() {
+        let begun = Instant::now();
+        let mut stats = CaptureStats::begin(begun);
+
+        stats.record(&[0.1, -0.6, 0.3], begun);
+        stats.record(&[0.2, f32::NAN], begun);
+
+        assert_eq!(stats.peak, 0.6);
+    }
+
+    #[test]
+    fn capture_stats_peak_stays_zero_for_nan_only_audio() {
+        let begun = Instant::now();
+        let mut stats = CaptureStats::begin(begun);
+
+        stats.record(&[f32::NAN, f32::NAN], begun);
+
+        assert_eq!(stats.samples, 2);
+        assert_eq!(stats.peak, 0.0);
+    }
+
+    #[test]
+    fn capture_stats_ignore_empty_chunks_when_timing_first_audio() {
+        let begun = Instant::now();
+        let mut stats = CaptureStats::begin(begun);
+
+        stats.record(&[], begun + Duration::from_millis(50));
+        stats.record(&[0.5], begun + Duration::from_millis(70));
+
+        assert_eq!(stats.first_audio_ms(), Some(70));
     }
 
     #[test]

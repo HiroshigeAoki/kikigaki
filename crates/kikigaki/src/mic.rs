@@ -4,6 +4,7 @@ use cpal::SampleFormat;
 use kikigaki_core::audio::{downmix_into, StreamResampler};
 use kikigaki_core::engine::{AudioSink, EngineCmd, SinkError};
 use kikigaki_core::protocol::SAMPLE_RATE;
+use std::time::Instant;
 
 pub struct Mic {
     stream: Option<cpal::Stream>,
@@ -16,6 +17,7 @@ impl Mic {
 
     pub fn start(&mut self, sink: AudioSink) -> anyhow::Result<()> {
         self.stop();
+        let started = Instant::now();
 
         let host = cpal::default_host();
         let device = host
@@ -91,6 +93,12 @@ impl Mic {
         stream.play().context(
             "start microphone stream; grant Microphone access to kikigaki in System Settings",
         )?;
+        // Device lookup, format negotiation and stream start; the wait for the first audio after
+        // this is in the engine's "local-engine capture" line.
+        tracing::info!(
+            open_ms = started.elapsed().as_millis(),
+            "microphone stream started"
+        );
         self.stream = Some(stream);
         Ok(())
     }

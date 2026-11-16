@@ -240,7 +240,7 @@ fn start_controller(
         local_asr_cfg: cfg.asr.clone(),
         local_vad_cfg: cfg.vad.clone(),
         hotwords_enabled: AtomicBool::new(cfg.builtin_replace_dict),
-        hotwords_score: cfg.asr.hotwords_score,
+        hotwords_score: cfg.asr.active_hotwords_score(),
         remote_cfg: cfg.remote.clone(),
     });
     let builtin = match kikigaki_core::replace::builtin_rules() {

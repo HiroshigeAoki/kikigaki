@@ -36,6 +36,13 @@
 
         <h2 class="group-title">文字の整え方</h2>
         <section class="group">
+          <div class="row" id="asrModelRow">
+            <div class="l"><b>認識モデル</b><small id="asrModelNote">標準キーの認識に使うモデル</small></div>
+            <div class="seg" id="asrModelSeg" role="group" aria-label="認識モデル">
+              <button type="button" data-value="reazonspeech" aria-pressed="false">標準</button>
+              <button type="button" data-value="haas" aria-pressed="false">高精度（Haas）</button>
+            </div>
+          </div>
           <div class="row" id="punctRow">
             <div class="l"><b>句読点</b><small id="punctNote">両方のキーに適用</small></div>
             <div class="seg" id="punctSeg" role="group" aria-label="句読点">
@@ -71,7 +78,7 @@
             <button class="btn small" id="openConfigButton" type="button">設定ファイルを開く</button>
           </div>
         </section>
-        <div class="foot"><div class="l">メニューバーのアイコンでこの画面を開閉<br>ReazonSpeech ja-en · Silero VAD · mojicast</div><button class="btn" id="quitButton" type="button">kikigaki を終了</button></div>
+        <div class="foot"><div class="l">メニューバーのアイコンでこの画面を開閉<br><span id="asrModelFooter">ReazonSpeech ja-en · Silero VAD · mojicast</span></div><button class="btn" id="quitButton" type="button">kikigaki を終了</button></div>
       </div>
 
       <div class="scene" id="scene-onboarding" hidden>

@@ -116,3 +116,16 @@ test('statusKeysLine includes the long chord only when enabled and available', (
   for (const patch of [{long_key:false}, {long_available:false}, {long_hotkey:''}])
     assert.equal(f.statusKeysLine({...settings, ...patch}), '⌃⌥Space を押している間だけ聞き取ります');
 });
+
+
+test('asrModelNote distinguishes saved and applied models', () => {
+  for (const model of ['reazonspeech', 'haas'])
+    assert.equal(f.asrModelNote(model, model), '標準キーの認識に使うモデル');
+  assert.equal(f.asrModelNote('haas', 'reazonspeech'), '次の起動から切り替わります。Haas は初回に約 480 MB をダウンロードします');
+  assert.equal(f.asrModelNote('reazonspeech', 'haas'), '次の起動から切り替わります');
+});
+
+test('asrModelFooter describes the applied model', () => {
+  assert.equal(f.asrModelFooter('reazonspeech'), 'ReazonSpeech ja-en · Silero VAD · mojicast');
+  assert.equal(f.asrModelFooter('haas'), 'Haas-ja v1.0 · Silero VAD');
+});

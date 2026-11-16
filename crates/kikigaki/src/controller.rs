@@ -3808,6 +3808,43 @@ mod tests {
         }
 
         #[test]
+        fn saving_haas_keeps_running_local_postprocess_and_punct_flags() {
+            use kikigaki_core::config::AsrModel;
+            let (mut h, rx) = ready();
+            h.controller
+                .apply_settings(SettingsPatch {
+                    punctuation: Some(crate::settings::PunctSetting::On),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
+            let before = h.controller.settings_snapshot();
+            assert!(before.punct_enabled);
+            let saved = h
+                .controller
+                .apply_settings(SettingsPatch {
+                    asr_model: Some(AsrModel::Haas),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
+            assert_eq!(saved.asr_model, AsrModel::Haas);
+            assert_eq!(saved.asr_model_applied, AsrModel::ReazonSpeech);
+            assert_eq!(saved.punct_enabled, before.punct_enabled);
+            assert_eq!(saved.punct_choice, before.punct_choice);
+            assert_eq!(saved.strip_trailing_period, before.strip_trailing_period);
+            let mut outputs = Vec::new();
+            h.controller
+                .handle_hotkey_edge(HotkeyEdge::Pressed(HotkeyKey::Standard), &mut outputs);
+            h.engine(EngineKind::Local).send(final_message(1, "甲、乙"));
+            h.controller.handle_engine_messages(&mut outputs);
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            h.controller
+                .handle_hotkey_edge(HotkeyEdge::Released(HotkeyKey::Standard), &mut outputs);
+            h.controller.handle_postprocess_events(&mut outputs);
+            h.controller.execute_outputs(outputs);
+            assert_eq!(*h.pastes.attempts.lock().unwrap(), ["甲、乙。"]);
+        }
+
+        #[test]
         fn finals_use_their_engines_postprocess_settings() {
             use crate::settings::PunctSetting;
             for (choice, local, long) in [

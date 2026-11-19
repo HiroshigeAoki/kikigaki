@@ -5,6 +5,32 @@ use anyhow::{bail, Context};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// The operating system a path/hotkey default is computed for. A real enum (not a bare
+/// `cfg!(target_os = "windows")` check spread across every call site) so both platform policies
+/// can be exercised deterministically from a single-OS test run — see `config_dir_from` /
+/// `logs_dir_from` / `default_hotkey_for` below. The `platform` module of the `kikigaki` app
+/// crate reuses this enum for the same reason (e.g. the paste-modifier choice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    /// macOS, including the app's macOS-style policy on other non-Windows hosts.
+    MacOs,
+    /// Windows.
+    Windows,
+}
+
+impl Os {
+    /// Returns the operating-system policy for the current compilation target. Linux (the
+    /// dev/CI host; the app never ships there) maps to `MacOs` so Linux test runs exercise the
+    /// macOS layout, exactly as they did before Windows support existed.
+    pub const fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::MacOs
+        }
+    }
+}
+
 /// Runtime settings for the kikigaki application.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -329,24 +355,25 @@ impl Default for Config {
         let home = home_dir();
         Self {
             engine: EngineKind::Local,
-            hotkey: "Alt+Space".into(),
+            hotkey: default_hotkey().into(),
             paste_method: PasteMethod::Clipboard,
             strip_trailing_period: true,
             silence_pad_ms: 500,
             final_timeout_ms: 3_000,
             builtin_replace_dict: false,
             transcript_log: false,
-            transcript_dir: home.join(".config/kikigaki/transcripts"),
-            replace_file: home.join(".config/kikigaki/replace.toml"),
-            metrics_path: home.join("Library/Logs/kikigaki/latency.jsonl"),
+            transcript_dir: config_dir(&home).join("transcripts"),
+            replace_file: config_dir(&home).join("replace.toml"),
+            metrics_path: logs_dir(&home).join("latency.jsonl"),
             models_dir: dirs::data_local_dir()
                 .unwrap_or_else(|| home.join(".local/share"))
-                .join("kikigaki/models"),
+                .join("kikigaki")
+                .join("models"),
             asr: AsrConfig::default(),
             vad: VadConfig::default(),
             punct: PunctConfig::default(),
             remote: RemoteConfig::default(),
-            learned_file: home.join(".config/kikigaki/learned.toml"),
+            learned_file: config_dir(&home).join("learned.toml"),
         }
     }
 }
@@ -565,6 +592,52 @@ fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"))
 }
 
+/// Windows: `Ctrl+Alt+Space` (`Alt+Space` opens the system menu / PowerToys Run there).
+/// macOS: `Alt+Space` (unchanged).
+fn default_hotkey_for(os: Os) -> &'static str {
+    match os {
+        Os::Windows => "Ctrl+Alt+Space",
+        Os::MacOs => "Alt+Space",
+    }
+}
+
+fn default_hotkey() -> &'static str {
+    default_hotkey_for(Os::current())
+}
+
+/// Per-OS config-file directory, given the already-resolved home directory and (for Windows)
+/// the `dirs::config_dir()` answer if one was available. Pure — no `dirs::*` call inside —
+/// so both policies are testable with injected roots on any host.
+fn config_dir_from(os: Os, home: &Path, os_config_dir: Option<&Path>) -> PathBuf {
+    match os {
+        Os::Windows => os_config_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+            .join("kikigaki"),
+        Os::MacOs => home.join(".config/kikigaki"),
+    }
+}
+
+fn config_dir(home: &Path) -> PathBuf {
+    config_dir_from(Os::current(), home, dirs::config_dir().as_deref())
+}
+
+/// Per-OS log/metrics directory, same shape as `config_dir_from`.
+fn logs_dir_from(os: Os, home: &Path, os_data_local_dir: Option<&Path>) -> PathBuf {
+    match os {
+        Os::Windows => os_data_local_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join("AppData").join("Local"))
+            .join("kikigaki")
+            .join("logs"),
+        Os::MacOs => home.join("Library/Logs/kikigaki"),
+    }
+}
+
+fn logs_dir(home: &Path) -> PathBuf {
+    logs_dir_from(Os::current(), home, dirs::data_local_dir().as_deref())
+}
+
 fn validate_threshold(name: &str, value: f32) -> anyhow::Result<()> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         bail!("{name} must be in 0..=1");
@@ -595,7 +668,14 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 
 /// Returns the default per-user configuration path.
 pub fn default_path() -> PathBuf {
-    home_dir().join(".config/kikigaki/config.toml")
+    config_dir(&home_dir()).join("config.toml")
+}
+
+/// The per-OS log/metrics directory (`%LOCALAPPDATA%\kikigaki\logs` on Windows,
+/// `~/Library/Logs/kikigaki` on macOS). Intended for `shell.rs::init_logging` and used by
+/// `Config::default()`'s `metrics_path`.
+pub fn default_log_dir() -> PathBuf {
+    logs_dir(&home_dir())
 }
 
 /// Extracts the host and port used to launch a sidecar from a `ws://` URL.
@@ -630,6 +710,79 @@ pub fn sidecar_endpoint(ws_url: &str) -> anyhow::Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_hotkey_for_matches_os_policy() {
+        assert_eq!(default_hotkey_for(Os::Windows), "Ctrl+Alt+Space");
+        assert_eq!(default_hotkey_for(Os::MacOs), "Alt+Space");
+    }
+
+    #[test]
+    fn config_dir_from_matches_os_policy_with_injected_roots() {
+        let home = Path::new("/Users/aoki");
+        assert_eq!(
+            config_dir_from(Os::MacOs, home, None),
+            Path::new("/Users/aoki/.config/kikigaki")
+        );
+        let appdata = Path::new(r"C:\Users\aoki\AppData\Roaming");
+        // Built with join(): a `\` literal is a single component on Linux, so a spelled-out
+        // expected path would only match on Windows.
+        assert_eq!(
+            config_dir_from(Os::Windows, home, Some(appdata)),
+            appdata.join("kikigaki")
+        );
+        // No injected root falls back to home-relative, matching how dirs::config_dir() behaves
+        // when it can't resolve %APPDATA% (extremely rare, but must not panic).
+        assert_eq!(
+            config_dir_from(Os::Windows, home, None),
+            Path::new("/Users/aoki/AppData/Roaming/kikigaki")
+        );
+    }
+
+    #[test]
+    fn logs_dir_from_matches_os_policy_with_injected_roots() {
+        let home = Path::new("/Users/aoki");
+        assert_eq!(
+            logs_dir_from(Os::MacOs, home, None),
+            Path::new("/Users/aoki/Library/Logs/kikigaki")
+        );
+        let local_appdata = Path::new(r"C:\Users\aoki\AppData\Local");
+        // Built with join(): a `\` literal is a single component on Linux, so a spelled-out
+        // expected path would only match on Windows.
+        assert_eq!(
+            logs_dir_from(Os::Windows, home, Some(local_appdata)),
+            local_appdata.join("kikigaki").join("logs")
+        );
+    }
+
+    // Host-policy assertion: the injected-root tests above prove the *policy* for each
+    // `Os` in isolation; this proves `config_dir`/`logs_dir` land on the right one of those
+    // policies for whatever OS this test actually runs on, without restating their bodies.
+    #[test]
+    fn config_dir_and_logs_dir_follow_the_host_policy() {
+        let home = home_dir();
+        match Os::current() {
+            Os::Windows => {
+                assert_eq!(
+                    config_dir(&home),
+                    dirs::config_dir().unwrap().join("kikigaki")
+                );
+                assert_eq!(
+                    logs_dir(&home),
+                    dirs::data_local_dir()
+                        .unwrap()
+                        .join("kikigaki")
+                        .join("logs")
+                );
+            }
+            Os::MacOs => {
+                // Deliberately NOT dirs::config_dir(): on macOS that is ~/Library/Application
+                // Support, which this app has never used.
+                assert_eq!(config_dir(&home), home.join(".config/kikigaki"));
+                assert_eq!(logs_dir(&home), home.join("Library/Logs/kikigaki"));
+            }
+        }
+    }
 
     #[test]
     fn keyless_model_resolution_matrix() {
@@ -859,16 +1012,35 @@ mod tests {
         assert_eq!(actual.remote.extra_args, ["--serve", "--no-refine"]);
         assert!(actual.remote.server_punctuates);
         assert!(actual.models_dir.ends_with("kikigaki/models"));
-        assert!(actual
-            .metrics_path
-            .ends_with("Library/Logs/kikigaki/latency.jsonl"));
-        assert!(actual
-            .learned_file
-            .ends_with(".config/kikigaki/learned.toml"));
-        assert!(actual
-            .transcript_dir
-            .ends_with(".config/kikigaki/transcripts"));
-        assert!(default_path().ends_with(".config/kikigaki/config.toml"));
+        assert_eq!(actual.hotkey, default_hotkey_for(Os::current()));
+        if cfg!(target_os = "windows") {
+            assert!(actual
+                .metrics_path
+                .ends_with(r"kikigaki\logs\latency.jsonl"));
+            assert!(actual.replace_file.ends_with(r"kikigaki\replace.toml"));
+            assert!(actual.learned_file.ends_with(r"kikigaki\learned.toml"));
+            assert!(actual.transcript_dir.ends_with(r"kikigaki\transcripts"));
+            assert!(default_path().ends_with(r"kikigaki\config.toml"));
+        } else {
+            assert!(actual
+                .metrics_path
+                .ends_with("Library/Logs/kikigaki/latency.jsonl"));
+            assert!(actual
+                .learned_file
+                .ends_with(".config/kikigaki/learned.toml"));
+            assert!(actual
+                .transcript_dir
+                .ends_with(".config/kikigaki/transcripts"));
+            assert!(default_path().ends_with(".config/kikigaki/config.toml"));
+            assert!(actual
+                .replace_file
+                .ends_with(".config/kikigaki/replace.toml"));
+        }
+        let config_root = config_dir(&home_dir());
+        assert_eq!(actual.transcript_dir, config_root.join("transcripts"));
+        assert_eq!(actual.replace_file, config_root.join("replace.toml"));
+        assert_eq!(actual.learned_file, config_root.join("learned.toml"));
+        assert_eq!(actual.metrics_path, default_log_dir().join("latency.jsonl"));
     }
 
     #[test]

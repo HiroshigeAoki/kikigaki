@@ -87,6 +87,9 @@ pub trait EngineFactory: Send + Sync {
 }
 
 pub trait MicPort: Send {
+    fn prepare(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn start(&mut self, sink: kikigaki_core::engine::AudioSink) -> anyhow::Result<()>;
     fn stop(&mut self);
 }
@@ -433,6 +436,7 @@ const PASTE_FAILED_DETAIL: &str =
     "システム設定 › プライバシーとセキュリティ › アクセシビリティ で kikigaki を許可してください";
 
 struct Controller {
+    warm_mic: bool,
     settings: SettingsCoordinator,
     session: Session,
     mic: Box<dyn MicPort>,
@@ -535,6 +539,7 @@ impl Controller {
             EngineSupervisor::new(Box::new(move || supervisor_factory.build(standard_engine)))
                 .with_waker(Arc::clone(&waker));
         let controller = Self {
+            warm_mic: cfg!(target_os = "windows"),
             settings,
             session,
             mic,
@@ -746,6 +751,7 @@ impl Controller {
 
     fn handle_hotkey_edge(&mut self, edge: HotkeyEdge, outputs: &mut Vec<Output>) {
         let pressed = matches!(edge, HotkeyEdge::Pressed(_));
+        tracing::info!(pressed, "hotkey edge");
         if !pressed && self.active.is_none_or(|gen| !self.owners.contains(&gen)) {
             return;
         }
@@ -1062,6 +1068,11 @@ impl Controller {
                             .try_into()
                             .unwrap_or(u64::MAX);
                         tracing::info!(process_to_ready_ms, "engine ready");
+                        if self.warm_mic && self.session.state() != State::Recording {
+                            if let Err(error) = self.mic.prepare() {
+                                tracing::warn!(%error, "microphone prepare failed; will open per press");
+                            }
+                        }
                         if self.first_ready {
                             append_metric(
                                 self.settings.config(),
@@ -1745,6 +1756,8 @@ mod tests {
 
     #[derive(Default)]
     struct MicState {
+        prepares: AtomicUsize,
+        prepare_fails: AtomicBool,
         starts: AtomicUsize,
         stops: AtomicUsize,
         running: AtomicBool,
@@ -1753,6 +1766,15 @@ mod tests {
     struct FakeMic(Arc<MicState>);
 
     impl MicPort for FakeMic {
+        fn prepare(&mut self) -> anyhow::Result<()> {
+            self.0.prepares.fetch_add(1, Ordering::Relaxed);
+            anyhow::ensure!(
+                !self.0.prepare_fails.load(Ordering::Relaxed),
+                "scripted prepare failure"
+            );
+            Ok(())
+        }
+
         fn start(&mut self, _sink: AudioSink) -> anyhow::Result<()> {
             self.0.starts.fetch_add(1, Ordering::Relaxed);
             self.0.running.store(true, Ordering::Relaxed);
@@ -2256,6 +2278,90 @@ mod tests {
                 });
             self.turn();
         }
+    }
+
+    #[test]
+    fn warm_mic_ready_prepares_and_press_release_does_not_prepare_again() {
+        let mut h = LifecycleHarness::new();
+        let mic = Arc::new(MicState::default());
+        h.controller.mic = Box::new(FakeMic(Arc::clone(&mic)));
+        h.controller.warm_mic = true;
+        h.boot(false);
+        assert!(poll(|| {
+            h.turn();
+            mic.prepares.load(Ordering::Relaxed) == 1
+        }));
+        assert_eq!(mic.starts.load(Ordering::Relaxed), 0);
+        let mut outputs = Vec::new();
+        h.controller
+            .handle_hotkey_edge(HotkeyEdge::Pressed(HotkeyKey::Standard), &mut outputs);
+        h.controller.execute_outputs(std::mem::take(&mut outputs));
+        assert_eq!(mic.starts.load(Ordering::Relaxed), 1);
+        h.engine(EngineKind::Local).send(EngineMsg::Ready);
+        h.turn();
+        assert_eq!(h.controller.session.state(), State::Recording);
+        assert_eq!(mic.prepares.load(Ordering::Relaxed), 1);
+        h.controller
+            .handle_hotkey_edge(HotkeyEdge::Released(HotkeyKey::Standard), &mut outputs);
+        h.controller.execute_outputs(outputs);
+        assert_eq!(mic.stops.load(Ordering::Relaxed), 1);
+        assert_eq!(mic.prepares.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cold_mic_ready_does_not_prepare() {
+        let mut h = LifecycleHarness::new();
+        let mic = Arc::new(MicState::default());
+        h.controller.mic = Box::new(FakeMic(Arc::clone(&mic)));
+        h.controller.warm_mic = false;
+        h.boot(false);
+        assert!(poll(|| {
+            h.turn();
+            h.controller.session.state() == State::Idle
+        }));
+        assert_eq!(mic.prepares.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_warm_prepare_preserves_ready_and_press_retries_normally() {
+        let mut h = LifecycleHarness::new();
+        let mic = Arc::new(MicState::default());
+        mic.prepare_fails.store(true, Ordering::Relaxed);
+        h.controller.mic = Box::new(FakeMic(Arc::clone(&mic)));
+        h.controller.warm_mic = true;
+        h.boot(false);
+        assert!(poll(|| {
+            h.turn();
+            mic.prepares.load(Ordering::Relaxed) == 1
+        }));
+        assert_eq!(h.controller.session.state(), State::Idle);
+        assert!(matches!(h.controller.status, Status::Ok));
+        let mut outputs = Vec::new();
+        h.controller
+            .handle_hotkey_edge(HotkeyEdge::Pressed(HotkeyKey::Standard), &mut outputs);
+        h.controller.execute_outputs(outputs);
+        assert_eq!(mic.starts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn superseded_hotword_ready_does_not_prepare_microphone() {
+        let mut h = LifecycleHarness::new();
+        let mic = Arc::new(MicState::default());
+        h.controller.mic = Box::new(FakeMic(Arc::clone(&mic)));
+        h.controller.warm_mic = true;
+        h.boot(true);
+        assert!(poll(|| {
+            h.turn();
+            !h.engine(EngineKind::Local)
+                .event_senders
+                .lock()
+                .unwrap()
+                .is_empty()
+        }));
+        h.controller.hotwords_desired = !h.controller.hotwords_applied;
+        h.engine(EngineKind::Local).send(EngineMsg::Ready);
+        h.turn();
+        assert_eq!(mic.prepares.load(Ordering::Relaxed), 0);
     }
 
     #[test]

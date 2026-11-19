@@ -494,6 +494,10 @@ impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
 }
 
 impl crate::controller::MicPort for crate::mic::Mic {
+    fn prepare(&mut self) -> anyhow::Result<()> {
+        crate::mic::Mic::prepare(self)
+    }
+
     fn start(&mut self, sink: kikigaki_core::engine::AudioSink) -> anyhow::Result<()> {
         crate::mic::Mic::start(self, sink)
     }

@@ -38,6 +38,7 @@ unicode-segmentation = "=1.12.0"
 tempfile.workspace = true
 
 [dev-dependencies]
+dasp_sample = "0.11"
 # Same 1.x that reqwest's rustls-tls embeds; lets tests inspect the trusted roots.
 # 1.0.10 is the floor: it drops the compromised emSign ECC Root CA - G3.
 webpki-roots = "1.0.10"

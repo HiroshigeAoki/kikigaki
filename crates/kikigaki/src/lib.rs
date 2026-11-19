@@ -18,6 +18,9 @@ pub mod tray;
 mod cli;
 mod fetch;
 #[cfg(any(test, target_os = "macos", target_os = "windows"))]
+mod mic_format;
+mod mic_gate;
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 mod onboarding;
 mod permissions;
 mod startup;

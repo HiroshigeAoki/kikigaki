@@ -713,6 +713,7 @@ class SelfTests(unittest.TestCase):
                 "manifest_sha256": ["manifest-hash"],
                 "git_head": "012345",
                 "model_dir": "whisper-model",
+                "whisper_audio_ctx": "scaled:1000:128",
             },
             Path("whisper.jsonl"),
         )

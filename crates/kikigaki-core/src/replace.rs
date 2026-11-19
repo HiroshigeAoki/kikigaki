@@ -15,6 +15,39 @@ pub struct Rule {
     pub from: Vec<String>,
     /// Text substituted for every matching source string.
     pub to: String,
+    /// Restricts matches to katakana and ASCII word boundaries.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_word: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// One applied replacement, with byte offsets in the original input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// Matched source.
+    pub from: String,
+    /// Replacement text.
+    pub to: String,
+    /// Inclusive input byte offset.
+    pub start: usize,
+    /// Exclusive input byte offset.
+    pub end: usize,
+}
+
+fn class(c: char) -> Option<u8> {
+    match c {
+        '\u{30a1}'..='\u{30fa}' | '\u{30fc}'..='\u{30fe}' => Some(0),
+        c if c.is_ascii_alphanumeric() => Some(1),
+        _ => None,
+    }
+}
+
+fn boundary(edge: Option<char>, neighbor: Option<char>) -> bool {
+    edge.and_then(class)
+        .is_none_or(|k| neighbor.and_then(class) != Some(k))
 }
 
 /// Parsed replacement rules and their longest-match application order.
@@ -83,6 +116,7 @@ impl Rules {
                 (!kept.is_empty()).then(|| Rule {
                     from: kept,
                     to: rule.to.clone(),
+                    whole_word: rule.whole_word,
                 })
             })
             .collect();
@@ -130,27 +164,57 @@ impl Rules {
 
     /// Applies rules left-to-right with the longest source string taking precedence.
     pub fn apply(&self, text: &str) -> String {
+        self.apply_with(text, |_| {})
+    }
+
+    /// Applies rules and records matches using byte offsets in the input.
+    pub fn apply_traced(&self, text: &str) -> (String, Vec<Applied>) {
+        let mut hits = Vec::new();
+        let output = self.apply_with(text, |hit| hits.push(hit));
+        (output, hits)
+    }
+
+    /// Returns whether a source belongs to this dictionary.
+    pub fn contains_source(&self, source: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.from.iter().any(|from| from == source))
+    }
+
+    fn apply_with(&self, text: &str, mut record: impl FnMut(Applied)) -> String {
         let mut output = String::with_capacity(text.len());
-        let mut remaining = text;
-        while !remaining.is_empty() {
-            let matched = self.ordered.iter().find_map(|&(rule_index, from_index)| {
-                let rule = &self.rules[rule_index];
-                let from = &rule.from[from_index];
-                remaining
-                    .starts_with(from)
-                    .then_some((from.len(), rule.to.as_str()))
+        let mut start = 0;
+        while start < text.len() {
+            let remaining = &text[start..];
+            let matched = self.ordered.iter().find_map(|&(ri, fi)| {
+                let rule = &self.rules[ri];
+                let from = &rule.from[fi];
+                if !remaining.starts_with(from) {
+                    return None;
+                }
+                let end = start + from.len();
+                if rule.whole_word
+                    && !(boundary(from.chars().next(), text[..start].chars().next_back())
+                        && boundary(from.chars().next_back(), text[end..].chars().next()))
+                {
+                    return None;
+                }
+                Some((from, rule))
             });
-            if let Some((source_bytes, replacement)) = matched {
-                output.push_str(replacement);
-                remaining = &remaining[source_bytes..];
+            if let Some((from, rule)) = matched {
+                let end = start + from.len();
+                output.push_str(&rule.to);
+                record(Applied {
+                    from: from.clone(),
+                    to: rule.to.clone(),
+                    start,
+                    end,
+                });
+                start = end;
             } else {
-                let char_bytes = remaining
-                    .chars()
-                    .next()
-                    .expect("remaining text is non-empty")
-                    .len_utf8();
-                output.push_str(&remaining[..char_bytes]);
-                remaining = &remaining[char_bytes..];
+                let c = remaining.chars().next().expect("non-empty remaining input");
+                output.push(c);
+                start += c.len_utf8();
             }
         }
         output
@@ -236,6 +300,84 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn whole_word_boundaries_and_fallthrough() {
+        let rules = Rules::parse(
+            r#"[[rule]]
+from = ["ハウス", "uat", "漢ハウス", "ひハウス"]
+to = "X"
+whole_word = true
+[[rule]]
+from = ["ゲラ"]
+to = "long"
+whole_word = true
+[[rule]]
+from = ["ゲ"]
+to = "X"
+"#,
+        )
+        .unwrap();
+        for (input, expected) in [
+            ("ハウスを使う", "Xを使う"),
+            ("ビニールハウス", "ビニールハウス"),
+            ("ハウスキーパー", "ハウスキーパー"),
+            ("uatを頼む", "Xを頼む"),
+            ("uatx", "uatx"),
+            ("a uat b", "a X b"),
+            ("1uat", "1uat"),
+            ("カ漢ハウス", "カX"),
+            ("aひハウス", "aX"),
+            ("ゲラフ", "Xラフ"),
+            ("ー ハウスヽ", "ー ハウスヽ"),
+            ("ハウス・", "X・"),
+        ] {
+            assert_eq!(rules.apply(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn whole_word_toml_roundtrip_and_flag_preservation() {
+        for flag in [false, true] {
+            let text = format!("from = [\"uat\"]\nto = \"UAT\"\nwhole_word = {flag}\n");
+            let rule: Rule = toml::from_str(&text).unwrap();
+            let serialized = toml::to_string(&rule).unwrap();
+            assert_eq!(serialized.contains("whole_word"), flag);
+            assert_eq!(toml::from_str::<Rule>(&serialized).unwrap(), rule);
+            let base = Rules::from_learned_checked(vec![rule]).unwrap();
+            assert_eq!(
+                Rules::merge(&base, &Rules::default()).apply("uatx"),
+                if flag { "uatx" } else { "UATx" }
+            );
+        }
+        let rule: Rule = toml::from_str("from = [\"a\"]\nto = \"b\"\n").unwrap();
+        assert!(!rule.whole_word);
+    }
+
+    #[test]
+    fn traces_input_byte_offsets_and_uses_input_boundaries() {
+        let rules = Rules::parse("[[rule]]\nfrom = [\"カ\"]\nto = \" \"\n[[rule]]\nfrom = [\"ハウス\"]\nto = \"Haas\"\nwhole_word = true\n").unwrap();
+        let (output, hits) = rules.apply_traced("カハウスとハウス");
+        assert_eq!(output, " ハウスとHaas");
+        assert_eq!(
+            hits,
+            vec![
+                Applied {
+                    from: "カ".into(),
+                    to: " ".into(),
+                    start: 0,
+                    end: 3
+                },
+                Applied {
+                    from: "ハウス".into(),
+                    to: "Haas".into(),
+                    start: 15,
+                    end: 24
+                }
+            ]
+        );
+        assert_eq!(rules.apply("カハウスとハウス"), output);
+    }
 
     #[test]
     fn builtin_dict_parses_and_is_sane() {
@@ -342,6 +484,7 @@ mod tests {
         let rules = vec![Rule {
             from: vec!["".into()],
             to: "x".into(),
+            whole_word: false,
         }];
         assert!(Rules::from_learned_checked(rules).is_err());
     }
@@ -352,10 +495,12 @@ mod tests {
             Rule {
                 from: vec!["a".into()],
                 to: "1".into(),
+                whole_word: false,
             },
             Rule {
                 from: vec!["a".into()],
                 to: "2".into(),
+                whole_word: false,
             },
         ];
         assert!(Rules::from_learned_checked(rules).is_err());

@@ -9,7 +9,7 @@ commit messages) is English.
 | Crate | Role |
 | --- | --- |
 | `crates/kikigaki-core` | Platform-independent audio, protocol, session, and engine support |
-| `crates/kikigaki-engine` | In-process speech engine: Silero VAD + ReazonSpeech transducer on sherpa-onnx; mojicast punctuation on ort (feature `punct`) |
+| `crates/kikigaki-engine` | In-process speech engine: Silero VAD + Haas-ja (default) or ReazonSpeech transducer on sherpa-onnx; mojicast punctuation on ort for ReazonSpeech (feature `punct`); Haas provides its own punctuation |
 | `crates/kikigaki` | Tauri v2 app; platform-specific modules are gated on `target_os = "macos"` / `"windows"` so `cargo test --lib` runs on any platform |
 
 ## Verification
@@ -33,7 +33,6 @@ Development happens on Linux; macOS builds run on a separate build Mac over SSH.
 
 Development happens on Linux; Windows builds run on a separate build machine over SSH.
 
-
 - `scripts/win-sync-build.sh` — sync the source tree to the Windows build machine and build.
 - `scripts/win-build.ps1` — Windows-side build/test driver invoked by `win-sync-build.sh`;
   provides `build` and `test` subcommands.
@@ -45,7 +44,7 @@ Development happens on Linux; Windows builds run on a separate build machine ove
 - `scripts/fetch-sherpa-win.ps1` — downloads and hash-verifies the vendored sherpa-onnx
   Windows shared-library archive (five pinned files: three runtime DLLs plus two `.lib` import
   libraries); invoked by `win-build.ps1` and `release-win.ps1`.
-- Requires `KIKIGAKI_WIN=user@host` of the Windows build machine. No secrets live in this repo.
+- Requires `KIKIGAKI_WIN` to specify the SSH destination of the Windows build machine. No secrets live in this repo.
 
 ## Other scripts
 

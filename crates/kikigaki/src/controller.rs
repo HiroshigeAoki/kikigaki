@@ -96,6 +96,7 @@ pub trait PostprocessFactory: Send {
         &self,
         learned: std::sync::Arc<kikigaki_core::replace::Rules>,
         builtin_enabled: bool,
+        load_punctuator: bool,
         waker: Option<Waker>,
     ) -> anyhow::Result<PostprocessWorker>;
 }
@@ -948,6 +949,10 @@ impl Controller {
                         match self.postprocess_factory.build(
                             self.learned.as_core_rules(),
                             settings.builtin_replace_dict,
+                            !self.settings.config().engine_punctuates(
+                                self.standard_engine,
+                                self.settings.applied_asr_model(),
+                            ),
                             Some(Arc::clone(&self.waker)),
                         ) {
                             Ok(worker) => {
@@ -1782,6 +1787,7 @@ mod tests {
         builtin: Arc<kikigaki_core::replace::Rules>,
         gate: Mutex<Option<BuildGate>>,
         punctuator: Arc<PunctuatorState>,
+        load_punctuator: Arc<Mutex<Vec<bool>>>,
     }
 
     impl FakePostprocessFactory {
@@ -1791,6 +1797,7 @@ mod tests {
                 builtin: Arc::new(kikigaki_core::replace::builtin_rules().unwrap()),
                 gate: Mutex::new(gate),
                 punctuator: Arc::new(PunctuatorState::default()),
+                load_punctuator: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1800,8 +1807,10 @@ mod tests {
             &self,
             learned: Arc<kikigaki_core::replace::Rules>,
             builtin_enabled: bool,
+            load_punctuator: bool,
             waker: Option<Waker>,
         ) -> anyhow::Result<PostprocessWorker> {
+            self.load_punctuator.lock().unwrap().push(load_punctuator);
             if let Some(gate) = self.gate.lock().unwrap().take() {
                 gate.entered.send(()).unwrap();
                 gate.release.recv().unwrap();
@@ -2240,6 +2249,43 @@ mod tests {
                     failed_model: model,
                 });
             self.turn();
+        }
+    }
+
+    #[test]
+    fn postprocess_factory_load_flag_uses_applied_asr_model() {
+        use kikigaki_core::config::AsrModel;
+        for (model, expected) in [(AsrModel::Haas, false), (AsrModel::ReazonSpeech, true)] {
+            let mut h = LifecycleHarness::new();
+            let path = h._temp.path().join("config.toml");
+            let config = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                config.replace(
+                    "reazonspeech",
+                    if model == AsrModel::Haas {
+                        "haas"
+                    } else {
+                        "reazonspeech"
+                    },
+                ),
+            )
+            .unwrap();
+            h.controller.settings = SettingsCoordinator::load(
+                path,
+                Capabilities {
+                    punct: true,
+                    remote_engine: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(h.controller.settings.applied_asr_model(), model);
+            assert_eq!(h.controller.standard_engine, EngineKind::Local);
+            let factory = FakePostprocessFactory::new(h._temp.path().join("replace.toml"), None);
+            let flags = Arc::clone(&factory.load_punctuator);
+            h.controller.postprocess_factory = Box::new(factory);
+            h.boot(false);
+            assert_eq!(*flags.lock().unwrap(), [expected]);
         }
     }
 

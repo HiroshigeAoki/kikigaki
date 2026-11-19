@@ -436,9 +436,12 @@ impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
         &self,
         learned: Arc<kikigaki_core::replace::Rules>,
         builtin_enabled: bool,
+        load_punctuator: bool,
         waker: Option<kikigaki_core::engine::Waker>,
     ) -> anyhow::Result<kikigaki_core::postprocess::PostprocessWorker> {
-        let punctuator: Box<dyn kikigaki_core::postprocess::Punctuator> = {
+        let punctuator: Box<dyn kikigaki_core::postprocess::Punctuator> = if !load_punctuator {
+            Box::new(kikigaki_core::postprocess::NoopPunctuator)
+        } else {
             #[cfg(feature = "punct")]
             {
                 let models_dir = self.models_dir.clone();

@@ -24,34 +24,39 @@ impl Punctuator for NoopPunctuator {
     }
 }
 
-/// Retries an unavailable punctuator on each request, caching the first successful load.
+type PunctuatorLoader = Box<dyn FnMut() -> anyhow::Result<Option<Box<dyn Punctuator>>> + Send>;
+
+/// Retries while files are absent and caches a successful load.
+/// A load failure warns once and disables loading for this process.
 pub struct LazyPunctuator {
-    loader: Box<dyn FnMut() -> anyhow::Result<Box<dyn Punctuator>> + Send>,
+    loader: PunctuatorLoader,
     loaded: Option<Box<dyn Punctuator>>,
-    warned: bool,
+    failed: bool,
 }
 
 impl LazyPunctuator {
     /// Defers loading until punctuation is requested.
-    pub fn new(loader: Box<dyn FnMut() -> anyhow::Result<Box<dyn Punctuator>> + Send>) -> Self {
+    pub fn new(loader: PunctuatorLoader) -> Self {
         Self {
             loader,
             loaded: None,
-            warned: false,
+            failed: false,
         }
     }
 }
 
 impl Punctuator for LazyPunctuator {
     fn punctuate(&mut self, text: &str) -> anyhow::Result<String> {
+        if self.failed {
+            return Ok(text.to_owned());
+        }
         if self.loaded.is_none() {
             match (self.loader)() {
-                Ok(punctuator) => self.loaded = Some(punctuator),
+                Ok(Some(punctuator)) => self.loaded = Some(punctuator),
+                Ok(None) => return Ok(text.to_owned()),
                 Err(error) => {
-                    if !self.warned {
-                        tracing::warn!(%error, "punctuator unavailable; keeping unpunctuated text until loading succeeds");
-                        self.warned = true;
-                    }
+                    tracing::warn!(%error, "punctuator load failed; keeping unpunctuated text for this process");
+                    self.failed = true;
                     return Ok(text.to_owned());
                 }
             }
@@ -64,7 +69,8 @@ impl Punctuator for LazyPunctuator {
 }
 
 /// Loads installed mojicast eagerly, or waits for both model files before trying the loader.
-/// Eager load failures are propagated; deferred failures pass text through and retry later.
+/// Eager load failures are propagated. Missing files are checked again on each request;
+/// a deferred load failure warns once and passes text through without further retries.
 pub fn optional_mojicast_punctuator(
     models_dir: std::path::PathBuf,
     mut loader: impl FnMut() -> anyhow::Result<Box<dyn Punctuator>> + Send + 'static,
@@ -77,8 +83,10 @@ pub fn optional_mojicast_punctuator(
         return loader();
     }
     Ok(Box::new(LazyPunctuator::new(Box::new(move || {
-        anyhow::ensure!(installed(), "mojicast model files are not installed");
-        loader()
+        if !installed() {
+            return Ok(None);
+        }
+        loader().map(Some)
     }))))
 }
 
@@ -411,13 +419,13 @@ mod tests {
         let recorded = Arc::clone(&seen);
         let mut punct = LazyPunctuator::new(Box::new(move || {
             if count.fetch_add(1, Ordering::SeqCst) < 2 {
-                bail!("not installed");
+                return Ok(None);
             }
-            Ok(Box::new(RecordingPunctuator(Arc::clone(&recorded))))
+            Ok(Some(Box::new(RecordingPunctuator(Arc::clone(&recorded)))))
         }));
         assert_eq!(punct.punctuate("一").unwrap(), "一");
         assert_eq!(punct.punctuate("二").unwrap(), "二");
-        assert!(punct.warned);
+        assert!(!punct.failed);
         assert_eq!(punct.punctuate("三").unwrap(), "三。");
         assert_eq!(punct.punctuate("四").unwrap(), "四。");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -469,7 +477,19 @@ mod tests {
         }
         let warnings = Arc::new(AtomicUsize::new(0));
         tracing::subscriber::with_default(Warnings(Arc::clone(&warnings)), || {
-            let mut punct = LazyPunctuator::new(Box::new(|| bail!("missing")));
+            let mut attempts = 0;
+            let mut punct = LazyPunctuator::new(Box::new(move || {
+                attempts += 1;
+                if attempts <= 2 {
+                    Ok(None)
+                } else {
+                    bail!("bad model")
+                }
+            }));
+            for _ in 0..2 {
+                assert_eq!(punct.punctuate("missing").unwrap(), "missing");
+            }
+            assert_eq!(warnings.load(Ordering::SeqCst), 0);
             for _ in 0..3 {
                 assert_eq!(punct.punctuate("text").unwrap(), "text");
             }
@@ -478,8 +498,43 @@ mod tests {
     }
 
     #[test]
+    fn lazy_punctuator_load_failure_is_not_retried() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let mut punct = LazyPunctuator::new(Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            bail!("bad model")
+        }));
+        for text in ["one", "two", "three"] {
+            assert_eq!(punct.punctuate(text).unwrap(), text);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn optional_mojicast_deferred_load_failure_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let mut punct = optional_mojicast_punctuator(dir.path().to_owned(), move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            bail!("bad model")
+        })
+        .unwrap();
+        assert_eq!(punct.punctuate("missing").unwrap(), "missing");
+        let model = dir.path().join("mojicast-punct");
+        std::fs::create_dir(&model).unwrap();
+        std::fs::write(model.join("punct_bert.int8.onnx"), "").unwrap();
+        std::fs::write(model.join("vocab.txt"), "").unwrap();
+        for text in ["one", "two", "three"] {
+            assert_eq!(punct.punctuate(text).unwrap(), text);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn lazy_punctuator_forwards_loaded_errors() {
-        let mut punct = LazyPunctuator::new(Box::new(|| Ok(Box::new(FailingPunctuator))));
+        let mut punct = LazyPunctuator::new(Box::new(|| Ok(Some(Box::new(FailingPunctuator)))));
         assert!(punct.punctuate("text").is_err());
     }
 

@@ -45,14 +45,14 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 ### 認識モデル
 
-設定画面の「認識モデル」で、聞き取りキーが使うモデルを「標準」(ReazonSpeech)と「Haas」(Haas-ja v1.0、既定)から選べる。
+設定画面の「認識モデル」で、聞き取りキーが使うモデルを「ReazonSpeech」と「Haas」(Haas-ja v1.0、既定)から選べる。
 
-以前からkikigakiを使っていてモデルを選んだことがない環境では、ReazonSpeechだけが入っている間はReazonSpeechを使い続ける。Haasのモデルがすでに入っている場合はHaasを使う。設定画面でHaasを選ぶと切り替わる。ReazonSpeechを使い続けたい場合は、設定画面で「標準」を選ぶ。選んだモデルは設定ファイルの `[asr]` の `model` に保存される。
+以前からkikigakiを使っていてモデルを選んだことがない環境では、ReazonSpeechだけが入っている間はReazonSpeechを使い続ける。Haasのモデルがすでに入っている場合はHaasを使う。設定画面でHaasを選ぶと切り替わる。ReazonSpeechを使い続けたい場合は、設定画面で「ReazonSpeech」を選ぶ。選んだモデルは設定ファイルの `[asr]` の `model` に保存される。
 
 - Haasは一般的な日本語の読み上げ音声で誤りが約半分になる。FLEURS日本語テストセットの文字誤り率はHaasが4.8%、ReazonSpeechが9.0%で、固有名詞や専門用語にも強い
-- 標準はキーを離してから貼り付けまで約0.2秒。Haasはそれより遅く、Apple Silicon搭載Macで短い発話なら約0.4秒が目安となる
+- ReazonSpeechはキーを離してから貼り付けまで約0.2秒。Haasはそれより遅く、Apple Silicon搭載Macで短い発話なら約0.4秒が目安となる
 - Haasは初回に約480 MBをダウンロードし、実行中は約0.9 GBのメモリを使う
-- 切り替えはkikigakiの次の起動から反映される。標準に戻す場合も同じ
+- 切り替えはkikigakiの次の起動から反映される。ReazonSpeechに戻す場合も同じ
 - Haasは自身で句読点を出力し、聞き取りキーに句読点モデルを適用しないため、末尾の文に必ずしも「。」が付くわけではない
 
 ### 置換辞書

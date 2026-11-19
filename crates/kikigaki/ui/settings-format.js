@@ -102,7 +102,20 @@
     }
   }
 
+  function asrModelNote(saved, applied) {
+    if (saved === applied) return '標準キーの認識に使うモデル';
+    return saved === 'haas'
+      ? '次の起動から切り替わります。Haas は初回に約 480 MB をダウンロードします'
+      : '次の起動から切り替わります';
+  }
+
+  function asrModelFooter(applied) {
+    return applied === 'haas' ? 'Haas-ja v1.0 · Silero VAD'
+      : 'ReazonSpeech ja-en · Silero VAD · mojicast';
+  }
+
   const KikigakiFormat = {
+    asrModelNote, asrModelFooter,
     formatChord, longStateView, statusKeysLine, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateText,
     HISTORY_PAGE: 20,
   };

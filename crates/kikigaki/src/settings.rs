@@ -2,12 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use kikigaki_core::config::{chords_match, Capabilities, Config, PunctEnabled};
+use kikigaki_core::config::{chords_match, AsrModel, Capabilities, Config, PunctEnabled};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
+    pub asr_model: Option<AsrModel>,
     pub hotkey: Option<String>,
     pub long_key: Option<bool>,
     pub long_hotkey: Option<String>,
@@ -28,6 +29,8 @@ pub enum PunctSetting {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SettingsSnapshot {
+    pub asr_model: AsrModel,
+    pub asr_model_applied: AsrModel,
     pub hotkey: String,
     pub long_key: bool,
     pub long_hotkey: String,
@@ -45,6 +48,7 @@ pub struct SettingsSnapshot {
 pub struct SettingsCoordinator {
     path: PathBuf,
     config: Config,
+    applied_asr_model: AsrModel,
     capabilities: Capabilities,
     last_written: Option<String>,
 }
@@ -58,6 +62,7 @@ impl SettingsCoordinator {
         }
         Ok(Self {
             path,
+            applied_asr_model: config.asr.model,
             config,
             capabilities,
             last_written: Some(raw),
@@ -67,6 +72,8 @@ impl SettingsCoordinator {
     /// The controller adds runtime long-engine state in `settings_snapshot()`.
     pub fn snapshot(&self) -> SettingsSnapshot {
         SettingsSnapshot {
+            asr_model: self.config.asr.model,
+            asr_model_applied: self.applied_asr_model(),
             hotkey: self.config.hotkey.clone(),
             long_key: self.config.long_key,
             long_hotkey: self.config.long_hotkey.clone(),
@@ -83,6 +90,7 @@ impl SettingsCoordinator {
                 &self.config,
                 self.capabilities,
                 self.config.engine,
+                self.applied_asr_model(),
             ),
             strip_trailing_period: self.config.strip_trailing_period,
             builtin_replace_dict: self.config.builtin_replace_dict,
@@ -90,6 +98,10 @@ impl SettingsCoordinator {
             transcript_dir: self.config.transcript_dir.clone(),
             paste_method: self.config.paste_method,
         }
+    }
+
+    pub fn applied_asr_model(&self) -> AsrModel {
+        self.applied_asr_model
     }
 
     pub fn config(&self) -> &Config {
@@ -145,6 +157,28 @@ impl SettingsCoordinator {
             })?;
             document["hotkey"] = toml_edit::value(chord.as_str());
             candidate.hotkey = chord.clone();
+        }
+        if let Some(model) = patch.asr_model {
+            match model {
+                AsrModel::Haas => {
+                    if !document.contains_key("asr") {
+                        document["asr"] = toml_edit::table();
+                    }
+                    document["asr"]["model"] = toml_edit::value("haas");
+                }
+                AsrModel::ReazonSpeech => {
+                    if let Some(table) = document
+                        .get_mut("asr")
+                        .and_then(toml_edit::Item::as_table_mut)
+                    {
+                        table.remove("model");
+                        if table.is_empty() {
+                            document.remove("asr");
+                        }
+                    }
+                }
+            }
+            candidate.asr.model = model;
         }
         if let Some(setting) = patch.punctuation {
             let (enabled, strip) = match setting {
@@ -269,6 +303,121 @@ mod tests {
         };
         let coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
         (temp, path, coordinator, caps)
+    }
+
+    #[test]
+    fn asr_model_patch_uses_camel_case_json() {
+        let patch: SettingsPatch = serde_json::from_str(r#"{"asrModel":"haas"}"#).unwrap();
+        assert_eq!(patch.asr_model, Some(AsrModel::Haas));
+    }
+
+    #[test]
+    fn asr_model_apply_round_trip_preserves_original_bytes() {
+        for raw in [
+            "# keep\nhotkey = \"Alt+Space\"\n[vad]\nthreshold = 0.6\n",
+            concat!(
+                "# keep\nhotkey = \"Alt+Space\"\n[asr] # tuning\n",
+                "hotwords_score = 2.5 # keep score\n[vad]\nthreshold = 0.6\n",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            std::fs::write(&path, raw).unwrap();
+            let caps = Capabilities {
+                punct: true,
+                remote_engine: false,
+                long_key: false,
+            };
+            let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
+            let before = coordinator.snapshot();
+            let saved = coordinator
+                .apply(SettingsPatch {
+                    asr_model: Some(AsrModel::Haas),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
+            assert_eq!(coordinator.config().asr.model, AsrModel::Haas);
+            assert_eq!(saved.asr_model, AsrModel::Haas);
+            assert_eq!(saved.asr_model_applied, AsrModel::ReazonSpeech);
+            assert_eq!(saved.punct_enabled, before.punct_enabled);
+            let json = serde_json::to_value(&saved).unwrap();
+            assert_eq!(json["asr_model"], "haas");
+            assert_eq!(json["asr_model_applied"], "reazonspeech");
+            let reloaded = SettingsCoordinator::load(path.clone(), caps).unwrap();
+            assert_eq!(reloaded.config().asr.model, AsrModel::Haas);
+            coordinator
+                .apply(SettingsPatch {
+                    asr_model: Some(AsrModel::ReazonSpeech),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
+            assert_eq!(coordinator.config().asr.model, AsrModel::ReazonSpeech);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn unrelated_patch_does_not_write_asr_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let raw = "# keep\ntranscript_log = false\n";
+        std::fs::write(&path, raw).unwrap();
+        let mut coordinator = SettingsCoordinator::load(
+            path.clone(),
+            Capabilities {
+                punct: true,
+                remote_engine: false,
+                long_key: false,
+            },
+        )
+        .unwrap();
+        coordinator
+            .apply(SettingsPatch {
+                transcript_log: Some(false),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn applied_asr_model_is_captured_at_load_and_survives_apply() {
+        for (raw, model) in [
+            ("", AsrModel::ReazonSpeech),
+            ("[asr]\nmodel = \"haas\"\n", AsrModel::Haas),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            std::fs::write(&path, raw).unwrap();
+            let caps = Capabilities {
+                punct: true,
+                remote_engine: true,
+                long_key: true,
+            };
+            let mut settings = SettingsCoordinator::load(path, caps).unwrap();
+            assert_eq!(settings.applied_asr_model(), model);
+            assert_eq!(
+                settings.snapshot().punct_enabled,
+                model == AsrModel::ReazonSpeech
+            );
+            // Simulate a saved selection changing independently of the running engine.
+            settings.config.asr.model = if model == AsrModel::Haas {
+                AsrModel::ReazonSpeech
+            } else {
+                AsrModel::Haas
+            };
+            settings
+                .apply(SettingsPatch {
+                    transcript_log: Some(true),
+                    ..SettingsPatch::default()
+                })
+                .unwrap();
+            assert_eq!(settings.applied_asr_model(), model);
+            assert_eq!(
+                settings.snapshot().punct_enabled,
+                model == AsrModel::ReazonSpeech
+            );
+        }
     }
 
     #[test]

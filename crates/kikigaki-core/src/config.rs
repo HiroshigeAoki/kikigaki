@@ -83,10 +83,26 @@ pub enum PasteMethod {
     Type,
 }
 
+/// Local speech recognition model selected at launch.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AsrModel {
+    /// ReazonSpeech Japanese-English transducer.
+    #[default]
+    #[serde(rename = "reazonspeech")]
+    ReazonSpeech,
+    /// Haas Japanese transducer with built-in punctuation.
+    #[serde(rename = "haas")]
+    Haas,
+}
+
 /// Offline speech recognition settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AsrConfig {
+    /// Local model selected for the next launch.
+    pub model: AsrModel,
+    /// Score used to boost Haas hotwords.
+    pub haas_hotwords_score: f32,
     /// Number of threads used by the recognizer.
     pub num_threads: u32,
     /// Search algorithm used to decode recognizer output.
@@ -95,9 +111,21 @@ pub struct AsrConfig {
     pub hotwords_score: f32,
 }
 
+impl AsrConfig {
+    /// Returns the hotword score for the selected local model.
+    pub fn active_hotwords_score(&self) -> f32 {
+        match self.model {
+            AsrModel::Haas => self.haas_hotwords_score,
+            AsrModel::ReazonSpeech => self.hotwords_score,
+        }
+    }
+}
+
 impl Default for AsrConfig {
     fn default() -> Self {
         Self {
+            model: AsrModel::ReazonSpeech,
+            haas_hotwords_score: 1.5,
             num_threads: 4,
             decoding_method: DecodingMethod::ModifiedBeamSearch,
             hotwords_score: 3.0,
@@ -409,6 +437,7 @@ impl Config {
             bail!("asr.num_threads must be in 1..=16");
         }
         validate_positive("asr.hotwords_score", self.asr.hotwords_score)?;
+        validate_positive("asr.haas_hotwords_score", self.asr.haas_hotwords_score)?;
         validate_threshold("vad.threshold", self.vad.threshold)?;
         validate_threshold("punct.comma_threshold", self.punct.comma_threshold)?;
         validate_threshold("punct.period_threshold", self.punct.period_threshold)?;
@@ -458,11 +487,12 @@ impl Config {
     }
 
     /// Returns whether engine punctuation is retained instead of running local punctuation.
-    /// Whisper punctuation is stripped so both local engines use the same punctuator.
-    pub fn engine_punctuates(&self, engine: EngineKind) -> bool {
+    /// Whisper punctuation is stripped before the shared local punctuator runs.
+    pub fn engine_punctuates(&self, engine: EngineKind, applied_asr_model: AsrModel) -> bool {
         match engine {
             EngineKind::Remote => self.remote.server_punctuates,
-            EngineKind::Local | EngineKind::Whisper => false,
+            EngineKind::Local => applied_asr_model == AsrModel::Haas,
+            EngineKind::Whisper => false,
         }
     }
 
@@ -478,8 +508,13 @@ impl Config {
 }
 
 /// Returns whether this process should run punctuation for the selected engine.
-pub fn punct_effective(config: &Config, caps: Capabilities, engine: EngineKind) -> bool {
-    config.punct.effective(caps) && !config.engine_punctuates(engine)
+pub fn punct_effective(
+    config: &Config,
+    caps: Capabilities,
+    engine: EngineKind,
+    applied_asr_model: AsrModel,
+) -> bool {
+    config.punct.effective(caps) && !config.engine_punctuates(engine, applied_asr_model)
 }
 
 /// Resolves text processing choices independently of the configured engine.
@@ -487,11 +522,15 @@ pub fn postprocess_settings(
     config: &Config,
     caps: Capabilities,
     engine: EngineKind,
+    applied_asr_model: AsrModel,
 ) -> crate::postprocess::PostprocessSettings {
     crate::postprocess::PostprocessSettings {
-        punct_enabled: punct_effective(config, caps, engine),
+        punct_enabled: punct_effective(config, caps, engine, applied_asr_model),
         strip_trailing_period: config.strip_trailing_period,
-        strip_engine_punct: engine == EngineKind::Whisper,
+        strip_engine_punct: engine == EngineKind::Whisper
+            || (engine == EngineKind::Local
+                && applied_asr_model == AsrModel::Haas
+                && !config.punct.effective(caps)),
     }
 }
 
@@ -575,6 +614,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_hotwords_score_follows_model_and_custom_scores() {
+        let mut config = AsrConfig::default();
+        assert_eq!(config.active_hotwords_score(), 3.0);
+        config.hotwords_score = 4.5;
+        config.haas_hotwords_score = 2.5;
+        assert_eq!(config.active_hotwords_score(), 4.5);
+        config.model = AsrModel::Haas;
+        assert_eq!(config.active_hotwords_score(), 2.5);
+        assert_eq!(
+            AsrConfig {
+                model: AsrModel::Haas,
+                ..AsrConfig::default()
+            }
+            .active_hotwords_score(),
+            1.5
+        );
+    }
+
+    #[test]
+    fn haas_punctuation_uses_applied_model_and_effective_choice() {
+        for (choice, capability, strip, strip_engine) in [
+            (PunctEnabled::On, true, false, false),
+            (PunctEnabled::On, true, true, false),
+            (PunctEnabled::Off, true, false, true),
+            (PunctEnabled::Off, true, true, true),
+            (PunctEnabled::Auto, true, false, false),
+            (PunctEnabled::Auto, false, false, true),
+            (PunctEnabled::On, false, false, false),
+        ] {
+            let mut config = Config::default();
+            // The saved model deliberately differs from the running model.
+            config.asr.model = AsrModel::ReazonSpeech;
+            config.punct.enabled = choice;
+            config.strip_trailing_period = strip;
+            let caps = Capabilities {
+                punct: capability,
+                remote_engine: true,
+                long_key: true,
+            };
+            assert!(config.engine_punctuates(EngineKind::Local, AsrModel::Haas));
+            assert!(!punct_effective(
+                &config,
+                caps,
+                EngineKind::Local,
+                AsrModel::Haas
+            ));
+            let actual = postprocess_settings(&config, caps, EngineKind::Local, AsrModel::Haas);
+            assert!(!actual.punct_enabled);
+            assert_eq!(actual.strip_engine_punct, strip_engine);
+            assert_eq!(actual.strip_trailing_period, strip);
+            config.asr.model = AsrModel::Haas;
+            let expected = postprocess_settings(
+                &Config {
+                    asr: AsrConfig::default(),
+                    ..config.clone()
+                },
+                caps,
+                EngineKind::Local,
+                AsrModel::ReazonSpeech,
+            );
+            assert_eq!(
+                postprocess_settings(&config, caps, EngineKind::Local, AsrModel::ReazonSpeech),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn asr_model_and_haas_score_config_contract() {
+        let legacy: Config = toml::from_str("[asr]\nnum_threads = 4").unwrap();
+        assert_eq!(legacy.asr.model, AsrModel::ReazonSpeech);
+        assert_eq!(legacy.asr.haas_hotwords_score, 1.5);
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+        assert_eq!(defaults["asr"]["model"].as_str(), Some("reazonspeech"));
+        assert_eq!(defaults["asr"]["haas_hotwords_score"].as_float(), Some(1.5));
+        for model in ["haas", "reazonspeech"] {
+            let config: Config = toml::from_str(&format!("[asr]\nmodel = \"{model}\"")).unwrap();
+            let serialized = toml::to_string(&config).unwrap();
+            assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
+        }
+        assert!(toml::from_str::<Config>("[asr]\nmodel = \"unknown\"").is_err());
+        for score in ["0", "-1", "inf", "nan"] {
+            let config: Config =
+                toml::from_str(&format!("[asr]\nhaas_hotwords_score = {score}")).unwrap();
+            assert_eq!(
+                config
+                    .validate(Capabilities {
+                        punct: true,
+                        remote_engine: true,
+                        long_key: true
+                    })
+                    .unwrap_err()
+                    .to_string(),
+                "asr.haas_hotwords_score must be finite and greater than zero"
+            );
+        }
+    }
+
+    #[test]
     fn postprocess_settings_per_engine_matches_shared_punctuation() {
         use crate::postprocess::PostprocessSettings;
         let caps = Capabilities {
@@ -595,7 +733,7 @@ mod tests {
             for engine in [EngineKind::Local, EngineKind::Whisper, EngineKind::Remote] {
                 let whisper = engine == EngineKind::Whisper;
                 assert_eq!(
-                    postprocess_settings(&cfg, caps, engine),
+                    postprocess_settings(&cfg, caps, engine, AsrModel::ReazonSpeech),
                     PostprocessSettings {
                         punct_enabled: engine != EngineKind::Remote && choice != PunctEnabled::Off,
                         strip_trailing_period: strip,
@@ -605,20 +743,28 @@ mod tests {
             }
             cfg.remote.server_punctuates = false;
             assert_eq!(
-                postprocess_settings(&cfg, caps, EngineKind::Remote).punct_enabled,
+                postprocess_settings(&cfg, caps, EngineKind::Remote, AsrModel::ReazonSpeech)
+                    .punct_enabled,
                 choice != PunctEnabled::Off
             );
         }
         let cfg = Config::default();
-        assert!(postprocess_settings(&cfg, caps, EngineKind::Whisper).strip_engine_punct);
+        assert!(
+            postprocess_settings(&cfg, caps, EngineKind::Whisper, AsrModel::ReazonSpeech)
+                .strip_engine_punct
+        );
         let no_punct = Capabilities {
             punct: false,
             ..caps
         };
-        let settings = postprocess_settings(&cfg, no_punct, EngineKind::Whisper);
+        let settings =
+            postprocess_settings(&cfg, no_punct, EngineKind::Whisper, AsrModel::ReazonSpeech);
         assert!(settings.strip_engine_punct);
         assert!(!settings.punct_enabled);
-        assert!(postprocess_settings(&cfg, caps, EngineKind::Local).punct_enabled);
+        assert!(
+            postprocess_settings(&cfg, caps, EngineKind::Local, AsrModel::ReazonSpeech)
+                .punct_enabled
+        );
     }
 
     fn write(temp: &tempfile::TempDir, body: &str) -> PathBuf {
@@ -1133,7 +1279,8 @@ mod tests {
                 remote_engine: true,
                 long_key: false,
             },
-            cfg.engine
+            cfg.engine,
+            AsrModel::ReazonSpeech
         ));
         cfg.remote.server_punctuates = false;
         assert!(punct_effective(
@@ -1143,7 +1290,8 @@ mod tests {
                 remote_engine: true,
                 long_key: false,
             },
-            cfg.engine
+            cfg.engine,
+            AsrModel::ReazonSpeech
         ));
     }
 
@@ -1159,9 +1307,19 @@ mod tests {
             ..Config::default()
         };
         cfg.punct.enabled = PunctEnabled::On;
-        assert!(punct_effective(&cfg, caps, cfg.engine));
+        assert!(punct_effective(
+            &cfg,
+            caps,
+            cfg.engine,
+            AsrModel::ReazonSpeech
+        ));
         cfg.punct.enabled = PunctEnabled::Off;
-        assert!(!punct_effective(&cfg, caps, cfg.engine));
+        assert!(!punct_effective(
+            &cfg,
+            caps,
+            cfg.engine,
+            AsrModel::ReazonSpeech
+        ));
     }
 
     #[test]

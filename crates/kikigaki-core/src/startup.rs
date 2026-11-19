@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
-use crate::config::{punct_effective, Capabilities, Config, EngineKind};
+use crate::config::{punct_effective, AsrModel, Capabilities, Config, EngineKind};
 use crate::engine::panic_reason;
 use crate::models::fetch::Fetcher;
 use crate::models::{ensure_installed, required, Model, Progress};
@@ -34,8 +34,9 @@ impl StartupPlan {
             models_dir: config.models_dir.clone(),
             required: required(
                 config.engine,
+                config.asr.model,
                 caps,
-                punct_effective(config, caps, config.engine),
+                punct_effective(config, caps, config.engine, config.asr.model),
             ),
         }
     }
@@ -43,6 +44,7 @@ impl StartupPlan {
     /// Builds a plan for an engine candidate independently of the configured engine.
     pub fn for_target(
         target: EngineKind,
+        asr_model: AsrModel,
         models_dir: PathBuf,
         caps: Capabilities,
         punct_effective: bool,
@@ -50,7 +52,7 @@ impl StartupPlan {
         Self {
             engine: target,
             models_dir,
-            required: required(target, caps, punct_effective),
+            required: required(target, asr_model, caps, punct_effective),
         }
     }
 }
@@ -197,6 +199,7 @@ mod tests {
         let models_dir = PathBuf::from("candidate-models");
         let plan = StartupPlan::for_target(
             EngineKind::Whisper,
+            AsrModel::ReazonSpeech,
             models_dir.clone(),
             Capabilities {
                 punct: true,

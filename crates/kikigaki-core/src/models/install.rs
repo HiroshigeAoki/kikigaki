@@ -612,7 +612,7 @@ mod tests {
                 size: bytes.len() as u64,
                 sha256: hash(bytes),
             }),
-            required_for: Requirement::Asr,
+            required_for: Requirement::Asr(crate::config::AsrModel::ReazonSpeech),
         }
     }
 
@@ -633,7 +633,7 @@ mod tests {
                 archive_sha256: hash(archive),
                 files: Box::leak(files.into_boxed_slice()),
             },
-            required_for: Requirement::Asr,
+            required_for: Requirement::Asr(crate::config::AsrModel::ReazonSpeech),
         }
     }
 

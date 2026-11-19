@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::config::{Capabilities, EngineKind};
+use crate::config::{AsrModel, Capabilities, EngineKind};
 
 /// Model download abstraction.
 pub mod fetch;
@@ -77,8 +77,8 @@ pub enum Payload {
 /// Feature that requires a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requirement {
-    /// The ASR transducer only (ReazonSpeech).
-    Asr,
+    /// The selected local ASR transducer.
+    Asr(AsrModel),
     /// Voice activity detection — needed by `Local` (mid-utterance VAD) and `Whisper` (the
     /// VAD-only empty-speech gate before the single decode call).
     Vad,
@@ -133,6 +133,34 @@ const REAZONSPEECH_FILES: &[ManifestFile] = &[
     },
 ];
 
+const HAAS_FILES: &[ManifestFile] = &[
+    ManifestFile {
+        name: "encoder.quantized.onnx",
+        size: 42261252,
+        sha256: "aba291d61d3d594bc6fb8c7f90acbd980e7bc7bf6b7caaf3965ddc25e6f42fac",
+    },
+    ManifestFile {
+        name: "encoder.data",
+        size: 410744064,
+        sha256: "30befbf6aeb75383e6551f5e58de53efdb76972ddc7d0f76070c517899873586",
+    },
+    ManifestFile {
+        name: "decoder.onnx",
+        size: 15661602,
+        sha256: "2947cb5512699cbba753fe45fe221428aadaa9856597debbb7aabe19cc253622",
+    },
+    ManifestFile {
+        name: "joiner.onnx",
+        size: 12158641,
+        sha256: "8a68320e750890ff9e944a794b41ae1c42c6f439ac4c273503458a6b42adc12d",
+    },
+    ManifestFile {
+        name: "tokens.txt",
+        size: 28704,
+        sha256: "ec78b13c5d9f156cf0d5fdbd6b5aec5785680f319c92630c11d5d11b14b83a84",
+    },
+];
+
 const PUNCT_FILES: &[ManifestFile] = &[
     ManifestFile {
         name: "punct_bert.int8.onnx",
@@ -148,6 +176,8 @@ const PUNCT_FILES: &[ManifestFile] = &[
 
 /// Stable model-package identifier for the ReazonSpeech transducer.
 pub const ASR_MODEL_ID: &str = "reazonspeech-ja-en-2025-01-17";
+/// Stable model-package identifier for Haas.
+pub const HAAS_MODEL_ID: &str = "haas-ja-v1.0-onnx-quantized";
 /// Stable model-package identifier for Silero VAD.
 pub const VAD_MODEL_ID: &str = "silero-vad";
 /// Stable model-package identifier for the Whisper large-v3-turbo transducer.
@@ -166,7 +196,7 @@ pub const MODELS: &[Model] = &[
             archive_sha256: "dc03758608c0280e2cbcaac4597467ffcf846ae0b06436f1706738a11da86f5d",
             files: REAZONSPEECH_FILES,
         },
-        required_for: Requirement::Asr,
+        required_for: Requirement::Asr(AsrModel::ReazonSpeech),
     },
     Model {
         id: VAD_MODEL_ID,
@@ -203,18 +233,28 @@ pub const MODELS: &[Model] = &[
         payload: Payload::Files(PUNCT_FILES),
         required_for: Requirement::Punct,
     },
+    Model {
+        id: HAAS_MODEL_ID,
+        source: Source::HuggingFace {
+            repo: "oboroge0/Haas-ja-v1.0-onnx-quantized",
+            revision: "7f5ab0a4b1bf39db78afd6691eeecbc4f9d42e39",
+        },
+        payload: Payload::Files(HAAS_FILES),
+        required_for: Requirement::Asr(AsrModel::Haas),
+    },
 ];
 
 /// Selects models required by an engine and effective local capabilities.
 pub fn required(
     kind: EngineKind,
+    asr_model: AsrModel,
     caps: Capabilities,
     punct_effective: bool,
 ) -> Vec<&'static Model> {
     MODELS
         .iter()
         .filter(|model| match model.required_for {
-            Requirement::Asr => kind == EngineKind::Local,
+            Requirement::Asr(model) => kind == EngineKind::Local && model == asr_model,
             Requirement::Vad => kind == EngineKind::Local || kind == EngineKind::Whisper,
             Requirement::Whisper => kind == EngineKind::Whisper,
             Requirement::Punct => caps.punct && punct_effective,
@@ -256,6 +296,99 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn haas_manifest_matches_pinned_files() {
+        let model = MODELS.iter().find(|m| m.id == HAAS_MODEL_ID).unwrap();
+        assert_eq!(model.required_for, Requirement::Asr(AsrModel::Haas));
+        assert_eq!(
+            model.source,
+            Source::HuggingFace {
+                repo: "oboroge0/Haas-ja-v1.0-onnx-quantized",
+                revision: "7f5ab0a4b1bf39db78afd6691eeecbc4f9d42e39",
+            }
+        );
+        assert!(matches!(model.payload, Payload::Files(_)));
+        assert_eq!(
+            model
+                .files()
+                .iter()
+                .map(|f| (f.name, f.size, f.sha256))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "encoder.quantized.onnx",
+                    42261252,
+                    "aba291d61d3d594bc6fb8c7f90acbd980e7bc7bf6b7caaf3965ddc25e6f42fac"
+                ),
+                (
+                    "encoder.data",
+                    410744064,
+                    "30befbf6aeb75383e6551f5e58de53efdb76972ddc7d0f76070c517899873586"
+                ),
+                (
+                    "decoder.onnx",
+                    15661602,
+                    "2947cb5512699cbba753fe45fe221428aadaa9856597debbb7aabe19cc253622"
+                ),
+                (
+                    "joiner.onnx",
+                    12158641,
+                    "8a68320e750890ff9e944a794b41ae1c42c6f439ac4c273503458a6b42adc12d"
+                ),
+                (
+                    "tokens.txt",
+                    28704,
+                    "ec78b13c5d9f156cf0d5fdbd6b5aec5785680f319c92630c11d5d11b14b83a84"
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn required_models_select_only_the_applied_asr() {
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: true,
+        };
+        let mut config = crate::config::Config::default();
+        config.remote.server_punctuates = false;
+        for model in [AsrModel::ReazonSpeech, AsrModel::Haas] {
+            for enabled in [false, true] {
+                config.punct.enabled = if enabled {
+                    crate::config::PunctEnabled::On
+                } else {
+                    crate::config::PunctEnabled::Off
+                };
+                for engine in [EngineKind::Local, EngineKind::Whisper, EngineKind::Remote] {
+                    let punct = crate::config::punct_effective(&config, caps, engine, model);
+                    let mut ids = required(engine, model, caps, punct)
+                        .iter()
+                        .map(|m| m.id)
+                        .collect::<Vec<_>>();
+                    let mut expected = match engine {
+                        EngineKind::Local => vec![
+                            if model == AsrModel::Haas {
+                                HAAS_MODEL_ID
+                            } else {
+                                ASR_MODEL_ID
+                            },
+                            VAD_MODEL_ID,
+                        ],
+                        EngineKind::Whisper => vec![VAD_MODEL_ID, WHISPER_MODEL_ID],
+                        EngineKind::Remote => vec![],
+                    };
+                    if enabled && !(engine == EngineKind::Local && model == AsrModel::Haas) {
+                        expected.push("mojicast-punct");
+                    }
+                    ids.sort_unstable();
+                    expected.sort_unstable();
+                    assert_eq!(ids, expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn manifest_entries_are_well_formed() {
@@ -312,6 +445,7 @@ mod tests {
     fn required_models_follow_engine_and_punctuation() {
         assert!(required(
             EngineKind::Remote,
+            AsrModel::ReazonSpeech,
             Capabilities {
                 punct: false,
                 remote_engine: true,
@@ -322,6 +456,7 @@ mod tests {
         .is_empty());
         let remote_punct = required(
             EngineKind::Remote,
+            AsrModel::ReazonSpeech,
             Capabilities {
                 punct: true,
                 remote_engine: true,
@@ -338,6 +473,7 @@ mod tests {
         );
         let local = required(
             EngineKind::Local,
+            AsrModel::ReazonSpeech,
             Capabilities {
                 punct: false,
                 remote_engine: true,
@@ -358,7 +494,7 @@ mod tests {
             remote_engine: true,
             long_key: false,
         };
-        let mut whisper_ids = required(EngineKind::Whisper, caps, false)
+        let mut whisper_ids = required(EngineKind::Whisper, AsrModel::ReazonSpeech, caps, false)
             .iter()
             .map(|model| model.id)
             .collect::<Vec<_>>();
@@ -368,7 +504,7 @@ mod tests {
         assert_eq!(whisper_ids, expected);
 
         // Whisper shares Local's punctuator; both require mojicast when punctuation is effective.
-        let local = required(EngineKind::Local, caps, false);
+        let local = required(EngineKind::Local, AsrModel::ReazonSpeech, caps, false);
         assert!(!local.iter().any(|model| model.id == WHISPER_MODEL_ID));
         // Local must still get VAD too — the Asr/Vad split must not change Local's model set.
         assert!(local.iter().any(|model| model.id == VAD_MODEL_ID));
@@ -389,8 +525,14 @@ mod tests {
             config.punct.enabled = choice;
             let models = required(
                 EngineKind::Whisper,
+                AsrModel::ReazonSpeech,
                 caps,
-                crate::config::punct_effective(&config, caps, EngineKind::Whisper),
+                crate::config::punct_effective(
+                    &config,
+                    caps,
+                    EngineKind::Whisper,
+                    AsrModel::ReazonSpeech,
+                ),
             );
             assert_eq!(
                 models.iter().any(|model| model.id == "mojicast-punct"),
@@ -401,9 +543,11 @@ mod tests {
             punct: false,
             ..caps
         };
-        assert!(!required(EngineKind::Whisper, caps, true)
-            .iter()
-            .any(|model| model.id == "mojicast-punct"));
+        assert!(
+            !required(EngineKind::Whisper, AsrModel::ReazonSpeech, caps, true)
+                .iter()
+                .any(|model| model.id == "mojicast-punct")
+        );
     }
 
     #[test]

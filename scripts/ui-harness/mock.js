@@ -43,6 +43,8 @@
   const LONG_PATH_ERROR = 'load whisper model /Users/yamada.taro/Library/Application Support/com.kikigaki.app/models/whisper-large-v3-turbo-q8_0/ggml-large-v3-turbo-q8_0.bin: Failed to create a new whisper context';
 
   const baseSettings = {
+    asr_model: 'reazonspeech',
+    asr_model_applied: 'reazonspeech',
     hotkey: 'Ctrl+Space',
     long_key: true,
     long_hotkey: 'Ctrl+Shift+Space',
@@ -85,6 +87,8 @@
 
   const FIXTURES = {
     demo: snap(),
+    'haas-pending': snap({ settings: { asr_model: 'haas' } }),
+    'haas-applied': snap({ settings: { asr_model: 'haas', asr_model_applied: 'haas' } }),
     worst: snap({
       settings: { ...WORST_HOTKEYS, long_state: { kind: 'failed', message: LONG_PATH_ERROR }, transcript_log: true },
       status: {

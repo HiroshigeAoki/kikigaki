@@ -14,7 +14,7 @@ window.addEventListener('unhandledrejection', (event) => {
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-const { statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateView, formatChord, statusKeysLine, HISTORY_PAGE } = window.KikigakiFormat;
+const { asrModelNote, asrModelFooter, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateView, formatChord, statusKeysLine, HISTORY_PAGE } = window.KikigakiFormat;
 
 const EVENT_NAME = 'kikigaki://event';
 const MODIFIER_NAMES = ['Meta', 'Alt', 'Control', 'Shift'];
@@ -91,6 +91,14 @@ function applyStatus(status) {
   document.getElementById('statusSub').textContent = statusKeysLine(currentSnapshot.settings);
   renderChord('standard', status.hotkey);
   if (status.long_hotkey) renderChord('long', status.long_hotkey);
+}
+
+function applyAsrModel(settings) {
+  for (const button of document.querySelectorAll('#asrModelSeg button')) {
+    button.setAttribute('aria-pressed', String(button.dataset.value === settings.asr_model));
+  }
+  document.getElementById('asrModelNote').textContent = asrModelNote(settings.asr_model, settings.asr_model_applied);
+  document.getElementById('asrModelFooter').textContent = asrModelFooter(settings.asr_model_applied);
 }
 
 function applyPunctSeg(settings) {
@@ -277,6 +285,7 @@ function applySnapshot(snapshot) {
   applyStatus(snapshot.status);
   applyHotkeys(snapshot.settings);
   applyLongKey(snapshot.settings);
+  applyAsrModel(snapshot.settings);
   applyPunctSeg(snapshot.settings);
   applyBuiltinReplaceDict(snapshot.settings);
   applyTranscriptLog(snapshot.settings);
@@ -495,6 +504,25 @@ document.getElementById('retryLongEngineButton').addEventListener('click', async
     if (currentSnapshot) applyLongKey(currentSnapshot.settings);
   }
 });
+
+for (const button of document.querySelectorAll('#asrModelSeg button')) {
+  button.addEventListener('click', async () => {
+    if (button.disabled) return;
+    const buttons = [...document.querySelectorAll('#asrModelSeg button')];
+    for (const control of buttons) control.disabled = true;
+    const sinceRevision = appliedRevision;
+    try {
+      const settings = await invoke('apply_settings', { patch: { asrModel: button.dataset.value } });
+      cacheSettings(settings, sinceRevision);
+      applyAsrModel(currentSnapshot ? currentSnapshot.settings : settings);
+    } catch (error) {
+      if (currentSnapshot) applyAsrModel(currentSnapshot.settings);
+      showInlineError(document.getElementById('asrModelSeg'), error);
+    } finally {
+      for (const control of buttons) control.disabled = false;
+    }
+  });
+}
 
 for (const button of document.querySelectorAll('#punctSeg button')) {
   button.addEventListener('click', async () => {

@@ -240,7 +240,7 @@ fn start_controller(
         local_asr_cfg: cfg.asr.clone(),
         local_vad_cfg: cfg.vad.clone(),
         hotwords_enabled: AtomicBool::new(cfg.builtin_replace_dict),
-        hotwords_score: cfg.asr.hotwords_score,
+        hotwords_score: cfg.asr.active_hotwords_score(),
         remote_cfg: cfg.remote.clone(),
     });
     let builtin = match kikigaki_core::replace::builtin_rules() {
@@ -479,15 +479,23 @@ impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
         let punctuator: Box<dyn kikigaki_core::postprocess::Punctuator> = {
             #[cfg(feature = "punct")]
             {
-                Box::new(kikigaki_engine::punct::MojicastPunctuator::new(
+                let models_dir = self.models_dir.clone();
+                let thresholds = kikigaki_core::punct::Thresholds {
+                    comma: self.punct_cfg.comma_threshold,
+                    period: self.punct_cfg.period_threshold,
+                    force_final_period: true,
+                };
+                let num_threads = self.num_threads;
+                kikigaki_core::postprocess::optional_mojicast_punctuator(
                     self.models_dir.clone(),
-                    kikigaki_core::punct::Thresholds {
-                        comma: self.punct_cfg.comma_threshold,
-                        period: self.punct_cfg.period_threshold,
-                        force_final_period: true,
+                    move || {
+                        Ok(Box::new(kikigaki_engine::punct::MojicastPunctuator::new(
+                            models_dir.clone(),
+                            thresholds,
+                            num_threads,
+                        )?))
                     },
-                    self.num_threads,
-                )?)
+                )?
             }
             #[cfg(not(feature = "punct"))]
             {

@@ -11,6 +11,10 @@ This product includes or uses the following upstream software and model artifact
   https://github.com/ggerganov/whisper.cpp
 - ReazonSpeech zipformer model, Apache License 2.0
   https://research.reazon.jp/projects/ReazonSpeech/
+- Haas-ja v1.0 ASR model (Third Intelligence), Apache License 2.0
+  https://huggingface.co/third-intelligence/Haas-ja-v1.0
+- Haas-ja-v1.0-onnx-quantized (ONNX conversion and quantization by oboroge0), Apache License 2.0
+  https://huggingface.co/oboroge0/Haas-ja-v1.0-onnx-quantized
 - Silero VAD, MIT License
   https://github.com/snakers4/silero-vad
 - mojicast-punct-onnx, Apache License 2.0

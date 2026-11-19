@@ -31,3 +31,28 @@ pub fn load_wav_16k(name: &str) -> Vec<f32> {
     kikigaki_engine::audio::load_wav_16k(&path)
         .unwrap_or_else(|error| panic!("failed to load WAV {}: {error:#}", path.display()))
 }
+
+/// Returns the installed Haas directory, with the same visible skip as other model fixtures.
+pub fn haas_models_dir() -> Option<PathBuf> {
+    let Some(root) = std::env::var_os("KIKIGAKI_MODELS_DIR").map(PathBuf::from) else {
+        eprintln!("SKIPPED: models missing (KIKIGAKI_MODELS_DIR unset)");
+        return None;
+    };
+    let model = root.join(kikigaki_core::models::HAAS_MODEL_ID);
+    for name in [
+        "encoder.quantized.onnx",
+        "encoder.data",
+        "decoder.onnx",
+        "joiner.onnx",
+        "tokens.txt",
+    ] {
+        if !model.join(name).is_file() {
+            eprintln!(
+                "SKIPPED: Haas model file missing ({})",
+                model.join(name).display()
+            );
+            return None;
+        }
+    }
+    Some(root)
+}

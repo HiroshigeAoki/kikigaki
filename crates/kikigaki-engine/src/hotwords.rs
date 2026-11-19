@@ -4,8 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use kikigaki_core::config::DecodingMethod;
-use kikigaki_core::models::{Payload, ASR_MODEL_ID, MODELS};
+use kikigaki_core::config::{AsrModel, DecodingMethod};
+use kikigaki_core::models::{Payload, MODELS};
 use sha2::{Digest, Sha256};
 
 /// Embedded canonical hotword readings (generated; see scripts/hotword-eval/make_hotwords.py).
@@ -33,7 +33,8 @@ pub fn resolve_hotword_arg(
     (enabled && decoding_method == DecodingMethod::ModifiedBeamSearch).then_some(score)
 }
 
-/// Materializes `hotwords.txt` and a synthesized `bpe.vocab` under `models_dir/hotwords/`.
+/// Materializes shared `hotwords.txt` and model-specific `<model-id>/bpe.vocab` under
+/// `models_dir/hotwords/`.
 ///
 /// This ports `make_bpe_vocab.py`: for `tokens.txt` line `i` (`<piece> <id>`), it emits
 /// `<piece>\t<-0.1*i>`. Score formatting matches the Python generator exactly, including the
@@ -43,15 +44,16 @@ pub fn resolve_hotword_arg(
 /// separate cjkchar-era per-character `tokens.txt` preflight from the evaluation tooling is
 /// intentionally not carried forward: bbpe's byte fallback can encode any input, so malformed
 /// piece rejection plus the caller's graceful-degradation path cover those failure modes.
-pub fn materialize(models_dir: &Path) -> anyhow::Result<HotwordSetup> {
-    materialize_with_expected_sha(models_dir, manifest_tokens_sha256()?)
+pub fn materialize(models_dir: &Path, model: AsrModel) -> anyhow::Result<HotwordSetup> {
+    materialize_with_expected_sha(models_dir, model, manifest_tokens_sha256(model)?)
 }
 
-fn manifest_tokens_sha256() -> anyhow::Result<&'static str> {
+fn manifest_tokens_sha256(model: AsrModel) -> anyhow::Result<&'static str> {
+    let id = crate::sherpa::model_spec(model).id;
     let model = MODELS
         .iter()
-        .find(|model| model.id == ASR_MODEL_ID)
-        .ok_or_else(|| anyhow!("ASR model {ASR_MODEL_ID} is missing from the model manifest"))?;
+        .find(|model| model.id == id)
+        .ok_or_else(|| anyhow!("ASR model {id} is missing from the model manifest"))?;
     let files = match &model.payload {
         Payload::File(file) => std::slice::from_ref(file),
         Payload::Files(files) | Payload::TarBz2 { files, .. } => files,
@@ -60,14 +62,16 @@ fn manifest_tokens_sha256() -> anyhow::Result<&'static str> {
         .iter()
         .find(|file| file.name == "tokens.txt")
         .map(|file| file.sha256)
-        .ok_or_else(|| anyhow!("tokens.txt is missing from the {ASR_MODEL_ID} manifest"))
+        .ok_or_else(|| anyhow!("tokens.txt is missing from the {id} manifest"))
 }
 
 fn materialize_with_expected_sha(
     models_dir: &Path,
+    model: AsrModel,
     expected_sha256: &str,
 ) -> anyhow::Result<HotwordSetup> {
-    let tokens_path = models_dir.join(ASR_MODEL_ID).join("tokens.txt");
+    let id = crate::sherpa::model_spec(model).id;
+    let tokens_path = models_dir.join(id).join("tokens.txt");
     let tokens = fs::read(&tokens_path)
         .with_context(|| format!("read installed tokens.txt from {}", tokens_path.display()))?;
     let actual_sha256 = hex::encode(Sha256::digest(&tokens));
@@ -93,9 +97,12 @@ fn materialize_with_expected_sha(
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("create hotword directory {}", output_dir.display()))?;
     let hotwords_file = output_dir.join("hotwords.txt");
-    let bpe_vocab = output_dir.join("bpe.vocab");
+    let vocab_dir = output_dir.join(id);
+    fs::create_dir_all(&vocab_dir)
+        .with_context(|| format!("create vocabulary directory {}", vocab_dir.display()))?;
+    let bpe_vocab = vocab_dir.join("bpe.vocab");
     atomic_write(&output_dir, &hotwords_file, BUILTIN_HOTWORDS.as_bytes())?;
-    atomic_write(&output_dir, &bpe_vocab, &vocab)?;
+    atomic_write(&vocab_dir, &bpe_vocab, &vocab)?;
 
     Ok(HotwordSetup {
         hotwords_file,
@@ -187,6 +194,37 @@ mod tests {
     }
 
     #[test]
+    fn model_vocab_paths_are_separate_and_use_each_manifest_digest() {
+        let dir = fixture_models_dir();
+        let haas_id = kikigaki_core::models::HAAS_MODEL_ID;
+        fs::create_dir_all(dir.path().join(haas_id)).unwrap();
+        fs::write(dir.path().join(haas_id).join("tokens.txt"), FIXTURE_TOKENS).unwrap();
+        for (model, id) in [
+            (AsrModel::ReazonSpeech, kikigaki_core::models::ASR_MODEL_ID),
+            (AsrModel::Haas, haas_id),
+        ] {
+            let setup =
+                materialize_with_expected_sha(dir.path(), model, &fixture_sha256()).unwrap();
+            assert_eq!(
+                setup.bpe_vocab,
+                dir.path().join("hotwords").join(id).join("bpe.vocab")
+            );
+            assert_eq!(
+                setup.hotwords_file,
+                dir.path().join("hotwords/hotwords.txt")
+            );
+            assert_eq!(fs::read(setup.bpe_vocab).unwrap(), FIXTURE_VOCAB);
+            let error = materialize(dir.path(), model).unwrap_err();
+            assert!(format!("{error:#}").contains("digest mismatch"));
+            assert!(format!("{error:#}").contains(id));
+        }
+        assert_ne!(
+            manifest_tokens_sha256(AsrModel::Haas).unwrap(),
+            manifest_tokens_sha256(AsrModel::ReazonSpeech).unwrap()
+        );
+    }
+
+    #[test]
     fn resolves_hotword_argument_for_modified_beam_search() {
         assert_eq!(
             resolve_hotword_arg(true, 3.0, DecodingMethod::ModifiedBeamSearch),
@@ -226,7 +264,9 @@ mod tests {
     #[test]
     fn fixture_matches_python_generator_byte_for_byte() {
         let dir = fixture_models_dir();
-        let setup = materialize_with_expected_sha(dir.path(), &fixture_sha256()).unwrap();
+        let setup =
+            materialize_with_expected_sha(dir.path(), AsrModel::ReazonSpeech, &fixture_sha256())
+                .unwrap();
         assert_eq!(fs::read(setup.bpe_vocab).unwrap(), FIXTURE_VOCAB);
         assert_eq!(
             fs::read(setup.hotwords_file).unwrap(),
@@ -266,11 +306,15 @@ mod tests {
     fn materialize_is_atomic_and_overwrites_cleanly() {
         let dir = fixture_models_dir();
         let expected_sha = fixture_sha256();
-        let first = materialize_with_expected_sha(dir.path(), &expected_sha).unwrap();
+        let first =
+            materialize_with_expected_sha(dir.path(), AsrModel::ReazonSpeech, &expected_sha)
+                .unwrap();
         fs::write(&first.bpe_vocab, b"stale").unwrap();
         fs::write(&first.hotwords_file, b"stale").unwrap();
 
-        let second = materialize_with_expected_sha(dir.path(), &expected_sha).unwrap();
+        let second =
+            materialize_with_expected_sha(dir.path(), AsrModel::ReazonSpeech, &expected_sha)
+                .unwrap();
         assert_eq!(fs::read(second.bpe_vocab).unwrap(), FIXTURE_VOCAB);
         assert_eq!(
             fs::read(second.hotwords_file).unwrap(),
@@ -288,9 +332,16 @@ mod tests {
     fn failed_atomic_write_leaves_no_temporary_file() {
         let dir = fixture_models_dir();
         let output_dir = dir.path().join("hotwords");
-        fs::create_dir_all(output_dir.join("bpe.vocab")).unwrap();
+        fs::create_dir_all(
+            output_dir
+                .join(crate::sherpa::model_spec(AsrModel::ReazonSpeech).id)
+                .join("bpe.vocab"),
+        )
+        .unwrap();
 
-        let error = materialize_with_expected_sha(dir.path(), &fixture_sha256()).unwrap_err();
+        let error =
+            materialize_with_expected_sha(dir.path(), AsrModel::ReazonSpeech, &fixture_sha256())
+                .unwrap_err();
         assert!(format!("{error:#}").contains("persist"), "{error:#}");
         let entries = fs::read_dir(output_dir)
             .unwrap()
@@ -302,15 +353,16 @@ mod tests {
     #[test]
     fn missing_tokens_file_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let error = materialize(dir.path()).unwrap_err();
+        let error = materialize(dir.path(), AsrModel::ReazonSpeech).unwrap_err();
         assert!(format!("{error:#}").contains("tokens.txt"), "{error:#}");
     }
 
     #[test]
     fn digest_mismatch_warns_and_errors() {
         let dir = fixture_models_dir();
-        let (_, warning) =
-            crate::test_support::capture_warnings(|| materialize(dir.path()).unwrap_err());
+        let (_, warning) = crate::test_support::capture_warnings(|| {
+            materialize(dir.path(), AsrModel::ReazonSpeech).unwrap_err()
+        });
         assert!(
             warning.contains("digest mismatch"),
             "warning was {warning:?}"

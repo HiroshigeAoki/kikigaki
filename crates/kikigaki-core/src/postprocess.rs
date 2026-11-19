@@ -24,6 +24,64 @@ impl Punctuator for NoopPunctuator {
     }
 }
 
+/// Retries an unavailable punctuator on each request, caching the first successful load.
+pub struct LazyPunctuator {
+    loader: Box<dyn FnMut() -> anyhow::Result<Box<dyn Punctuator>> + Send>,
+    loaded: Option<Box<dyn Punctuator>>,
+    warned: bool,
+}
+
+impl LazyPunctuator {
+    /// Defers loading until punctuation is requested.
+    pub fn new(loader: Box<dyn FnMut() -> anyhow::Result<Box<dyn Punctuator>> + Send>) -> Self {
+        Self {
+            loader,
+            loaded: None,
+            warned: false,
+        }
+    }
+}
+
+impl Punctuator for LazyPunctuator {
+    fn punctuate(&mut self, text: &str) -> anyhow::Result<String> {
+        if self.loaded.is_none() {
+            match (self.loader)() {
+                Ok(punctuator) => self.loaded = Some(punctuator),
+                Err(error) => {
+                    if !self.warned {
+                        tracing::warn!(%error, "punctuator unavailable; keeping unpunctuated text until loading succeeds");
+                        self.warned = true;
+                    }
+                    return Ok(text.to_owned());
+                }
+            }
+        }
+        self.loaded
+            .as_mut()
+            .expect("loaded punctuator")
+            .punctuate(text)
+    }
+}
+
+/// Loads installed mojicast eagerly, or waits for both model files before trying the loader.
+/// Eager load failures are propagated; deferred failures pass text through and retry later.
+pub fn optional_mojicast_punctuator(
+    models_dir: std::path::PathBuf,
+    mut loader: impl FnMut() -> anyhow::Result<Box<dyn Punctuator>> + Send + 'static,
+) -> anyhow::Result<Box<dyn Punctuator>> {
+    let installed = move || {
+        let dir = models_dir.join("mojicast-punct");
+        dir.join("punct_bert.int8.onnx").is_file() && dir.join("vocab.txt").is_file()
+    };
+    if installed() {
+        return loader();
+    }
+    Ok(Box::new(LazyPunctuator::new(Box::new(move || {
+        anyhow::ensure!(installed(), "mojicast model files are not installed");
+        loader()
+    }))))
+}
+
 /// Runtime text processing choices for one engine.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PostprocessSettings {
@@ -344,6 +402,86 @@ mod tests {
     use anyhow::bail;
 
     use super::*;
+
+    #[test]
+    fn lazy_punctuator_retries_then_caches_and_forwards() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let mut punct = LazyPunctuator::new(Box::new(move || {
+            if count.fetch_add(1, Ordering::SeqCst) < 2 {
+                bail!("not installed");
+            }
+            Ok(Box::new(RecordingPunctuator(Arc::clone(&recorded))))
+        }));
+        assert_eq!(punct.punctuate("一").unwrap(), "一");
+        assert_eq!(punct.punctuate("二").unwrap(), "二");
+        assert!(punct.warned);
+        assert_eq!(punct.punctuate("三").unwrap(), "三。");
+        assert_eq!(punct.punctuate("四").unwrap(), "四。");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(*seen.lock().unwrap(), ["三", "四"]);
+    }
+
+    #[test]
+    fn optional_mojicast_checks_both_files_and_loads_after_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("mojicast-punct");
+        std::fs::create_dir(&model).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let mut punct = optional_mojicast_punctuator(dir.path().to_owned(), move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(NoopPunctuator))
+        })
+        .unwrap();
+        assert_eq!(punct.punctuate("missing").unwrap(), "missing");
+        std::fs::write(model.join("punct_bert.int8.onnx"), "").unwrap();
+        punct.punctuate("partial").unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        std::fs::write(model.join("vocab.txt"), "").unwrap();
+        punct.punctuate("installed").unwrap();
+        punct.punctuate("cached").unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            optional_mojicast_punctuator(dir.path().to_owned(), || bail!("bad model")).is_err()
+        );
+    }
+
+    #[test]
+    fn lazy_punctuator_warns_once_across_retries() {
+        struct Warnings(Arc<AtomicUsize>);
+        impl tracing::Subscriber for Warnings {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() == tracing::Level::WARN
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let warnings = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::with_default(Warnings(Arc::clone(&warnings)), || {
+            let mut punct = LazyPunctuator::new(Box::new(|| bail!("missing")));
+            for _ in 0..3 {
+                assert_eq!(punct.punctuate("text").unwrap(), "text");
+            }
+        });
+        assert_eq!(warnings.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lazy_punctuator_forwards_loaded_errors() {
+        let mut punct = LazyPunctuator::new(Box::new(|| Ok(Box::new(FailingPunctuator))));
+        assert!(punct.punctuate("text").is_err());
+    }
 
     struct FailingPunctuator;
 

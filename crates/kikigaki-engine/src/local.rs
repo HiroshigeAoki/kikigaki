@@ -4,21 +4,19 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use anyhow::{ensure, Context};
-use kikigaki_core::config::{AsrConfig, VadConfig};
+use kikigaki_core::config::{AsrConfig, AsrModel, VadConfig};
 use kikigaki_core::engine::{
     self, join_workers, run_worker, AudioSink, Engine, EngineCmd, EngineMsg, EventSender, Waker,
 };
-use kikigaki_core::models::{ASR_MODEL_ID, VAD_MODEL_ID};
+use kikigaki_core::models::VAD_MODEL_ID;
 
 use crate::framer::Framer;
 use crate::hotwords::HotwordSetup;
-use crate::sherpa::{build_recognizer_auto, build_vad};
+use crate::sherpa::{build_recognizer_auto, build_vad, model_spec};
 
 const SAMPLE_RATE: usize = 16_000;
 const PREROLL_MS: usize = 1_000;
 const PREROLL_SAMPLES: usize = SAMPLE_RATE * PREROLL_MS / 1_000;
-/// Decode-time silence floor for protecting speech onsets when real preroll is short.
-const ONSET_PAD_SAMPLES: usize = SAMPLE_RATE * 400 / 1_000;
 const HISTORY_MARGIN_SAMPLES: usize = SAMPLE_RATE;
 
 /// One complete VAD speech segment and its start in the detector's sample stream.
@@ -140,6 +138,11 @@ pub trait Vad {
 
 /// Offline recognition operation required by the local worker.
 pub trait Recognizer {
+    /// Decode-time silence floor for protecting speech onsets.
+    fn onset_pad_samples(&self) -> usize {
+        model_spec(AsrModel::ReazonSpeech).onset_pad_samples
+    }
+
     /// Transcribes one 16 kHz mono speech segment.
     fn transcribe(&mut self, samples: &[f32]) -> Option<String>;
 }
@@ -181,6 +184,7 @@ impl LocalEngine {
                             worker_events,
                             worker_sink,
                             vad,
+                            asr.model,
                             move || {
                                 build_vad(&vad_models_dir, &vad_config)
                                     .map(|detector| Box::new(detector) as Box<dyn Vad>)
@@ -274,6 +278,7 @@ fn run_with_loaders<V, A>(
     events: EventSender,
     sink: AudioSink,
     vad_config: VadConfig,
+    asr_model: AsrModel,
     mut make_vad: V,
     mut make_asr: A,
 ) -> anyhow::Result<()>
@@ -284,7 +289,7 @@ where
     let started = Instant::now();
     let vad = make_vad().map_err(|error| model_load_error(VAD_MODEL_ID, error))?;
     let vad_load_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    let asr = make_asr().map_err(|error| model_load_error(ASR_MODEL_ID, error))?;
+    let asr = make_asr().map_err(|error| model_load_error(model_spec(asr_model).id, error))?;
     let asr_load_ms = started.elapsed().as_secs_f64() * 1_000.0 - vad_load_ms;
     tracing::info!(vad_load_ms, asr_load_ms, "local engine models loaded");
     events
@@ -514,7 +519,7 @@ fn drain_and_transcribe(
             .max(*last_segment_end)
             .max(history.base());
         let preroll_samples = segment.start.saturating_sub(want_start);
-        let onset_pad_samples = ONSET_PAD_SAMPLES.saturating_sub(preroll_samples);
+        let onset_pad_samples = asr.onset_pad_samples().saturating_sub(preroll_samples);
         let mut decode_samples = Vec::with_capacity(
             onset_pad_samples
                 .saturating_add(preroll_samples)
@@ -567,7 +572,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use kikigaki_core::engine::{self, EngineCmd, EngineMsg};
-    use kikigaki_core::models::{ASR_MODEL_ID, VAD_MODEL_ID};
+    use kikigaki_core::models::VAD_MODEL_ID;
 
     use super::{
         drain_and_transcribe, report_model_load_failure, run_local_worker, run_with_loaders,
@@ -856,6 +861,36 @@ mod tests {
         assert_eq!(captured[0].len(), 16_000 + segment_samples.len());
         assert_eq!(&captured[0][..16_000], &history[8_000..24_000]);
         assert_eq!(&captured[0][16_000..], segment_samples);
+    }
+
+    #[test]
+    fn haas_short_preroll_has_no_synthetic_onset_padding() {
+        struct HaasRecognizer(CapturingRecognizer);
+        impl Recognizer for HaasRecognizer {
+            fn onset_pad_samples(&self) -> usize {
+                crate::sherpa::model_spec(kikigaki_core::config::AsrModel::Haas).onset_pad_samples
+            }
+            fn transcribe(&mut self, samples: &[f32]) -> Option<String> {
+                self.0.transcribe(samples)
+            }
+        }
+        let mut history = AudioHistory::new(20.0);
+        history.push(&vec![1.0; 1_600]);
+        let segment = vec![-1.0; 8_000];
+        let mut vad = OffsetVad {
+            pending: vec![VadSegment {
+                start: 1_600,
+                samples: segment.clone(),
+            }],
+            wait_for_reset: false,
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut recognizer = HaasRecognizer(CapturingRecognizer(Arc::clone(&captured)));
+        drain_and_transcribe(&mut vad, &mut recognizer, &history, &mut 0, None).unwrap();
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured[0].len(), 9_600);
+        assert_eq!(&captured[0][..1_600], &vec![1.0; 1_600]);
+        assert_eq!(&captured[0][1_600..], segment);
     }
 
     #[test]
@@ -1237,6 +1272,7 @@ mod tests {
     #[test]
     fn every_model_load_site_reports_a_structured_model_id() {
         fn failure_reason(
+            asr_model: kikigaki_core::config::AsrModel,
             commands: Vec<EngineCmd>,
             make_vad: impl FnMut() -> anyhow::Result<Box<dyn Vad>> + Send + 'static,
             make_asr: impl FnMut() -> anyhow::Result<Box<dyn Recognizer>> + Send + 'static,
@@ -1257,6 +1293,7 @@ mod tests {
                         worker_events,
                         sink,
                         kikigaki_core::config::VadConfig::default(),
+                        asr_model,
                         make_vad,
                         make_asr,
                     );
@@ -1277,6 +1314,7 @@ mod tests {
         }
 
         let initial_vad = failure_reason(
+            kikigaki_core::config::AsrModel::ReazonSpeech,
             Vec::new(),
             || anyhow::bail!("bad initial VAD"),
             || Ok(Box::new(FakeRecognizer)),
@@ -1285,16 +1323,33 @@ mod tests {
         assert_eq!(initial_vad.1, Some(VAD_MODEL_ID));
 
         let recognizer = failure_reason(
+            kikigaki_core::config::AsrModel::ReazonSpeech,
             Vec::new(),
             || Ok(Box::new(FakeVad::new(1, Arc::new(AtomicBool::new(false))))),
             || anyhow::bail!("bad recognizer"),
         );
         assert!(recognizer.0.contains("bad recognizer"), "{recognizer:?}");
-        assert_eq!(recognizer.1, Some(ASR_MODEL_ID));
+        assert_eq!(
+            recognizer.1,
+            Some(crate::sherpa::model_spec(kikigaki_core::config::AsrModel::ReazonSpeech).id)
+        );
+
+        let haas = failure_reason(
+            kikigaki_core::config::AsrModel::Haas,
+            Vec::new(),
+            || Ok(Box::new(FakeVad::new(1, Arc::new(AtomicBool::new(false))))),
+            || anyhow::bail!("bad Haas recognizer"),
+        );
+        assert!(haas.0.contains("bad Haas recognizer"));
+        assert_eq!(
+            haas.1,
+            Some(crate::sherpa::model_spec(kikigaki_core::config::AsrModel::Haas).id)
+        );
 
         let vad_loads = Arc::new(AtomicUsize::new(0));
         let rebuild_loads = Arc::clone(&vad_loads);
         let rebuild = failure_reason(
+            kikigaki_core::config::AsrModel::ReazonSpeech,
             vec![
                 EngineCmd::Begin { gen: 7 },
                 EngineCmd::End { gen: 7, pad_ms: 0 },

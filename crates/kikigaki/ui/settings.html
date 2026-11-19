@@ -21,6 +21,13 @@
             <button class="hk" id="hkButton" type="button" aria-label="標準キーを変更"><span class="kbd" id="hkKbd"></span><span class="cap" id="hkCap">変更</span></button>
           </div>
           <p class="capture-note" id="hkNote" hidden></p>
+          <div class="row" id="asrModelRow">
+            <div class="l"><b>認識モデル</b><small id="asrModelNote">標準キーの認識に使うモデル</small></div>
+            <div class="seg" id="asrModelSeg" role="group" aria-label="認識モデル">
+              <button type="button" data-value="reazonspeech" aria-pressed="false">標準</button>
+              <button type="button" data-value="haas" aria-pressed="false">Haas</button>
+            </div>
+          </div>
           <div class="row" id="longKeyRow" hidden>
             <div class="l"><b>長文キー（高精度）</b><small>英語の固有名詞に強い。貼り付けまで1〜3秒。初回に約0.9GBをダウンロード</small>
               <div id="longStateRow" hidden><span class="pill" id="longState" role="status"></span><div class="bar" id="longStateBar" hidden><i></i></div></div>
@@ -71,7 +78,7 @@
             <button class="btn small" id="openConfigButton" type="button">設定ファイルを開く</button>
           </div>
         </section>
-        <div class="foot"><div class="l">メニューバーのアイコンでこの画面を開閉<br>ReazonSpeech ja-en · Silero VAD · mojicast</div><button class="btn" id="quitButton" type="button">kikigaki を終了</button></div>
+        <div class="foot"><div class="l">メニューバーのアイコンでこの画面を開閉<br><span id="asrModelFooter">ReazonSpeech ja-en · Silero VAD · mojicast</span></div><button class="btn" id="quitButton" type="button">kikigaki を終了</button></div>
       </div>
 
       <div class="scene" id="scene-onboarding" hidden>

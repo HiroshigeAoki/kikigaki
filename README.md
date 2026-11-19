@@ -44,15 +44,26 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 設定ファイルは任意。省略した項目はすべて既定値のまま動く。全項目の一覧と既定値は [`docs/configuration.md`](docs/configuration.md) に記載している。
 
+### 認識モデル
+
+設定画面の「認識モデル」で、標準キーが使うモデルを「標準」(ReazonSpeech、既定)と「Haas」(Haas-ja v1.0)から選べる。
+
+- Haasは一般的な日本語の読み上げ音声で誤りが約半分になる。FLEURS日本語テストセットの文字誤り率はHaasが4.8%、ReazonSpeechが9.0%で、固有名詞や専門用語にも強い
+- 標準はキーを離してから貼り付けまで約0.2秒。Haasはそれより遅く、Apple Silicon搭載Macで短い発話なら約0.4秒が目安となる
+- Haasは初回に約480 MBをダウンロードし、実行中は約0.9 GBのメモリを使う
+- 切り替えはkikigakiの次の起動から反映される。標準に戻す場合も同じ
+- Haasは自身で句読点を出力し、標準キーに句読点モデルを適用しないため、末尾の文に必ずしも「。」が付くわけではない
+- 長文キーには影響しない
+
 ### 長文キー
 
 設定画面の「長文キー（高精度）を使う」を有効にすると、2つ目のホットキーでWhisper large-v3-turboによる認識を使える。既定のキーは `⌥⇧Space`。⌥とShiftを先に押してからSpaceを押す。
 
-- 標準キー(`Alt+Space`)は短い返信向けで、キーを離してから貼り付けまで約0.2秒
+- 標準キー(`Alt+Space`)は短い返信向けで、標準モデルではキーを離してから貼り付けまで約0.2秒
 - 長文キーは長い文章や英語の固有名詞に強い。貼り付けまでは短い発話で約1秒、10秒の発話で約3秒かかる
 - 初回の有効化時にモデル(約0.9 GB)をダウンロードする。有効な間は2つのエンジンが常駐し、メモリを約1 GB多く使う
 - 起動直後やダウンロード中など長文エンジンの準備ができていない間に長文キーを押すと、標準のエンジンで認識し、その旨を表示する
-- 両方のキーで同じ句読点モデルと設定を使う。長文キーでは、Whisperの句読点と日本語の語句間の空白を先に取り除く
+- 標準モデルでは両方のキーで同じ句読点モデルと設定を使う。長文キーでは、Whisperの句読点と日本語の語句間の空白を先に取り除く
 - カタカナ語→英語辞書の認識バイアスは標準キーにのみ適用される
 - Apple Silicon搭載Macのみ対応
 
@@ -94,6 +105,8 @@ to = "Kubernetes"
 | --- | --- | --- |
 | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Apache-2.0 | 音声認識・VADの実行エンジン |
 | [ReazonSpeech](https://research.reazon.jp/projects/ReazonSpeech/) | Apache-2.0(モデル) | 日本語の音声認識モデル |
+| [Haas-ja v1.0](https://huggingface.co/third-intelligence/Haas-ja-v1.0) | Apache-2.0(モデル) | 高精度な日本語の音声認識モデル(Third Intelligence) |
+| [Haas-ja-v1.0-onnx-quantized](https://huggingface.co/oboroge0/Haas-ja-v1.0-onnx-quantized) | Apache-2.0 | HaasのONNX変換・量子化(oboroge0) |
 | [Silero VAD](https://github.com/snakers4/silero-vad) | MIT | 発話区間検出モデル |
 | [mojicast-punct-onnx](https://huggingface.co/ishiki-emo/mojicast-punct-onnx) | Apache-2.0(モデル) | 句読点付与モデル |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | 句読点モデルの実行 |

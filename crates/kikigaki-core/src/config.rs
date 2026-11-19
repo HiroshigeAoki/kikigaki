@@ -544,7 +544,7 @@ pub fn postprocess_settings(
     applied_asr_model: AsrModel,
 ) -> crate::postprocess::PostprocessSettings {
     crate::postprocess::PostprocessSettings {
-        punct_enabled: punct_effective(config, caps, engine, applied_asr_model),
+        local_punct: punct_effective(config, caps, engine, applied_asr_model),
         strip_trailing_period: config.strip_trailing_period,
         strip_engine_punct: engine == EngineKind::Local
             && applied_asr_model == AsrModel::Haas
@@ -700,7 +700,7 @@ mod tests {
                 AsrModel::Haas
             ));
             let actual = postprocess_settings(&config, caps, EngineKind::Local, AsrModel::Haas);
-            assert!(!actual.punct_enabled);
+            assert!(!actual.local_punct);
             assert_eq!(actual.strip_engine_punct, strip_engine);
             assert_eq!(actual.strip_trailing_period, strip);
             config.asr.model = AsrModel::Haas;
@@ -771,7 +771,7 @@ mod tests {
                 assert_eq!(
                     postprocess_settings(&cfg, caps, engine, AsrModel::ReazonSpeech),
                     PostprocessSettings {
-                        punct_enabled: engine != EngineKind::Remote && choice != PunctEnabled::Off,
+                        local_punct: engine != EngineKind::Remote && choice != PunctEnabled::Off,
                         strip_trailing_period: strip,
                         strip_engine_punct: false,
                     }
@@ -780,7 +780,7 @@ mod tests {
             cfg.remote.server_punctuates = false;
             assert_eq!(
                 postprocess_settings(&cfg, caps, EngineKind::Remote, AsrModel::ReazonSpeech)
-                    .punct_enabled,
+                    .local_punct,
                 choice != PunctEnabled::Off
             );
         }

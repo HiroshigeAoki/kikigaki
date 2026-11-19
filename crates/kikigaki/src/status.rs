@@ -9,7 +9,8 @@ pub struct UiStatus {
     pub message: Option<String>,
     pub detail: Option<String>,
     pub hotkey: String,
-    pub punct_enabled: bool,
+    /// Mirrors `SettingsSnapshot::local_punct`.
+    pub local_punct: bool,
     pub strip_trailing_period: bool,
 }
 
@@ -202,7 +203,7 @@ mod tests {
             message: Some("起動できませんでした".into()),
             detail: Some("raw error".into()),
             hotkey: "Alt+Space".into(),
-            punct_enabled: false,
+            local_punct: false,
             strip_trailing_period: false,
         };
         let json = serde_json::to_value(&status).unwrap();

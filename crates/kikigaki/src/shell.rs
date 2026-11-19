@@ -360,7 +360,7 @@ fn default_snapshot(
                 .map(|_| "設定ファイルを読み込めませんでした".to_owned()),
             detail: bootstrap_error.as_ref().map(|error| error.message.clone()),
             hotkey: settings_snapshot.hotkey.clone(),
-            punct_enabled: settings_snapshot.punct_enabled,
+            local_punct: settings_snapshot.local_punct,
             strip_trailing_period: settings_snapshot.strip_trailing_period,
         },
         settings: settings_snapshot,
@@ -436,9 +436,12 @@ impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
         &self,
         learned: Arc<kikigaki_core::replace::Rules>,
         builtin_enabled: bool,
+        load_punctuator: bool,
         waker: Option<kikigaki_core::engine::Waker>,
     ) -> anyhow::Result<kikigaki_core::postprocess::PostprocessWorker> {
-        let punctuator: Box<dyn kikigaki_core::postprocess::Punctuator> = {
+        let punctuator: Box<dyn kikigaki_core::postprocess::Punctuator> = if !load_punctuator {
+            Box::new(kikigaki_core::postprocess::NoopPunctuator)
+        } else {
             #[cfg(feature = "punct")]
             {
                 let models_dir = self.models_dir.clone();

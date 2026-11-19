@@ -47,7 +47,7 @@
     asr_model_applied: 'haas',
     hotkey: 'Ctrl+Space',
     punct_choice: 'on_strip',
-    punct_enabled: false,
+    local_punct: false,
     strip_trailing_period: true,
     builtin_replace_dict: true,
     transcript_log: false,
@@ -56,7 +56,7 @@
   };
   const baseStatus = {
     state: 'idle', level: 'ok', phase: 'ready', message: null,
-    hotkey: 'Ctrl+Space', punct_enabled: false, strip_trailing_period: true,
+    hotkey: 'Ctrl+Space', local_punct: false, strip_trailing_period: true,
   };
 
   function snap(over = {}) {
@@ -83,7 +83,7 @@
 
   const FIXTURES = {
     demo: snap(),
-    'haas-pending': snap({ settings: { asr_model: 'haas', asr_model_applied: 'reazonspeech', punct_enabled: true } }),
+    'haas-pending': snap({ settings: { asr_model: 'haas', asr_model_applied: 'reazonspeech', local_punct: true } }),
     'haas-applied': snap({ settings: { asr_model: 'haas', asr_model_applied: 'haas' } }),
     worst: snap({
       settings: { ...WORST_HOTKEYS, transcript_log: true },

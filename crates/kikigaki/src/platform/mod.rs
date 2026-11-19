@@ -6,6 +6,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
     NoDevice,
+    AccessDenied,
     ConfigQueryFailed,
     StreamOpenOrPlayFailed,
     /// The stream started and may have delivered at least one callback before its timeout.
@@ -19,6 +20,7 @@ pub fn classify_probe_outcome(outcome: ProbeOutcome) -> crate::permissions::MicP
     use crate::permissions::MicPermission;
 
     match outcome {
+        ProbeOutcome::AccessDenied => MicPermission::Denied,
         ProbeOutcome::NoDevice => MicPermission::Unavailable,
         ProbeOutcome::ConfigQueryFailed | ProbeOutcome::StreamOpenOrPlayFailed => {
             MicPermission::Busy
@@ -28,7 +30,7 @@ pub fn classify_probe_outcome(outcome: ProbeOutcome) -> crate::permissions::MicP
         } => MicPermission::Authorized,
         ProbeOutcome::Completed {
             delivered_callback: false,
-        } => MicPermission::Denied,
+        } => MicPermission::Unknown,
     }
 }
 
@@ -157,6 +159,10 @@ mod probe_tests {
     #[test]
     fn classify_probe_outcome_covers_every_mic_permission_this_can_produce() {
         assert_eq!(
+            classify_probe_outcome(ProbeOutcome::AccessDenied),
+            MicPermission::Denied
+        );
+        assert_eq!(
             classify_probe_outcome(ProbeOutcome::NoDevice),
             MicPermission::Unavailable
         );
@@ -178,7 +184,7 @@ mod probe_tests {
             classify_probe_outcome(ProbeOutcome::Completed {
                 delivered_callback: false
             }),
-            MicPermission::Denied
+            MicPermission::Unknown
         );
     }
 

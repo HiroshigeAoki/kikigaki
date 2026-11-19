@@ -620,3 +620,20 @@ async function bootstrap() {
 }
 
 bootstrap().catch((error) => showConfigError(error));
+
+// Recheck after returning from Windows Settings. Focus and visibility may fire together.
+let micRecheckPending = false;
+async function recheckWindowsMicrophone() {
+  if (currentPlatform() !== 'windows' || document.visibilityState === 'hidden'
+      || !currentOnboarding || currentOnboarding.microphone === 'authorized' || micRecheckPending) return;
+  micRecheckPending = true;
+  try {
+    await invoke('request_microphone_access');
+  } catch (error) {
+    showInlineError(document.getElementById('stepMic'), error);
+  } finally {
+    micRecheckPending = false;
+  }
+}
+window.addEventListener('focus', recheckWindowsMicrophone);
+document.addEventListener('visibilitychange', recheckWindowsMicrophone);

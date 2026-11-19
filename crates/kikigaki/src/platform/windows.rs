@@ -1,7 +1,7 @@
 //! Windows platform implementations.
 
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::permissions::MicPermission;
 use crate::platform::{ProbeBackend, ProbeOutcome};
@@ -9,7 +9,7 @@ use crate::platform::{ProbeBackend, ProbeOutcome};
 /// Windows-specific probe timeout: unlike macOS's 120-second consent callback wait, Windows
 /// displays its own privacy prompt when an input stream opens, so the probe only waits long enough
 /// to learn whether the started stream delivers data.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `NotDetermined` doubles as "never probed yet", the cache's initial value.
 static CACHED_PERMISSION: AtomicU8 = AtomicU8::new(MicPermission::NotDetermined as u8);
@@ -23,26 +23,55 @@ pub fn microphone_permission() -> MicPermission {
 fn probe_and_cache() -> MicPermission {
     let result = crate::platform::probe_with::<CpalProbeBackend>(PROBE_TIMEOUT);
     // The byte is the complete cached state and guards no other memory, so Relaxed is sufficient.
+    let result = if HEALTHY_STREAM.load(Ordering::Relaxed) {
+        MicPermission::Authorized
+    } else {
+        result
+    };
     CACHED_PERMISSION.store(result as u8, Ordering::Relaxed);
     result
 }
 
-/// Performs the one-time startup probe synchronously before `onboarding::scan`. It is bounded by
-/// `PROBE_TIMEOUT` and runs during Tauri setup before the controller thread exists; never call it
-/// from the controller loop or the two-second onboarding poll. A first-launch `Busy`/`Unavailable`
-/// result is therefore re-probed only by the explicit onboarding request, never by
-/// `retry_bootstrap`.
-pub fn init_microphone_permission_probe() {
-    if CACHED_PERMISSION.load(Ordering::Relaxed) == MicPermission::NotDetermined as u8 {
-        probe_and_cache();
+/// A healthy capture stream makes a second hardware probe unnecessary.
+static HEALTHY_STREAM: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn capture_delivered_audio() {
+    HEALTHY_STREAM.store(true, Ordering::Relaxed);
+    if microphone_permission() != MicPermission::Authorized {
+        CACHED_PERMISSION.store(MicPermission::Authorized as u8, Ordering::Relaxed);
     }
 }
 
-/// Explicitly probes Windows microphone access and updates the cache. The caller's timeout is
-/// ignored because the macOS 120-second consent callback wait is not meaningful on Windows; the
-/// probe is instead bounded by `PROBE_TIMEOUT`.
+pub(crate) fn capture_discarded() {
+    HEALTHY_STREAM.store(false, Ordering::Relaxed);
+}
+
+/// Startup continues after one second even if device activation is hung.
+pub fn init_microphone_permission_probe() {
+    if microphone_permission() == MicPermission::NotDetermined {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_and_cache());
+        });
+        let _ = rx.recv_timeout(Duration::from_secs(1));
+    }
+}
+
+/// Called only on a worker, never from the controller or onboarding poll.
 pub fn request_microphone_access(_timeout: Duration) -> Result<bool, String> {
+    if HEALTHY_STREAM.load(Ordering::Relaxed) {
+        CACHED_PERMISSION.store(MicPermission::Authorized as u8, Ordering::Relaxed);
+        return Ok(true);
+    }
     Ok(probe_and_cache().is_granted())
+}
+
+fn probe_error(error: cpal::Error) -> ProbeOutcome {
+    if error.kind() == cpal::ErrorKind::PermissionDenied {
+        ProbeOutcome::AccessDenied
+    } else {
+        ProbeOutcome::StreamOpenOrPlayFailed
+    }
 }
 
 struct CpalProbeBackend;
@@ -57,11 +86,17 @@ impl ProbeBackend for CpalProbeBackend {
         let Some(device) = host.default_input_device() else {
             return ProbeOutcome::NoDevice;
         };
-        let Ok(config) = device.default_input_config() else {
-            return ProbeOutcome::ConfigQueryFailed;
+        let config = match device.default_input_config() {
+            Ok(config) => config,
+            Err(error) if error.kind() == cpal::ErrorKind::PermissionDenied => {
+                return ProbeOutcome::AccessDenied
+            }
+            Err(_) => return ProbeOutcome::ConfigQueryFailed,
         };
         let got_callback = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&got_callback);
+        let access_denied = Arc::new(AtomicBool::new(false));
+        let denied_flag = Arc::clone(&access_denied);
         // Permission probing only needs callback delivery, independent of sample format.
         let stream = device.build_input_stream_raw(
             config.config(),
@@ -69,16 +104,31 @@ impl ProbeBackend for CpalProbeBackend {
             move |_, _| {
                 flag.store(true, Ordering::SeqCst);
             },
-            |error| tracing::warn!(%error, "microphone probe stream error"),
-            None,
+            move |error| {
+                if error.kind() == cpal::ErrorKind::PermissionDenied {
+                    denied_flag.store(true, Ordering::Relaxed);
+                }
+                tracing::warn!(%error, "microphone probe stream error");
+            },
+            Some(crate::mic::STREAM_BUILD_TIMEOUT),
         );
-        let Ok(stream) = stream else {
-            return ProbeOutcome::StreamOpenOrPlayFailed;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => return probe_error(error),
         };
-        if stream.play().is_err() {
-            return ProbeOutcome::StreamOpenOrPlayFailed;
+        if let Err(error) = stream.play() {
+            return probe_error(error);
         }
-        std::thread::sleep(timeout);
+        let deadline = Instant::now() + timeout;
+        while !got_callback.load(Ordering::SeqCst)
+            && !access_denied.load(Ordering::Relaxed)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if access_denied.load(Ordering::Relaxed) {
+            return ProbeOutcome::AccessDenied;
+        }
         ProbeOutcome::Completed {
             delivered_callback: got_callback.load(Ordering::SeqCst),
         }

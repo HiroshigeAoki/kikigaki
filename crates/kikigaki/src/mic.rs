@@ -11,15 +11,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const WARM_STREAM: bool = cfg!(target_os = "windows");
-const STREAM_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const STREAM_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Mic {
+    #[cfg(target_os = "windows")]
+    controller: Option<crate::controller::ControllerClient>,
+    #[cfg(target_os = "windows")]
+    preparing: bool,
     stream: Option<cpal::Stream>,
     shared: Option<Arc<Shared>>,
     device_name: Option<String>,
 }
 
-struct BuiltStream {
+pub struct BuiltStream {
     stream: cpal::Stream,
     shared: Arc<Shared>,
     host_ms: u128,
@@ -170,25 +174,57 @@ fn default_input_device_name(host: &cpal::Host) -> Option<String> {
 impl Mic {
     pub fn new() -> Self {
         Self {
+            #[cfg(target_os = "windows")]
+            controller: None,
+            #[cfg(target_os = "windows")]
+            preparing: false,
             stream: None,
             shared: None,
             device_name: None,
         }
     }
 
-    /// Prepares a paused stream for the current Windows default microphone.
+    /// Schedules background preparation of a paused Windows microphone stream at Ready time.
+    /// Does nothing while capture is active, a usable stream exists, or a build is in flight.
     ///
     /// The resolved `Specific` endpoint does not follow later default-device changes; `start`
     /// rechecks the friendly name on every press, and stream errors also force a rebuild.
+    /// Discarding a stream leaves any in-flight build tracked until `install_prepared` runs.
     pub fn prepare(&mut self) -> anyhow::Result<()> {
         if !WARM_STREAM {
             return Ok(());
         }
-        if self.is_warm() {
+        if self
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.active.load(Ordering::SeqCst))
+            || self.is_warm()
+        {
             return Ok(());
         }
         self.discard_stream();
-        let built = Self::build_stream()?;
+        #[cfg(target_os = "windows")]
+        {
+            if !self.preparing {
+                let client = self
+                    .controller
+                    .clone()
+                    .context("microphone controller not installed")?;
+                self.preparing = true;
+                std::thread::spawn(move || {
+                    let result = Self::build_stream();
+                    let _ = client
+                        .sender_for_handle()
+                        .send(crate::controller::ControllerCmd::MicPrepared(result));
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        self.install_built(Self::build_stream()?)
+    }
+
+    fn install_built(&mut self, built: BuiltStream) -> anyhow::Result<()> {
         tracing::info!(
             host_ms = built.host_ms,
             device_ms = built.device_ms,
@@ -206,7 +242,47 @@ impl Mic {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_controller(&mut self, client: crate::controller::ControllerClient) {
+        self.controller = Some(client);
+    }
+
+    #[cfg(target_os = "windows")]
+    /// Finishes background preparation and always clears the in-flight flag.
+    /// Drops late results when a usable stream exists or capture is active, including when
+    /// `start` has already built a stream synchronously for a press.
+    pub(crate) fn install_prepared(&mut self, result: anyhow::Result<BuiltStream>) {
+        self.preparing = false;
+        if self.is_warm()
+            || self
+                .shared
+                .as_ref()
+                .is_some_and(|shared| shared.active.load(Ordering::SeqCst))
+        {
+            tracing::debug!(
+                "discarding background microphone result; stream already installed or active"
+            );
+            return;
+        }
+        match result {
+            Ok(built) => {
+                let _ = self.install_built(built);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "microphone prepare failed; will retry on next press")
+            }
+        }
+    }
+
+    pub(crate) fn captured_audio(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|shared| shared.first_callback.load(Ordering::Relaxed))
+    }
+
     /// Starts capture for one press.
+    /// On Windows, reuses a usable warm stream or builds synchronously for this press,
+    /// even if Ready-time background preparation is still in flight. Its late result is dropped.
     ///
     /// On cpal 0.18.2's WASAPI backend, `play()` and `pause()` only send commands to the stream
     /// thread; `IAudioClient::Start()` and `Stop()` run asynchronously and failures arrive through
@@ -224,17 +300,20 @@ impl Mic {
             warm = self.is_warm();
             if warm {
                 let host = cpal::default_host();
-                if let Some(current) = default_input_device_name(&host) {
-                    if self.device_name.as_ref() != Some(&current) {
-                        let stored = self.device_name.as_deref().unwrap_or("<unknown>");
-                        tracing::info!(old = %stored, new = %current, "default microphone changed; rebuilding stream");
-                        self.discard_stream();
-                        warm = false;
-                    }
+                let current = default_input_device_name(&host);
+                if current.is_none() || self.device_name != current {
+                    let stored = self.device_name.as_deref().unwrap_or("<unknown>");
+                    tracing::info!(old = %stored, new = ?current, "default microphone changed; rebuilding stream");
+                    self.discard_stream();
+                    warm = false;
                 }
             }
             if !warm {
-                self.prepare()?;
+                self.discard_stream();
+                let built = Self::build_stream()?;
+                build_ms = Some(built.build_ms);
+                open_started_at = built.entry_at;
+                self.install_built(built)?;
             }
         } else {
             let built = Self::build_stream()?;
@@ -322,6 +401,10 @@ impl Mic {
             &device,
             &supported,
             move |data| {
+                #[cfg(target_os = "windows")]
+                if !data.is_empty() && !capture_shared.needs_rebuild() {
+                    crate::platform::capture_delivered_audio();
+                }
                 let Gate::Process { reset, generation } = capture_shared.gate_buffer() else {
                     return;
                 };
@@ -358,9 +441,10 @@ impl Mic {
                     return;
                 }
                 // WASAPI keeps un-read packets across Stop/Start, so up to one period of stale
-                // audio can be delivered after the next Start. This generation check plus the
-                // engine-side `current.is_some()` guard bound the effect. Holding the sink lock
-                // through the send also ensures no packet is sent after Stop returns.
+                // audio can be delivered after the next Start. Generation checks reject callbacks
+                // gated in an earlier press, but cannot identify stale device packets first
+                // delivered during a new press. Holding the sink lock through send ensures no
+                // packet is sent after Stop returns.
                 let Some(sink) = capture_shared.lock_sink_for_generation(generation) else {
                     return;
                 };
@@ -373,6 +457,10 @@ impl Mic {
                 }
             },
             move |error| {
+                #[cfg(target_os = "windows")]
+                if error.kind() != cpal::ErrorKind::Xrun {
+                    crate::platform::capture_discarded();
+                }
                 error_shared.record_stream_error(error.kind() == cpal::ErrorKind::Xrun, &error)
             },
         )
@@ -455,6 +543,8 @@ impl Mic {
     }
 
     fn discard_stream(&mut self) {
+        #[cfg(target_os = "windows")]
+        crate::platform::capture_discarded();
         if let Some(shared) = self.shared.as_ref() {
             shared.active.store(false, Ordering::SeqCst);
             shared.clear_sink();

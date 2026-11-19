@@ -494,6 +494,18 @@ impl crate::controller::PostprocessFactory for TauriPostprocessFactory {
 }
 
 impl crate::controller::MicPort for crate::mic::Mic {
+    #[cfg(target_os = "windows")]
+    fn set_controller(&mut self, client: crate::controller::ControllerClient) {
+        self.set_controller(client);
+    }
+    #[cfg(target_os = "windows")]
+    fn install_prepared(&mut self, result: anyhow::Result<crate::mic::BuiltStream>) {
+        self.install_prepared(result);
+    }
+    fn captured_audio(&self) -> bool {
+        self.captured_audio()
+    }
+
     fn prepare(&mut self) -> anyhow::Result<()> {
         crate::mic::Mic::prepare(self)
     }
@@ -913,7 +925,11 @@ fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<(), crate::statu
 }
 
 #[tauri::command]
-fn retry_bootstrap(app: AppHandle) -> Result<(), crate::status::UiError> {
+async fn retry_bootstrap(app: AppHandle) -> Result<(), crate::status::UiError> {
+    #[cfg(target_os = "windows")]
+    if !crate::permissions::microphone_permission().is_granted() {
+        request_microphone_access().await?;
+    }
     let state = app.state::<Arc<ShellState>>();
     let mut controller = state.controller.lock().unwrap();
     if controller.is_some() {

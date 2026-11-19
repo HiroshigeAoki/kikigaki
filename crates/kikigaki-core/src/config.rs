@@ -87,12 +87,25 @@ pub enum PasteMethod {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AsrModel {
     /// ReazonSpeech Japanese-English transducer.
-    #[default]
     #[serde(rename = "reazonspeech")]
     ReazonSpeech,
     /// Haas Japanese transducer with built-in punctuation.
+    #[default]
     #[serde(rename = "haas")]
     Haas,
+}
+
+/// Resolves a keyless configuration without replacing an explicit model choice.
+pub fn resolve_asr_model(
+    explicit: Option<AsrModel>,
+    reazon_installed: bool,
+    haas_installed: bool,
+) -> AsrModel {
+    explicit.unwrap_or(if reazon_installed && !haas_installed {
+        AsrModel::ReazonSpeech
+    } else {
+        AsrModel::Haas
+    })
 }
 
 /// Offline speech recognition settings.
@@ -124,7 +137,7 @@ impl AsrConfig {
 impl Default for AsrConfig {
     fn default() -> Self {
         Self {
-            model: AsrModel::ReazonSpeech,
+            model: AsrModel::Haas,
             haas_hotwords_score: 1.5,
             num_threads: 4,
             decoding_method: DecodingMethod::ModifiedBeamSearch,
@@ -614,8 +627,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyless_model_resolution_matrix() {
+        assert_eq!(AsrModel::default(), AsrModel::Haas);
+        assert_eq!(Config::default().asr.model, AsrModel::Haas);
+        for reazon in [false, true] {
+            for haas in [false, true] {
+                let expected = if reazon && !haas {
+                    AsrModel::ReazonSpeech
+                } else {
+                    AsrModel::Haas
+                };
+                assert_eq!(resolve_asr_model(None, reazon, haas), expected);
+                for model in [AsrModel::Haas, AsrModel::ReazonSpeech] {
+                    assert_eq!(resolve_asr_model(Some(model), reazon, haas), model);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn active_hotwords_score_follows_model_and_custom_scores() {
-        let mut config = AsrConfig::default();
+        let mut config = AsrConfig {
+            model: AsrModel::ReazonSpeech,
+            ..AsrConfig::default()
+        };
         assert_eq!(config.active_hotwords_score(), 3.0);
         config.hotwords_score = 4.5;
         config.haas_hotwords_score = 2.5;
@@ -684,10 +719,10 @@ mod tests {
     #[test]
     fn asr_model_and_haas_score_config_contract() {
         let legacy: Config = toml::from_str("[asr]\nnum_threads = 4").unwrap();
-        assert_eq!(legacy.asr.model, AsrModel::ReazonSpeech);
+        assert_eq!(legacy.asr.model, AsrModel::Haas);
         assert_eq!(legacy.asr.haas_hotwords_score, 1.5);
         let defaults = toml::Value::try_from(Config::default()).unwrap();
-        assert_eq!(defaults["asr"]["model"].as_str(), Some("reazonspeech"));
+        assert_eq!(defaults["asr"]["model"].as_str(), Some("haas"));
         assert_eq!(defaults["asr"]["haas_hotwords_score"].as_float(), Some(1.5));
         for model in ["haas", "reazonspeech"] {
             let config: Config = toml::from_str(&format!("[asr]\nmodel = \"{model}\"")).unwrap();

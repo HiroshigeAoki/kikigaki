@@ -154,6 +154,7 @@ fn run() -> anyhow::Result<()> {
 
     let asr_config = AsrConfig {
         num_threads: args.num_threads,
+        model: kikigaki_core::config::AsrModel::ReazonSpeech,
         ..AsrConfig::default()
     };
     let mut recognizer = match args.engine {

@@ -168,13 +168,23 @@ pub fn build_recognizer_with_hotwords(
 fn create_recognizer(
     models_dir: &Path,
     spec: ModelSpec,
-    mut sherpa_config: OfflineRecognizerConfig,
+    sherpa_config: OfflineRecognizerConfig,
 ) -> anyhow::Result<SherpaAsr> {
-    sherpa_config.model_config.provider = Some(cpu_provider(models_dir));
+    let sherpa_config = with_no_spin_provider(models_dir, sherpa_config);
     let path = models_dir.join(spec.id);
     let recognizer = OfflineRecognizer::create(&sherpa_config)
         .ok_or_else(|| anyhow!("failed to load {} from {}", spec.id, path.display()))?;
     Ok(SherpaAsr { recognizer, spec })
+}
+
+/// Points a recognizer config at the no-spin CPU provider. Every recognizer, whatever its model,
+/// is created through this, so `recognizer_config` itself stays free of filesystem access.
+fn with_no_spin_provider(
+    models_dir: &Path,
+    mut sherpa_config: OfflineRecognizerConfig,
+) -> OfflineRecognizerConfig {
+    sherpa_config.model_config.provider = Some(cpu_provider(models_dir));
+    sherpa_config
 }
 
 /// Returns the sherpa-onnx CPU provider string, pointing it at a freshly written no-spin config.
@@ -287,6 +297,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn both_recognizers_use_no_spin_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        for model in [AsrModel::Haas, AsrModel::ReazonSpeech] {
+            let config = AsrConfig {
+                model,
+                ..AsrConfig::default()
+            };
+            let base = recognizer_config(dir.path(), &config, None).unwrap();
+            let actual = with_no_spin_provider(dir.path(), base);
+            let expected = format!("cpu:{}", dir.path().join("ort/cpu-no-spin.cfg").display());
+            assert_eq!(actual.model_config.provider, Some(expected));
+        }
+    }
+
+    #[test]
     fn model_specs_and_haas_recognizer_fields() {
         let reazon = model_spec(AsrModel::ReazonSpeech);
         assert_eq!(reazon.id, ASR_MODEL_ID);
@@ -363,7 +388,10 @@ mod tests {
     #[test]
     fn recognizer_auto_without_hotwords_preserves_baseline_config() {
         let models_dir = Path::new("/models");
-        let config = AsrConfig::default();
+        let config = AsrConfig {
+            model: AsrModel::ReazonSpeech,
+            ..AsrConfig::default()
+        };
         let expected = recognizer_config(models_dir, &config, None).unwrap();
 
         let actual = crate::local::with_hotword_fallback(
@@ -388,7 +416,10 @@ mod tests {
         for score in [f32::NEG_INFINITY, -1.0, 0.0, f32::INFINITY, f32::NAN] {
             let error = build_recognizer_auto(
                 Path::new("/models-that-must-not-be-read"),
-                &AsrConfig::default(),
+                &AsrConfig {
+                    model: kikigaki_core::config::AsrModel::ReazonSpeech,
+                    ..AsrConfig::default()
+                },
                 Some(score),
             )
             .err()
@@ -404,7 +435,10 @@ mod tests {
     #[test]
     fn recognizer_config_preserves_existing_defaults() {
         let models_dir = Path::new("/models");
-        let config = AsrConfig::default();
+        let config = AsrConfig {
+            model: AsrModel::ReazonSpeech,
+            ..AsrConfig::default()
+        };
 
         let actual = recognizer_config(models_dir, &config, None).unwrap();
         let model_dir = models_dir.join(ASR_MODEL_ID);
@@ -466,7 +500,10 @@ mod tests {
 
         let actual = recognizer_config(
             Path::new("/models"),
-            &AsrConfig::default(),
+            &AsrConfig {
+                model: kikigaki_core::config::AsrModel::ReazonSpeech,
+                ..AsrConfig::default()
+            },
             Some((hotwords_file, 2.0, bpe_vocab)),
         )
         .unwrap();
@@ -520,6 +557,7 @@ mod tests {
     fn recognizer_config_rejects_thread_count_outside_sherpa_range() {
         let config = AsrConfig {
             num_threads: u32::MAX,
+            model: kikigaki_core::config::AsrModel::ReazonSpeech,
             ..AsrConfig::default()
         };
 

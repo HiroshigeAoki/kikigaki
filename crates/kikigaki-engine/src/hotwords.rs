@@ -33,6 +33,18 @@ pub fn resolve_hotword_arg(
     (enabled && decoding_method == DecodingMethod::ModifiedBeamSearch).then_some(score)
 }
 
+/// Maps the selected model's score to the local engine start argument.
+pub fn configured_hotword_arg(
+    enabled: bool,
+    config: &kikigaki_core::config::AsrConfig,
+) -> Option<f32> {
+    resolve_hotword_arg(
+        enabled,
+        config.active_hotwords_score(),
+        config.decoding_method,
+    )
+}
+
 /// Materializes shared `hotwords.txt` and model-specific `<model-id>/bpe.vocab` under
 /// `models_dir/hotwords/`.
 ///
@@ -191,6 +203,27 @@ mod tests {
 
     fn fixture_sha256() -> String {
         hex::encode(Sha256::digest(FIXTURE_TOKENS))
+    }
+
+    #[test]
+    fn config_score_reaches_engine_argument() {
+        use kikigaki_core::config::AsrConfig;
+        for (model, default_score, custom_score) in [
+            (AsrModel::Haas, 1.5, 2.5),
+            (AsrModel::ReazonSpeech, 3.0, 4.5),
+        ] {
+            let mut config = AsrConfig {
+                model,
+                ..AsrConfig::default()
+            };
+            assert_eq!(configured_hotword_arg(true, &config), Some(default_score));
+            config.haas_hotwords_score = custom_score;
+            config.hotwords_score = custom_score;
+            assert_eq!(configured_hotword_arg(true, &config), Some(custom_score));
+            assert_eq!(configured_hotword_arg(false, &config), None);
+            config.decoding_method = DecodingMethod::GreedySearch;
+            assert_eq!(configured_hotword_arg(true, &config), None);
+        }
     }
 
     #[test]

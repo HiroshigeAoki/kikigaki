@@ -56,7 +56,28 @@ pub struct SettingsCoordinator {
 impl SettingsCoordinator {
     pub fn load(path: PathBuf, capabilities: Capabilities) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
-        let config = Config::load(Some(&path))?;
+        let mut config = Config::load(Some(&path))?;
+        let document: toml_edit::DocumentMut = raw.parse()?;
+        let explicit = document
+            .get("asr")
+            .and_then(|asr| asr.get("model"))
+            .map(|_| config.asr.model);
+        let installed = |model| {
+            kikigaki_core::models::MODELS
+                .iter()
+                .find(|entry| entry.required_for == kikigaki_core::models::Requirement::Asr(model))
+                .is_some_and(|entry| kikigaki_core::models::is_installed(&config.models_dir, entry))
+        };
+        config.asr.model = kikigaki_core::config::resolve_asr_model(
+            explicit,
+            installed(AsrModel::ReazonSpeech),
+            installed(AsrModel::Haas),
+        );
+        if explicit.is_none() && config.asr.model == AsrModel::ReazonSpeech {
+            tracing::info!(
+                "keeping installed ReazonSpeech for configuration without an ASR model key"
+            );
+        }
         if config.long_key && !capabilities.long_key {
             tracing::warn!("long_key is enabled, but this build does not support the long key");
         }
@@ -159,24 +180,23 @@ impl SettingsCoordinator {
             candidate.hotkey = chord.clone();
         }
         if let Some(model) = patch.asr_model {
-            match model {
-                AsrModel::Haas => {
-                    if !document.contains_key("asr") {
-                        document["asr"] = toml_edit::table();
-                    }
-                    document["asr"]["model"] = toml_edit::value("haas");
-                }
-                AsrModel::ReazonSpeech => {
-                    if let Some(table) = document
-                        .get_mut("asr")
-                        .and_then(toml_edit::Item::as_table_mut)
-                    {
-                        table.remove("model");
-                        if table.is_empty() {
-                            document.remove("asr");
-                        }
-                    }
-                }
+            if !document.contains_key("asr") {
+                document["asr"] = toml_edit::table();
+            }
+            let spelling = match model {
+                AsrModel::Haas => "haas",
+                AsrModel::ReazonSpeech => "reazonspeech",
+            };
+            // Mutating the value retains inline comments and surrounding whitespace.
+            if let Some(value) = document["asr"]
+                .get_mut("model")
+                .and_then(toml_edit::Item::as_value_mut)
+            {
+                let decor = value.decor().clone();
+                *value = toml_edit::Value::from(spelling);
+                *value.decor_mut() = decor;
+            } else {
+                document["asr"]["model"] = toml_edit::value(spelling);
             }
             candidate.asr.model = model;
         }
@@ -305,6 +325,101 @@ mod tests {
         (temp, path, coordinator, caps)
     }
 
+    fn mark_installed(root: &Path, model: &kikigaki_core::models::Model) {
+        let dir = root.join(model.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = match model.payload {
+            kikigaki_core::models::Payload::File(ref file) => std::slice::from_ref(file),
+            kikigaki_core::models::Payload::Files(files)
+            | kikigaki_core::models::Payload::TarBz2 { files, .. } => files,
+        };
+        for file in files {
+            std::fs::File::create(dir.join(file.name))
+                .unwrap()
+                .set_len(file.size)
+                .unwrap();
+        }
+        std::fs::write(dir.join(".ok"), kikigaki_core::models::ok_marker(model)).unwrap();
+    }
+
+    #[test]
+    fn model_resolution_and_explicit_choices_survive_reload() {
+        use kikigaki_core::models::{Requirement, MODELS};
+        let caps = Capabilities {
+            punct: true,
+            remote_engine: false,
+            long_key: false,
+        };
+        for reazon in [false, true] {
+            for haas in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("config.toml");
+                let root = temp.path().join("models");
+                for (model, installed) in [(AsrModel::ReazonSpeech, reazon), (AsrModel::Haas, haas)]
+                {
+                    if installed {
+                        mark_installed(
+                            &root,
+                            MODELS
+                                .iter()
+                                .find(|m| m.required_for == Requirement::Asr(model))
+                                .unwrap(),
+                        );
+                    }
+                }
+                let raw = format!(
+                    "models_dir = {:?}\n[asr] # tuning\nnum_threads = 2 # threads\n",
+                    root
+                );
+                std::fs::write(&path, &raw).unwrap();
+                let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
+                let expected = if reazon && !haas {
+                    AsrModel::ReazonSpeech
+                } else {
+                    AsrModel::Haas
+                };
+                assert_eq!(coordinator.config().asr.model, expected);
+                assert_eq!(coordinator.applied_asr_model(), expected);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+                for model in [
+                    AsrModel::ReazonSpeech,
+                    AsrModel::Haas,
+                    AsrModel::ReazonSpeech,
+                ] {
+                    coordinator
+                        .apply(SettingsPatch {
+                            asr_model: Some(model),
+                            ..SettingsPatch::default()
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        SettingsCoordinator::load(path.clone(), caps)
+                            .unwrap()
+                            .config()
+                            .asr
+                            .model,
+                        model
+                    );
+                }
+                let edited = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("model = \"reazonspeech\"", "model = \"haas\" # choice");
+                std::fs::write(&path, edited).unwrap();
+                let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
+                coordinator
+                    .apply(SettingsPatch {
+                        asr_model: Some(AsrModel::ReazonSpeech),
+                        ..SettingsPatch::default()
+                    })
+                    .unwrap();
+                let saved = std::fs::read_to_string(&path).unwrap();
+                for comment in ["# tuning", "# threads", "# choice", "num_threads = 2"] {
+                    assert!(saved.contains(comment), "{saved}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn asr_model_patch_uses_camel_case_json() {
         let patch: SettingsPatch = serde_json::from_str(r#"{"asrModel":"haas"}"#).unwrap();
@@ -312,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn asr_model_apply_round_trip_preserves_original_bytes() {
+    fn asr_model_apply_round_trip_persists_explicit_choice() {
         for raw in [
             "# keep\nhotkey = \"Alt+Space\"\n[vad]\nthreshold = 0.6\n",
             concat!(
@@ -338,11 +453,11 @@ mod tests {
                 .unwrap();
             assert_eq!(coordinator.config().asr.model, AsrModel::Haas);
             assert_eq!(saved.asr_model, AsrModel::Haas);
-            assert_eq!(saved.asr_model_applied, AsrModel::ReazonSpeech);
+            assert_eq!(saved.asr_model_applied, AsrModel::Haas);
             assert_eq!(saved.punct_enabled, before.punct_enabled);
             let json = serde_json::to_value(&saved).unwrap();
             assert_eq!(json["asr_model"], "haas");
-            assert_eq!(json["asr_model_applied"], "reazonspeech");
+            assert_eq!(json["asr_model_applied"], "haas");
             let reloaded = SettingsCoordinator::load(path.clone(), caps).unwrap();
             assert_eq!(reloaded.config().asr.model, AsrModel::Haas);
             coordinator
@@ -352,7 +467,17 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(coordinator.config().asr.model, AsrModel::ReazonSpeech);
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("model = \"reazonspeech\""));
+            assert_eq!(
+                SettingsCoordinator::load(path, caps)
+                    .unwrap()
+                    .config()
+                    .asr
+                    .model,
+                AsrModel::ReazonSpeech
+            );
         }
     }
 
@@ -383,7 +508,7 @@ mod tests {
     #[test]
     fn applied_asr_model_is_captured_at_load_and_survives_apply() {
         for (raw, model) in [
-            ("", AsrModel::ReazonSpeech),
+            ("", AsrModel::Haas),
             ("[asr]\nmodel = \"haas\"\n", AsrModel::Haas),
         ] {
             let temp = tempfile::tempdir().unwrap();
@@ -814,7 +939,7 @@ mod tests {
     fn punct_patch_sets_both_enabled_and_strip_trailing_period() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
-        std::fs::write(&path, "").unwrap();
+        std::fs::write(&path, "[asr]\nmodel = \"reazonspeech\"\n").unwrap();
         let mut coordinator = SettingsCoordinator::load(
             path,
             Capabilities {

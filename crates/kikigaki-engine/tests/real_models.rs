@@ -110,7 +110,14 @@ fn transcribe_test_ja_1_golden() {
         return;
     };
     let samples = load_wav_16k("test_ja_1.wav");
-    let mut recognizer = build_recognizer(&PathBuf::from(dir), &AsrConfig::default()).unwrap();
+    let mut recognizer = build_recognizer(
+        &PathBuf::from(dir),
+        &AsrConfig {
+            model: kikigaki_core::config::AsrModel::ReazonSpeech,
+            ..AsrConfig::default()
+        },
+    )
+    .unwrap();
     let actual = recognizer
         .transcribe(&samples)
         .expect("recognizer returned no result");
@@ -189,6 +196,7 @@ fn production_hotword_path_biases_known_eval_wav() {
     };
     let asr = AsrConfig {
         num_threads: 4,
+        model: kikigaki_core::config::AsrModel::ReazonSpeech,
         ..AsrConfig::default()
     };
 
@@ -251,6 +259,7 @@ fn unwritable_hotword_directory_degrades_and_local_engine_decodes() {
     let text = tracing::subscriber::with_default(subscriber, || {
         let asr = AsrConfig {
             num_threads: 4,
+            model: kikigaki_core::config::AsrModel::ReazonSpeech,
             ..AsrConfig::default()
         };
         let mut engine = LocalEngine::start(
@@ -321,7 +330,10 @@ fn local_engine_end_to_end() {
     };
     let mut engine = LocalEngine::start(
         PathBuf::from(dir),
-        AsrConfig::default(),
+        AsrConfig {
+            model: kikigaki_core::config::AsrModel::ReazonSpeech,
+            ..AsrConfig::default()
+        },
         VadConfig::default(),
         None,
     )

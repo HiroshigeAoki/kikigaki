@@ -2334,6 +2334,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "webpki-roots 1.0.10",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

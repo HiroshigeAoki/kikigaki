@@ -1,4 +1,4 @@
-//! macOS Tauri shell and adapters for the platform-independent controller.
+//! Desktop Tauri shell and adapters for the platform-independent controller.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +26,8 @@ pub fn run() -> anyhow::Result<()> {
         tauri::Builder::default()
             .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
                 if let Some(window) = app.get_webview_window("settings") {
+                    #[cfg(target_os = "windows")]
+                    let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
@@ -85,8 +87,7 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 fn init_logging() -> anyhow::Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    let log_dir = home.join("Library/Logs/kikigaki");
+    let log_dir = kikigaki_core::config::default_log_dir();
     std::fs::create_dir_all(&log_dir)?;
     let appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
@@ -121,6 +122,7 @@ fn setup(
     process_started_at: Instant,
     shortcuts: Arc<Mutex<HashMap<HotkeyKey, Shortcut>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
     app.handle()
         .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
 
@@ -172,6 +174,8 @@ fn setup(
     build_tray(app, &handle)?;
     tracing::info!("tray built");
     if onboarding_now.is_some() || bootstrap_error.is_some() {
+        #[cfg(target_os = "windows")]
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
         tracing::info!(reason = "bootstrap", "window shown");
@@ -280,6 +284,7 @@ fn resolve_bootstrap() -> (
     crate::settings::SettingsCoordinator,
     kikigaki_core::config::Capabilities,
 ) {
+    crate::permissions::init_microphone_permission_probe();
     let capabilities = crate::cli::capabilities();
     let path = kikigaki_core::config::default_path();
     match crate::settings::SettingsCoordinator::load(path, capabilities) {
@@ -376,7 +381,10 @@ struct TauriEngineFactory {
     local_asr_cfg: kikigaki_core::config::AsrConfig,
     local_vad_cfg: kikigaki_core::config::VadConfig,
     hotwords_enabled: AtomicBool,
-    #[cfg_attr(not(feature = "remote-engine"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "remote-engine", target_os = "macos")),
+        allow(dead_code)
+    )]
     remote_cfg: kikigaki_core::config::RemoteConfig,
 }
 
@@ -403,7 +411,7 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
                 )
                 .map(|engine| Box::new(engine) as Box<dyn kikigaki_core::engine::Engine>)
             }
-            #[cfg(feature = "remote-engine")]
+            #[cfg(all(feature = "remote-engine", target_os = "macos"))]
             kikigaki_core::config::EngineKind::Remote => {
                 kikigaki_core::remote::RemoteEngine::start(
                     self.remote_cfg.clone(),
@@ -411,7 +419,7 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
                 )
                 .map(|engine| Box::new(engine) as Box<dyn kikigaki_core::engine::Engine>)
             }
-            #[cfg(not(feature = "remote-engine"))]
+            #[cfg(not(all(feature = "remote-engine", target_os = "macos")))]
             kikigaki_core::config::EngineKind::Remote => {
                 anyhow::bail!("engine = \"remote\" requires a build with the remote-engine feature")
             }
@@ -520,6 +528,8 @@ fn build_tray(app: &tauri::App, handle: &AppHandle) -> tauri::Result<()> {
                         let _ = window.hide();
                         tracing::info!(source = "tray click", "window hidden");
                     } else {
+                        #[cfg(target_os = "windows")]
+                        let _ = window.unminimize();
                         let _ = window.show();
                         let _ = window.set_focus();
                         tracing::info!(source = "tray click", "window shown");
@@ -629,7 +639,7 @@ fn publish_snapshot(app: &AppHandle, mut snapshot: crate::status::UiSnapshot) {
 
 fn autostart_state(app: &AppHandle) -> crate::status::AutostartState {
     crate::status::AutostartState {
-        available: is_relocatable_install(),
+        available: crate::platform::autostart_available(),
         enabled: app.autolaunch().is_enabled().unwrap_or(false),
     }
 }
@@ -871,10 +881,10 @@ async fn end_hotkey_capture(
 
 #[tauri::command]
 fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<(), crate::status::UiError> {
-    if !is_relocatable_install() {
+    if !crate::platform::autostart_available() {
         return Err(crate::status::UiError {
             code: "not_relocatable",
-            message: "/Applications 以外にインストールされているため設定できません".into(),
+            message: crate::platform::autostart_unavailable_message().into(),
         });
     }
     let manager = app.autolaunch();
@@ -927,18 +937,6 @@ fn retry_bootstrap(app: AppHandle) -> Result<(), crate::status::UiError> {
     })
 }
 
-fn is_relocatable_install() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.ancestors().nth(3).map(std::path::Path::to_path_buf))
-        .is_some_and(|app_bundle| {
-            let path = app_bundle.to_string_lossy();
-            path.starts_with("/Applications/")
-                || dirs::home_dir()
-                    .is_some_and(|home| app_bundle.starts_with(home.join("Applications")))
-        })
-}
-
 #[tauri::command]
 fn open_config(state: tauri::State<'_, Arc<ShellState>>) -> Result<(), crate::status::UiError> {
     let path = kikigaki_core::config::default_path();
@@ -949,14 +947,7 @@ fn open_config(state: tauri::State<'_, Arc<ShellState>>) -> Result<(), crate::st
         let _ = std::fs::write(&path, "");
     }
     let _ = state;
-    std::process::Command::new("open")
-        .arg(&path)
-        .status()
-        .map_err(|error| crate::status::UiError {
-            code: "open_failed",
-            message: format!("{error}"),
-        })?;
-    Ok(())
+    crate::platform::open_path(&path).map_err(open_failed)
 }
 
 #[tauri::command]
@@ -975,41 +966,31 @@ fn open_transcript_dir(
             message: format!("記録フォルダを保護できませんでした: {error}"),
         },
     )?;
-    std::process::Command::new("open")
-        .arg(path)
-        .status()
-        .map_err(|error| crate::status::UiError {
-            code: "open_failed",
-            message: format!("{error}"),
-        })?;
-    Ok(())
+    crate::platform::open_path(&path).map_err(open_failed)
+}
+
+/// Maps OS hand-off failures consistently for file, folder, and URI commands.
+fn open_failed(error: std::io::Error) -> crate::status::UiError {
+    crate::status::UiError {
+        code: "open_failed",
+        message: error.to_string(),
+    }
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum OnboardingPane {
+pub(crate) enum OnboardingPane {
     Microphone,
     Accessibility,
 }
 
 #[tauri::command]
 fn open_settings_pane(pane: OnboardingPane) -> Result<(), crate::status::UiError> {
-    let url = match pane {
-        OnboardingPane::Microphone => {
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-        }
-        OnboardingPane::Accessibility => {
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-        }
-    };
-    std::process::Command::new("open")
-        .arg(url)
-        .status()
-        .map_err(|error| crate::status::UiError {
-            code: "open_failed",
-            message: format!("{error}"),
-        })?;
-    Ok(())
+    let url = crate::platform::settings_pane_uri(pane).ok_or_else(|| crate::status::UiError {
+        code: "not_applicable",
+        message: "Windows ではアクセシビリティ権限の設定は不要です".into(),
+    })?;
+    crate::platform::open_uri(url).map_err(open_failed)
 }
 
 #[tauri::command]

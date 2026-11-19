@@ -80,6 +80,9 @@ echo "== default features (lib) =="
 cargo clippy -p kikigaki-core -p kikigaki-engine -p kikigaki --lib -- -D warnings
 cargo test -p kikigaki-core -p kikigaki-engine -p kikigaki --lib
 
+echo "== windows.conf.json sanity (runs on every OS) =="
+cargo test -p kikigaki --test windows_conf
+
 echo "== kikigaki-engine bins (hotword-eval stays compile- and test-checked) =="
 cargo clippy -p kikigaki-engine --all-targets -- -D warnings
 cargo build -p kikigaki-engine --bins

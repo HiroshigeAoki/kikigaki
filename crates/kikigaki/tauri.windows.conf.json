@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "vendor/win/sherpa-onnx-c-api.dll": "sherpa-onnx-c-api.dll",
+      "vendor/win/onnxruntime.dll": "onnxruntime.dll",
+      "vendor/win/onnxruntime_providers_shared.dll": "onnxruntime_providers_shared.dll"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "nsis/hooks.nsh"
+      },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  }
+}

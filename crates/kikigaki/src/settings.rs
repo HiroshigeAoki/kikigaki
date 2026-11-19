@@ -233,6 +233,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     temp.write_all(contents)?;
     temp.as_file().sync_all()?;
     temp.persist(path)?;
+    #[cfg(unix)]
     std::fs::File::open(directory)?.sync_all()?;
     Ok(())
 }

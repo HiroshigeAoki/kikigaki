@@ -1,4 +1,4 @@
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
@@ -84,10 +84,10 @@ impl StartupCoordinator {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) struct StartupCoordinatorPort(StartupCoordinator);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StartupCoordinatorPort {
     pub(crate) fn new(plan: StartupPlan) -> Self {
         Self(StartupCoordinator::new(plan))
@@ -99,7 +99,7 @@ impl StartupCoordinatorPort {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl crate::controller::StartupPort for StartupCoordinatorPort {
     fn start(&mut self) -> anyhow::Result<bool> {
         self.0.start()

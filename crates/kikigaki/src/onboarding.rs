@@ -1,12 +1,12 @@
 //! First-launch permission and required-model scanning.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn scan(
     settings: &crate::settings::SettingsCoordinator,
     startup: &dyn crate::controller::StartupPort,
 ) -> Option<crate::status::OnboardingState> {
     let microphone = mic_status_str(crate::permissions::microphone_permission());
-    let accessibility_trusted = accessibility_trusted();
+    let accessibility_trusted = crate::platform::accessibility_trusted();
     let models_installed = required_models_installed(&settings.config().models_dir, startup);
     if microphone == "authorized" && accessibility_trusted && models_installed {
         return None;
@@ -63,17 +63,7 @@ fn consent_copy(required: &[&'static kikigaki_core::models::Model]) -> String {
     )
 }
 
-#[cfg(target_os = "macos")]
-fn accessibility_trusted() -> bool {
-    #[link(name = "ApplicationServices", kind = "framework")]
-    extern "C" {
-        fn AXIsProcessTrusted() -> bool;
-    }
-
-    unsafe { AXIsProcessTrusted() }
-}
-
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn mic_status_str(status: crate::permissions::MicPermission) -> &'static str {
     use crate::permissions::MicPermission;
 
@@ -82,6 +72,8 @@ fn mic_status_str(status: crate::permissions::MicPermission) -> &'static str {
         MicPermission::Restricted => "restricted",
         MicPermission::Denied => "denied",
         MicPermission::Authorized => "authorized",
+        MicPermission::Unavailable => "unavailable",
+        MicPermission::Busy => "busy",
         MicPermission::Unknown => "unknown",
     }
 }

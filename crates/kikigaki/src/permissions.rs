@@ -1,84 +1,62 @@
-//! Microphone permission status.
-//!
-//! On macOS, CoreAudio can successfully open an input stream after microphone access is
-//! denied, but only deliver silent samples. Querying AVFoundation lets the tray explain that
-//! silent-stream failure. When kikigaki is launched from a terminal, macOS attributes the
-//! microphone permission to the launching terminal app.
+//! Microphone permission status. Platform probing lives in `crate::platform`; this module holds
+//! the OS-neutral vocabulary both platforms report through.
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[repr(u8)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MicPermission {
-    NotDetermined,
-    Restricted,
-    Denied,
-    Authorized,
-    /// AVFoundation returned an unrecognized status, or its device class was unavailable.
-    /// This deliberately fails closed and is never treated as permission being granted.
-    Unknown,
+    NotDetermined = 0,
+    Restricted = 1,
+    Denied = 2,
+    Authorized = 3,
+    /// No input device could be enumerated at all. Windows-only today.
+    Unavailable = 4,
+    /// A device exists but could not be opened or started. Windows-only today.
+    Busy = 5,
+    /// The platform returned an unrecognized status or probing was unavailable.
+    Unknown = 6,
 }
 
 impl MicPermission {
     pub fn is_granted(self) -> bool {
         self == Self::Authorized
     }
-}
 
-#[cfg(target_os = "macos")]
-#[link(name = "AVFoundation", kind = "framework")]
-extern "C" {}
-
-#[cfg(target_os = "macos")]
-pub fn microphone_permission() -> MicPermission {
-    use objc2::{msg_send, runtime::AnyClass};
-    use objc2_foundation::NSString;
-
-    let Some(cls) = AnyClass::get(c"AVCaptureDevice") else {
-        tracing::warn!("AVCaptureDevice class unavailable; microphone access is unknown");
-        return MicPermission::Unknown;
-    };
-    let status: isize =
-        unsafe { msg_send![cls, authorizationStatusForMediaType: &*NSString::from_str("soun")] };
-    match status {
-        0 => MicPermission::NotDetermined,
-        1 => MicPermission::Restricted,
-        2 => MicPermission::Denied,
-        3 => MicPermission::Authorized,
-        _ => {
-            tracing::warn!(status, "unknown microphone authorization status");
-            MicPermission::Unknown
+    /// Inverse of the Windows probe cache's `as u8` cast.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::NotDetermined,
+            1 => Self::Restricted,
+            2 => Self::Denied,
+            3 => Self::Authorized,
+            4 => Self::Unavailable,
+            5 => Self::Busy,
+            _ => Self::Unknown,
         }
     }
 }
 
-/// Asks macOS for microphone access and waits for the completion handler.
-#[cfg(target_os = "macos")]
-pub fn request_microphone_access(timeout: std::time::Duration) -> Result<bool, String> {
-    use std::sync::mpsc;
-
-    use block2::RcBlock;
-    use objc2::msg_send;
-    use objc2::runtime::{AnyClass, Bool};
-    use objc2_foundation::NSString;
-
-    let cls = AnyClass::get(c"AVCaptureDevice").ok_or("AVCaptureDevice class unavailable")?;
-    let (sender, receiver) = mpsc::channel::<bool>();
-    let block = RcBlock::new(move |granted: Bool| {
-        let _ = sender.send(granted.as_bool());
-    });
-    let media_type = NSString::from_str("soun");
-    unsafe {
-        let _: () = msg_send![
-            cls,
-            requestAccessForMediaType: &*media_type,
-            completionHandler: &*block
-        ];
-    }
-    receiver
-        .recv_timeout(timeout)
-        .map_err(|error| format!("no completion handler call within {timeout:?}: {error}"))
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn microphone_permission() -> MicPermission {
+    crate::platform::microphone_permission()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn request_microphone_access(timeout: std::time::Duration) -> Result<bool, String> {
+    crate::platform::request_microphone_access(timeout)
+}
+
+/// Runs Windows's one-time, synchronous startup probe before the initial onboarding scan.
+#[cfg(target_os = "windows")]
+pub fn init_microphone_permission_probe() {
+    crate::platform::init_microphone_permission_probe();
+}
+
+#[cfg(target_os = "macos")]
+pub fn init_microphone_permission_probe() {}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(dead_code)]
 pub fn microphone_permission() -> MicPermission {
     MicPermission::Authorized
@@ -94,10 +72,27 @@ mod tests {
         assert!(!MicPermission::Unknown.is_granted());
     }
 
-    #[cfg(target_os = "macos")]
+    #[test]
+    fn numeric_status_round_trips_and_unknown_values_fail_closed() {
+        let variants = [
+            MicPermission::NotDetermined,
+            MicPermission::Restricted,
+            MicPermission::Denied,
+            MicPermission::Authorized,
+            MicPermission::Unavailable,
+            MicPermission::Busy,
+            MicPermission::Unknown,
+        ];
+        for variant in variants {
+            assert_eq!(MicPermission::from_u8(variant as u8), variant);
+        }
+        assert_eq!(MicPermission::from_u8(7), MicPermission::Unknown);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     use super::microphone_permission;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn microphone_permission_returns_known_status() {
         assert!(matches!(
@@ -106,6 +101,8 @@ mod tests {
                 | MicPermission::Restricted
                 | MicPermission::Denied
                 | MicPermission::Authorized
+                | MicPermission::Unavailable
+                | MicPermission::Busy
                 | MicPermission::Unknown
         ));
     }

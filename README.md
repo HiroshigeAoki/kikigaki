@@ -11,7 +11,6 @@ Fast, private Japanese voice typing. 100% local and open source.
 - 音声認識・発話区間検出・句読点付与をすべて端末内で実行
 - 既定ではモデルの初回ダウンロードを除きネットワークを使わない
 - 置換辞書でカタカナ語や固有名詞を好みの表記に変換
-- 長い文章や英語の固有名詞には、高精度な「長文キー」を使い分けられる(任意)
 - 無料・オープンソース(MIT)
 
 ## インストール (macOS)
@@ -28,7 +27,7 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 ## プライバシー
 
-音声認識(HaasまたはReazonSpeech、長文キーではWhisper)、発話区間検出(Silero VAD)、句読点付与(mojicast)は、すべて端末上で実行される。既定構成でネットワークを使うのはモデルの初回ダウンロードだけで、音声データや認識結果を外部サーバーへ送信しない。`remote-engine` 構成でも、既定では同一マシン上のローカルプロセス(`ws://127.0.0.1`)に接続する。
+音声認識(HaasまたはReazonSpeech)、発話区間検出(Silero VAD)、句読点付与(mojicast)は、すべて端末上で実行される。既定構成でネットワークを使うのはモデルの初回ダウンロードだけで、音声データや認識結果を外部サーバーへ送信しない。`remote-engine` 構成でも、既定では同一マシン上のローカルプロセス(`ws://127.0.0.1`)に接続する。
 
 ## ファイルの場所
 
@@ -46,7 +45,7 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 ### 認識モデル
 
-設定画面の「認識モデル」で、標準キーが使うモデルを「標準」(ReazonSpeech)と「Haas」(Haas-ja v1.0、既定)から選べる。
+設定画面の「認識モデル」で、聞き取りキーが使うモデルを「標準」(ReazonSpeech)と「Haas」(Haas-ja v1.0、既定)から選べる。
 
 以前からkikigakiを使っていてモデルを選んだことがない環境では、ReazonSpeechだけが入っている間はReazonSpeechを使い続ける。Haasのモデルがすでに入っている場合はHaasを使う。設定画面でHaasを選ぶと切り替わる。ReazonSpeechを使い続けたい場合は、設定画面で「標準」を選ぶ。選んだモデルは設定ファイルの `[asr]` の `model` に保存される。
 
@@ -54,20 +53,7 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 - 標準はキーを離してから貼り付けまで約0.2秒。Haasはそれより遅く、Apple Silicon搭載Macで短い発話なら約0.4秒が目安となる
 - Haasは初回に約480 MBをダウンロードし、実行中は約0.9 GBのメモリを使う
 - 切り替えはkikigakiの次の起動から反映される。標準に戻す場合も同じ
-- Haasは自身で句読点を出力し、標準キーに句読点モデルを適用しないため、末尾の文に必ずしも「。」が付くわけではない
-- 長文キーには影響しない
-
-### 長文キー
-
-設定画面の「長文キー（高精度）を使う」を有効にすると、2つ目のホットキーでWhisper large-v3-turboによる認識を使える。既定のキーは `⌥⇧Space`。⌥とShiftを先に押してからSpaceを押す。
-
-- 標準キー(`Alt+Space`)は短い返信向けで、標準モデルではキーを離してから貼り付けまで約0.2秒
-- 長文キーは長い文章や英語の固有名詞に強い。貼り付けまでは短い発話で約1秒、10秒の発話で約3秒かかる
-- 初回の有効化時にモデル(約0.9 GB)をダウンロードする。有効な間は2つのエンジンが常駐し、メモリを約1 GB多く使う
-- 起動直後やダウンロード中など長文エンジンの準備ができていない間に長文キーを押すと、標準のエンジンで認識し、その旨を表示する
-- 標準モデルでは両方のキーで同じ句読点モデルと設定を使う。長文キーでは、Whisperの句読点と日本語の語句間の空白を先に取り除く
-- カタカナ語→英語辞書の認識バイアスは標準キーにのみ適用される
-- Apple Silicon搭載Macのみ対応
+- Haasは自身で句読点を出力し、聞き取りキーに句読点モデルを適用しないため、末尾の文に必ずしも「。」が付くわけではない
 
 ### 置換辞書
 
@@ -91,7 +77,6 @@ to = "Kubernetes"
 - [x] 自動句読点
 - [x] 置換辞書
 - [x] カタカナ語の既定置換辞書
-- [x] 高精度の長文キー(Whisper)
 - [ ] 認識精度の改善
 - [ ] Windows対応
 
@@ -112,8 +97,6 @@ to = "Kubernetes"
 | [Silero VAD](https://github.com/snakers4/silero-vad) | MIT | 発話区間検出モデル |
 | [mojicast-punct-onnx](https://huggingface.co/ishiki-emo/mojicast-punct-onnx) | Apache-2.0(モデル) | 句読点付与モデル |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) | MIT | 句読点モデルの実行 |
-| [whisper.cpp](https://github.com/ggerganov/whisper.cpp) / [whisper-rs](https://github.com/tazz4843/whisper-rs) | MIT | 長文キーの音声認識の実行エンジン |
-| [Whisper](https://github.com/openai/whisper) | MIT(モデル) | 長文キーの音声認識モデル(large-v3-turbo) |
 | [hayamimi](https://github.com/oboroge0/hayamimi) | MIT | 句読点パイプラインの移植元 |
 | [mecab-ipadic-NEologd](https://github.com/neologd/mecab-ipadic-neologd) | Apache-2.0 | 内蔵カタカナ語→英語辞書のデータ |
 | [Wikidata](https://www.wikidata.org) | CC0 1.0 | 内蔵カタカナ語→英語辞書のデータ |

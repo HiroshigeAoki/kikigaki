@@ -7,24 +7,19 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Runtime settings for the kikigaki application.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// Transcription engine implementation to use.
     pub engine: EngineKind,
     /// Push-to-talk global hotkey.
     pub hotkey: String,
-    /// Enable the long dictation key.
-    pub long_key: bool,
-    /// Global hotkey for long dictation.
-    pub long_hotkey: String,
     /// Method used to insert transcribed text.
     pub paste_method: PasteMethod,
     /// Whether one trailing Japanese or ASCII period is removed.
     pub strip_trailing_period: bool,
     /// Silence appended after hotkey release, in milliseconds.
     pub silence_pad_ms: u64,
-    /// Maximum wait for a final transcription, in milliseconds. Whisper extends this by half the
-    /// recorded utterance duration to accommodate whole-utterance decoding.
+    /// Maximum wait for a final transcription, in milliseconds.
     pub final_timeout_ms: u64,
     /// Enable the built-in katakana→English replacement dictionary tier. Default false (opt-in).
     pub builtin_replace_dict: bool,
@@ -55,11 +50,10 @@ pub struct Config {
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
     /// Run speech recognition in this process.
+    #[serde(alias = "whisper")]
     Local,
     /// Connect to a hayamimi WebSocket server.
     Remote,
-    /// Run Whisper large-v3-turbo in this process via whisper-rs.
-    Whisper,
 }
 
 impl EngineKind {
@@ -68,7 +62,6 @@ impl EngineKind {
         match self {
             Self::Local => "local",
             Self::Remote => "remote",
-            Self::Whisper => "whisper",
         }
     }
 }
@@ -110,7 +103,7 @@ pub fn resolve_asr_model(
 
 /// Offline speech recognition settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct AsrConfig {
     /// Local model selected for the next launch.
     pub model: AsrModel,
@@ -168,7 +161,7 @@ impl DecodingMethod {
 
 /// Voice activity detection settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct VadConfig {
     /// Silence duration that closes an utterance, in milliseconds.
     pub min_silence_ms: u64,
@@ -193,7 +186,7 @@ impl Default for VadConfig {
 
 /// Punctuation settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct PunctConfig {
     /// Whether punctuation is enabled.
     pub enabled: PunctEnabled,
@@ -288,7 +281,7 @@ impl<'de> Deserialize<'de> for PunctEnabled {
 
 /// Settings for the remote hayamimi engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RemoteConfig {
     /// Hayamimi WebSocket ingest URL.
     pub ws_url: String,
@@ -329,8 +322,6 @@ pub struct Capabilities {
     pub punct: bool,
     /// Whether the remote WebSocket engine is available.
     pub remote_engine: bool,
-    /// Whether the long dictation key is supported on this platform.
-    pub long_key: bool,
 }
 
 impl Default for Config {
@@ -339,8 +330,6 @@ impl Default for Config {
         Self {
             engine: EngineKind::Local,
             hotkey: "Alt+Space".into(),
-            long_key: false,
-            long_hotkey: "Alt+Shift+Space".into(),
             paste_method: PasteMethod::Clipboard,
             strip_trailing_period: true,
             silence_pad_ms: 500,
@@ -400,45 +389,75 @@ pub fn chords_match(a: &str, b: &str) -> bool {
 impl Config {
     /// Loads TOML configuration, returning defaults when the file is absent.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
+        Self::load_with_warnings(path).map(|(config, _)| config)
+    }
+
+    /// Loads configuration and reports ignored keys without modifying the file or logging.
+    pub fn load_with_warnings(path: Option<&Path>) -> anyhow::Result<(Self, Vec<String>)> {
         let path = path.map(Path::to_path_buf).unwrap_or_else(default_path);
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok((Self::default(), Vec::new()))
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("read config {}", path.display()));
             }
         };
-        let mut config: Self = match toml::from_str(&contents) {
-            Ok(config) => config,
-            Err(error) => {
-                let has_legacy_remote_key = error.to_string().contains("unknown field")
-                    && toml::from_str::<toml::Table>(&contents).is_ok_and(|table| {
-                        LEGACY_REMOTE_KEYS
-                            .iter()
-                            .any(|key| table.contains_key(*key))
-                    });
-                if has_legacy_remote_key {
-                    return Err(anyhow::Error::new(error).context(
-                        "these keys moved to [remote] in Phase 2 — see docs/config-migration.md",
-                    ))
-                    .with_context(|| format!("parse config {}", path.display()));
-                }
-                return Err(error).with_context(|| format!("parse config {}", path.display()));
-            }
-        };
         let table: toml::Table = toml::from_str(&contents)
             .with_context(|| format!("parse config {}", path.display()))?;
-        if config.engine == EngineKind::Whisper {
-            config.engine = EngineKind::Local;
-            if !table.contains_key("long_key") {
-                config.long_key = true;
+        if LEGACY_REMOTE_KEYS
+            .iter()
+            .any(|key| table.contains_key(*key))
+        {
+            bail!("parse config {}: these keys moved to [remote] in Phase 2 — see docs/config-migration.md", path.display());
+        }
+        let mut config: Self = table
+            .clone()
+            .try_into()
+            .with_context(|| format!("parse config {}", path.display()))?;
+        // All current fields serialize, including PunctEnabled::Auto as "auto".
+        // Keep this schema fixture populated if optional or skipped fields are added.
+        let known = toml::Table::try_from(Self::default())?;
+        let mut warnings = Vec::new();
+        fn diff(
+            input: &toml::Table,
+            known: &toml::Table,
+            prefix: &str,
+            warnings: &mut Vec<String>,
+        ) {
+            for (key, value) in input {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                match known.get(key) {
+                    None => warnings.push(
+                        if matches!(
+                            path.as_str(),
+                            "long_key" | "long_hotkey" | "auto_long_ms" | "asr.blank_penalty"
+                        ) {
+                            format!("config key {path} is retired and ignored")
+                        } else {
+                            format!("unknown config key {path} is ignored")
+                        },
+                    ),
+                    Some(toml::Value::Table(expected)) => {
+                        if let toml::Value::Table(actual) = value {
+                            diff(actual, expected, &path, warnings);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        if !table.contains_key("long_hotkey") && chords_match(&config.hotkey, &config.long_hotkey) {
-            config.long_hotkey = "Ctrl+Alt+Space".into();
+        diff(&table, &known, "", &mut warnings);
+        if table.get("engine").and_then(toml::Value::as_str) == Some("whisper") {
+            warnings.push("Whisper was removed; the local engine is used".into());
         }
         config.expand_paths();
-        Ok(config)
+        Ok((config, warnings))
     }
 
     /// Validates configuration values against supported ranges and capabilities.
@@ -475,9 +494,6 @@ impl Config {
         if self.engine == EngineKind::Remote && !caps.remote_engine {
             bail!("engine = \"remote\" requires a build with the remote-engine feature");
         }
-        if self.engine == EngineKind::Whisper {
-            bail!("engine = \"whisper\" is no longer supported; use long_key = true");
-        }
         if self.remote.spawn_sidecar {
             let (host, _) = sidecar_endpoint(&self.remote.ws_url)?;
             let loopback = host == "localhost"
@@ -491,18 +507,11 @@ impl Config {
         Ok(())
     }
 
-    /// Returns whether the long key is enabled and supported.
-    pub fn long_key_effective(&self, caps: Capabilities) -> bool {
-        self.long_key && caps.long_key
-    }
-
     /// Returns whether engine punctuation is retained instead of running local punctuation.
-    /// Whisper punctuation is stripped before the shared local punctuator runs.
     pub fn engine_punctuates(&self, engine: EngineKind, applied_asr_model: AsrModel) -> bool {
         match engine {
             EngineKind::Remote => self.remote.server_punctuates,
             EngineKind::Local => applied_asr_model == AsrModel::Haas,
-            EngineKind::Whisper => false,
         }
     }
 
@@ -537,10 +546,9 @@ pub fn postprocess_settings(
     crate::postprocess::PostprocessSettings {
         punct_enabled: punct_effective(config, caps, engine, applied_asr_model),
         strip_trailing_period: config.strip_trailing_period,
-        strip_engine_punct: engine == EngineKind::Whisper
-            || (engine == EngineKind::Local
-                && applied_asr_model == AsrModel::Haas
-                && !config.punct.effective(caps)),
+        strip_engine_punct: engine == EngineKind::Local
+            && applied_asr_model == AsrModel::Haas
+            && !config.punct.effective(caps),
     }
 }
 
@@ -683,7 +691,6 @@ mod tests {
             let caps = Capabilities {
                 punct: capability,
                 remote_engine: true,
-                long_key: true,
             };
             assert!(config.engine_punctuates(EngineKind::Local, AsrModel::Haas));
             assert!(!punct_effective(
@@ -735,7 +742,6 @@ mod tests {
                     .validate(Capabilities {
                         punct: true,
                         remote_engine: true,
-                        long_key: true
                     })
                     .unwrap_err()
                     .to_string(),
@@ -750,7 +756,6 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: true,
         };
         for (choice, strip) in [
             (PunctEnabled::Off, false),
@@ -762,14 +767,13 @@ mod tests {
                 ..Config::default()
             };
             cfg.punct.enabled = choice;
-            for engine in [EngineKind::Local, EngineKind::Whisper, EngineKind::Remote] {
-                let whisper = engine == EngineKind::Whisper;
+            for engine in [EngineKind::Local, EngineKind::Remote] {
                 assert_eq!(
                     postprocess_settings(&cfg, caps, engine, AsrModel::ReazonSpeech),
                     PostprocessSettings {
                         punct_enabled: engine != EngineKind::Remote && choice != PunctEnabled::Off,
                         strip_trailing_period: strip,
-                        strip_engine_punct: whisper,
+                        strip_engine_punct: false,
                     }
                 );
             }
@@ -780,23 +784,6 @@ mod tests {
                 choice != PunctEnabled::Off
             );
         }
-        let cfg = Config::default();
-        assert!(
-            postprocess_settings(&cfg, caps, EngineKind::Whisper, AsrModel::ReazonSpeech)
-                .strip_engine_punct
-        );
-        let no_punct = Capabilities {
-            punct: false,
-            ..caps
-        };
-        let settings =
-            postprocess_settings(&cfg, no_punct, EngineKind::Whisper, AsrModel::ReazonSpeech);
-        assert!(settings.strip_engine_punct);
-        assert!(!settings.punct_enabled);
-        assert!(
-            postprocess_settings(&cfg, caps, EngineKind::Local, AsrModel::ReazonSpeech)
-                .punct_enabled
-        );
     }
 
     fn write(temp: &tempfile::TempDir, body: &str) -> PathBuf {
@@ -837,97 +824,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_long_hotkey_uses_upgrade_safe_default() {
-        let temp = tempfile::tempdir().unwrap();
-        for chord in ["Alt+Shift+Space", "Shift+Option+Space"] {
-            let raw = format!("hotkey = {chord:?}\n");
-            let path = write(&temp, &raw);
-            let cfg = Config::load(Some(&path)).unwrap();
-            assert_eq!(cfg.long_hotkey, "Ctrl+Alt+Space");
-            cfg.validate(Capabilities {
-                punct: true,
-                remote_engine: true,
-                long_key: true,
-            })
-            .unwrap();
-            assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
-        }
-    }
-
-    #[test]
-    fn explicit_duplicate_long_hotkey_is_not_migrated() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = write(
-            &temp,
-            "hotkey = \"Alt+Shift+Space\"\nlong_hotkey = \"Alt+Shift+Space\"\n",
-        );
-        let cfg = Config::load(Some(&path)).unwrap();
-        assert_eq!(cfg.long_hotkey, "Alt+Shift+Space");
-        cfg.validate(Capabilities {
-            punct: true,
-            remote_engine: true,
-            long_key: false,
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn long_key_defaults_off_with_alt_shift_space() {
-        let cfg = Config::default();
-        assert!(!cfg.long_key);
-        assert_eq!(cfg.long_hotkey, "Alt+Shift+Space");
-    }
-
-    #[test]
-    fn legacy_whisper_without_long_key_migrates_on() {
+    fn legacy_whisper_maps_to_local() {
         let temp = tempfile::tempdir().unwrap();
         let raw = "engine = \"whisper\"\n";
         let path = write(&temp, raw);
         let cfg = Config::load(Some(&path)).unwrap();
         assert_eq!(cfg.engine, EngineKind::Local);
-        assert!(cfg.long_key);
+        assert!(toml::to_string(&cfg)
+            .unwrap()
+            .contains("engine = \"local\""));
         assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
-    }
-
-    #[test]
-    fn legacy_whisper_with_long_key_false_stays_off() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = write(&temp, "engine = \"whisper\"\nlong_key = false\n");
-        let cfg = Config::load(Some(&path)).unwrap();
-        assert_eq!(cfg.engine, EngineKind::Local);
-        assert!(!cfg.long_key);
-    }
-
-    #[test]
-    fn validate_accepts_retired_long_hotkey_equal_to_hotkey() {
-        // No build can use the long key any more, so a stale `long_hotkey` must never make an
-        // otherwise valid config unusable.
-        let cfg = Config {
-            long_hotkey: "  alt+SPACE  ".into(),
-            ..Config::default()
-        };
-        let caps = Capabilities {
-            punct: true,
-            remote_engine: true,
-            long_key: false,
-        };
-        cfg.validate(caps).unwrap();
-    }
-
-    #[test]
-    fn long_key_effective_requires_capability() {
-        let mut cfg = Config::default();
-        for enabled in [false, true] {
-            cfg.long_key = enabled;
-            for available in [false, true] {
-                let caps = Capabilities {
-                    punct: true,
-                    remote_engine: true,
-                    long_key: available,
-                };
-                assert_eq!(cfg.long_key_effective(caps), enabled && available);
-            }
-        }
     }
 
     #[test]
@@ -963,18 +869,6 @@ mod tests {
             .transcript_dir
             .ends_with(".config/kikigaki/transcripts"));
         assert!(default_path().ends_with(".config/kikigaki/config.toml"));
-    }
-
-    #[test]
-    fn engine_kind_whisper_round_trips_through_toml() {
-        let cfg = Config {
-            engine: EngineKind::Whisper,
-            ..Config::default()
-        };
-        let actual: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(actual.engine, EngineKind::Whisper);
-        let raw = toml::to_string(&cfg).unwrap();
-        assert!(raw.contains("engine = \"whisper\""), "{raw}");
     }
 
     #[test]
@@ -1038,7 +932,6 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: false,
         };
         for hotwords_score in [0.0, f32::INFINITY, f32::NAN, -1.0] {
             let mut config = Config::default();
@@ -1097,7 +990,6 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -1106,7 +998,6 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -1115,7 +1006,6 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .is_err());
         let cfg = Config {
@@ -1126,7 +1016,6 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .is_err());
         let mut cfg = Config::default();
@@ -1135,14 +1024,12 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .is_err());
         assert!(Config::default()
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
-                long_key: false,
             })
             .is_ok());
     }
@@ -1155,7 +1042,6 @@ mod tests {
             .validate(Capabilities {
                 punct: false,
                 remote_engine: true,
-                long_key: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("punct"));
@@ -1163,7 +1049,6 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .is_ok());
     }
@@ -1178,7 +1063,6 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: false,
-                long_key: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("remote-engine"));
@@ -1186,32 +1070,8 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_whisper_as_standard_engine_even_with_the_feature() {
-        let cfg = Config {
-            engine: EngineKind::Whisper,
-            ..Config::default()
-        };
-        let error = cfg
-            .validate(Capabilities {
-                punct: true,
-                remote_engine: true,
-                long_key: false,
-            })
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("whisper"));
-        assert!(cfg
-            .validate(Capabilities {
-                punct: true,
-                remote_engine: true,
-                long_key: false,
-            })
-            .is_err());
     }
 
     #[test]
@@ -1222,7 +1082,6 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .unwrap_err();
         assert!(format!("{error:#}").contains("loopback"));
@@ -1237,7 +1096,6 @@ mod tests {
                 cfg.validate(Capabilities {
                     punct: true,
                     remote_engine: true,
-                    long_key: false,
                 })
                 .is_ok(),
                 "{url}"
@@ -1250,7 +1108,6 @@ mod tests {
             .validate(Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             })
             .is_ok());
     }
@@ -1261,18 +1118,15 @@ mod tests {
         assert!(cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: false,
         }));
         assert!(!cfg.punct.effective(Capabilities {
             punct: false,
             remote_engine: true,
-            long_key: false,
         }));
         cfg.punct.enabled = PunctEnabled::Off;
         assert!(!cfg.punct.effective(Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: false,
         }));
 
         cfg.punct.enabled = PunctEnabled::On;
@@ -1283,7 +1137,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
             cfg.engine,
             AsrModel::ReazonSpeech
@@ -1294,35 +1147,7 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
-            cfg.engine,
-            AsrModel::ReazonSpeech
-        ));
-    }
-
-    #[test]
-    fn whisper_engine_uses_local_punctuation_choice() {
-        let caps = Capabilities {
-            punct: true,
-            remote_engine: true,
-            long_key: false,
-        };
-        let mut cfg = Config {
-            engine: EngineKind::Whisper,
-            ..Config::default()
-        };
-        cfg.punct.enabled = PunctEnabled::On;
-        assert!(punct_effective(
-            &cfg,
-            caps,
-            cfg.engine,
-            AsrModel::ReazonSpeech
-        ));
-        cfg.punct.enabled = PunctEnabled::Off;
-        assert!(!punct_effective(
-            &cfg,
-            caps,
             cfg.engine,
             AsrModel::ReazonSpeech
         ));
@@ -1341,10 +1166,15 @@ mod tests {
     #[test]
     fn unknown_field_without_legacy_keys_has_no_hint() {
         let temp = tempfile::tempdir().unwrap();
-        let path = write(&temp, "stip_trailing_period = false\n");
-        let text = format!("{:#}", Config::load(Some(&path)).unwrap_err());
-        assert!(text.contains("stip_trailing_period"));
-        assert!(!text.contains("[remote]"));
+        let path = write(&temp, "stip_trailing_period = false\n[vad]\nfoo = 1\n");
+        let (_, warnings) = Config::load_with_warnings(Some(&path)).unwrap();
+        assert_eq!(
+            warnings,
+            [
+                "unknown config key stip_trailing_period is ignored",
+                "unknown config key vad.foo is ignored"
+            ]
+        );
     }
 
     #[test]
@@ -1354,5 +1184,46 @@ mod tests {
             Config::load(Some(&temp.path().join("nope.toml"))).unwrap(),
             Config::default()
         );
+    }
+    #[test]
+    fn compatibility_warnings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(&temp, "hotkey = \"Shift+Space\"\nstrip_trailing_period = true\nbuiltin_replace_dict = true\nengine = \"local\"\ntranscript_log = true\nlong_key = true\n[punct]\nenabled = true\n");
+        let (cfg, warnings) = Config::load_with_warnings(Some(&path)).unwrap();
+        assert_eq!(cfg.engine, EngineKind::Local);
+        assert_eq!(warnings, ["config key long_key is retired and ignored"]);
+        let path = write(&temp, "engine = \"whisper\"\nlong_key = true\nlong_hotkey = \"Ctrl+Alt+Space\"\nauto_long_ms = 900\n[asr]\nblank_penalty = 1.5\n");
+        let (cfg, warnings) = Config::load_with_warnings(Some(&path)).unwrap();
+        assert_eq!(cfg.engine, EngineKind::Local);
+        assert_eq!(warnings.len(), 5);
+        for key in [
+            "long_key",
+            "long_hotkey",
+            "auto_long_ms",
+            "asr.blank_penalty",
+        ] {
+            assert!(warnings.contains(&format!("config key {key} is retired and ignored")));
+        }
+        assert!(warnings.iter().any(|w| w.contains("Whisper was removed")));
+        let path = write(&temp, "hotkey = 3");
+        assert!(Config::load_with_warnings(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn documented_keys_have_no_warnings() {
+        let doc = include_str!("../../../docs/configuration.md");
+        let sample = doc
+            .split("```toml\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = write(&temp, sample);
+        assert!(Config::load_with_warnings(Some(&path))
+            .unwrap()
+            .1
+            .is_empty());
     }
 }

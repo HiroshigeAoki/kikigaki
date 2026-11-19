@@ -89,7 +89,7 @@ pub struct PostprocessSettings {
     pub punct_enabled: bool,
     /// Whether to remove one trailing Japanese or ASCII period.
     pub strip_trailing_period: bool,
-    /// Whether to strip Whisper punctuation and whitespace outside ASCII words
+    /// Whether to strip engine-generated punctuation and whitespace outside ASCII words
     /// after normalization and replacement, before local punctuation.
     pub strip_engine_punct: bool,
 }

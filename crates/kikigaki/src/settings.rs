@@ -50,7 +50,10 @@ pub struct SettingsCoordinator {
 impl SettingsCoordinator {
     pub fn load(path: PathBuf, capabilities: Capabilities) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut config = Config::load(Some(&path))?;
+        let (mut config, warnings) = Config::load_with_warnings(Some(&path))?;
+        for warning in warnings {
+            tracing::warn!("{warning}");
+        }
         let document: toml_edit::DocumentMut = raw.parse()?;
         let explicit = document
             .get("asr")
@@ -274,7 +277,6 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: true,
         };
         let coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
         (temp, path, coordinator, caps)
@@ -291,7 +293,7 @@ mod tests {
             r#"long_key = true # enabled comment"#,
             "\n",
             r#"long_hotkey = "Ctrl+Alt+Space" # chord comment"#,
-            "\n"
+            "\nauto_long_ms = 900 # timeout comment\nunknown_setting = true # unknown comment\n[asr] # model comment\nmodel = \"haas\" # selected model\n"
         );
         std::fs::write(&path, raw).unwrap();
         let mut coordinator = SettingsCoordinator::load(
@@ -299,18 +301,19 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
         coordinator
             .apply(SettingsPatch {
-                punctuation: Some(PunctSetting::Off),
+                strip_trailing_period: Some(false),
                 ..SettingsPatch::default()
             })
             .unwrap();
-        assert!(std::fs::read_to_string(path).unwrap().starts_with(raw));
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert_eq!(saved.replace("strip_trailing_period = false\n", ""), raw);
+        assert_eq!(coordinator.config().asr.model, AsrModel::Haas);
     }
 
     #[test]
@@ -348,7 +351,6 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: false,
-            long_key: false,
         };
         for reazon in [false, true] {
             for haas in [false, true] {
@@ -441,7 +443,6 @@ mod tests {
             let caps = Capabilities {
                 punct: true,
                 remote_engine: false,
-                long_key: false,
             };
             let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
             let before = coordinator.snapshot();
@@ -492,7 +493,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: false,
-                long_key: false,
             },
         )
         .unwrap();
@@ -517,7 +517,6 @@ mod tests {
             let caps = Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: true,
             };
             let mut settings = SettingsCoordinator::load(path, caps).unwrap();
             assert_eq!(settings.applied_asr_model(), model);
@@ -553,7 +552,6 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: true,
         };
         let mut coordinator = SettingsCoordinator::load(path.clone(), caps).unwrap();
         coordinator
@@ -624,7 +622,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -691,7 +688,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -721,7 +717,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -751,7 +746,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -777,7 +771,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -805,7 +798,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -832,7 +824,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -869,7 +860,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -887,7 +877,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -911,7 +900,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();
@@ -942,7 +930,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         )
         .unwrap();

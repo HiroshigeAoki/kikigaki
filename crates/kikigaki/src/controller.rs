@@ -1,6 +1,6 @@
 //! Tauri-free push-to-talk controller and its injected platform ports.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -422,12 +422,6 @@ fn run(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Owner {
-    key: HotkeyKey,
-    engine: EngineKind,
-}
-
 const PASTE_FAILED_NOTICE: &str = "文字を貼り付けられません";
 const PASTE_FAILED_DETAIL: &str =
     "システム設定 › プライバシーとセキュリティ › アクセシビリティ で kikigaki を許可してください";
@@ -463,7 +457,7 @@ struct Controller {
     startup_cold: bool,
     first_ready: bool,
     pending_finals: VecDeque<(u64, String, String)>,
-    owners: HashMap<u64, Owner>,
+    owners: HashSet<u64>,
     // Tombstones protect this turn; after pruning, a missing owner rejects later finals.
     retired: HashSet<u64>,
     active: Option<u64>,
@@ -565,7 +559,7 @@ impl Controller {
             startup_cold: false,
             first_ready: true,
             pending_finals: VecDeque::new(),
-            owners: HashMap::new(),
+            owners: HashSet::new(),
             retired: HashSet::new(),
             active: None,
             hotwords_desired: hotwords_enabled,
@@ -745,20 +739,11 @@ impl Controller {
     }
 
     fn handle_hotkey_edge(&mut self, edge: HotkeyEdge, outputs: &mut Vec<Output>) {
-        let (key, pressed) = match edge {
-            HotkeyEdge::Pressed(key) => (key, true),
-            HotkeyEdge::Released(key) => (key, false),
-        };
-        let active_owner = self.active.and_then(|gen| self.owners.get(&gen)).copied();
-        if !pressed && active_owner.is_none_or(|owner| owner.key != key) {
+        let pressed = matches!(edge, HotkeyEdge::Pressed(_));
+        if !pressed && self.active.is_none_or(|gen| !self.owners.contains(&gen)) {
             return;
         }
-        let Some(input) = hotkey_input(
-            edge,
-            self.window_focused,
-            self.capturing_hotkey,
-            self.standard_engine,
-        ) else {
+        let Some(input) = hotkey_input(edge, self.window_focused, self.capturing_hotkey) else {
             return;
         };
         self.dirty = true;
@@ -768,13 +753,7 @@ impl Controller {
             match output {
                 Output::Cancel { gen } => self.retire_generation(*gen),
                 Output::Begin { gen } => {
-                    self.owners.insert(
-                        *gen,
-                        Owner {
-                            key,
-                            engine: self.standard_engine,
-                        },
-                    );
+                    self.owners.insert(*gen);
                     self.active = Some(*gen);
                 }
                 _ => {}
@@ -796,29 +775,15 @@ impl Controller {
         }
     }
 
-    fn owner_engine(&self, gen: u64) -> EngineKind {
-        self.owners.get(&gen).map_or_else(
-            || {
-                tracing::warn!(gen, "missing utterance owner; using standard engine");
-                self.standard_engine
-            },
-            |owner| owner.engine,
-        )
-    }
-
-    fn submit_final(&self, engine: EngineKind, message: EngineMsg) {
+    fn submit_final(&self, message: EngineMsg) {
         let EngineMsg::Final { gen, .. } = &message else {
             return;
         };
         let gen = *gen;
-        let Some(owner) = self
-            .owners
-            .get(&gen)
-            .filter(|owner| owner.engine == engine && !self.retired.contains(&gen))
-        else {
-            tracing::debug!(gen, ?engine, "dropping final without a live matching owner");
+        if !self.owners.contains(&gen) || self.retired.contains(&gen) {
+            tracing::debug!(gen, "dropping final without a live owner");
             return;
-        };
+        }
         if let Some(worker) = &self.postprocess {
             let result = worker.submit(
                 gen,
@@ -826,7 +791,7 @@ impl Controller {
                 postprocess_settings(
                     self.settings.config(),
                     self.capabilities,
-                    owner.engine,
+                    self.standard_engine,
                     self.settings.applied_asr_model(),
                 ),
             );
@@ -1040,7 +1005,7 @@ impl Controller {
                 break;
             };
             self.dirty = true;
-            if self.retired.contains(&processed.gen) || !self.owners.contains_key(&processed.gen) {
+            if self.retired.contains(&processed.gen) || !self.owners.contains(&processed.gen) {
                 continue;
             }
             let final_outputs = self.session.handle(
@@ -1103,7 +1068,7 @@ impl Controller {
                     Input::Engine(Event::Ready { sr: SAMPLE_RATE })
                 }
                 message @ EngineMsg::Final { .. } => {
-                    self.submit_final(self.standard_engine, message);
+                    self.submit_final(message);
                     continue;
                 }
                 EngineMsg::Disconnected {
@@ -1205,7 +1170,7 @@ impl Controller {
                                 crate::transcript::enqueue(
                                     self.settings.config().transcript_log,
                                     self.settings.config().transcript_dir.clone(),
-                                    self.owner_engine(gen).as_str(),
+                                    self.standard_engine.as_str(),
                                     raw.clone(),
                                     text.clone(),
                                     at,
@@ -1249,7 +1214,7 @@ impl Controller {
                 }
                 Output::Record(mut row) => {
                     row.ts = metric_timestamp();
-                    row.engine = Some(self.owner_engine(row.gen).as_str().into());
+                    row.engine = Some(self.standard_engine.as_str().into());
                     if !self.generation_is_in_progress(row.gen) {
                         self.retire_generation(row.gen);
                     }
@@ -1280,8 +1245,8 @@ impl Controller {
                 }
             }
         }
-        // Record and transcript enqueue above must still see owners retired during this drain.
-        self.owners.retain(|gen, _| !self.retired.contains(gen));
+        // Prune retired generations after the output drain.
+        self.owners.retain(|gen| !self.retired.contains(gen));
         self.retired.clear();
     }
 
@@ -1384,16 +1349,11 @@ impl Controller {
     }
 }
 
-fn hotkey_input(
-    edge: HotkeyEdge,
-    window_focused: bool,
-    capturing_hotkey: bool,
-    engine: EngineKind,
-) -> Option<Input> {
+fn hotkey_input(edge: HotkeyEdge, window_focused: bool, capturing_hotkey: bool) -> Option<Input> {
     match edge {
         HotkeyEdge::Pressed(_) if window_focused || capturing_hotkey => None,
         HotkeyEdge::Pressed(_) => Some(Input::Pressed),
-        HotkeyEdge::Released(_) => Some(Input::Released { engine }),
+        HotkeyEdge::Released(_) => Some(Input::Released),
     }
 }
 
@@ -1527,14 +1487,14 @@ mod tests {
             HotkeyEdge::Pressed(HotkeyKey::Standard),
             HotkeyEdge::Released(HotkeyKey::Standard),
         ] {
-            assert!(hotkey_input(edge, false, false, EngineKind::Local).is_some());
+            assert!(hotkey_input(edge, false, false).is_some());
         }
     }
 
     #[test]
     fn factory_builds_the_requested_kind() {
         let factory = FakeEngineFactory::new(Arc::new(FakeEngineState::default()));
-        for kind in [EngineKind::Local, EngineKind::Remote, EngineKind::Whisper] {
+        for kind in [EngineKind::Local, EngineKind::Remote] {
             let mut engine = factory.build(kind).unwrap();
             assert!(matches!(engine.events().try_recv(), Ok(EngineMsg::Ready)));
             assert_eq!(factory.engine(kind).builds.load(Ordering::Relaxed), 1);
@@ -1746,7 +1706,6 @@ mod tests {
         Arc::new(Vec::from([
             (EngineKind::Local, Arc::new(FakeEngineState::default())),
             (EngineKind::Remote, Arc::new(FakeEngineState::default())),
-            (EngineKind::Whisper, Arc::new(FakeEngineState::default())),
         ]))
     }
 
@@ -1886,7 +1845,7 @@ mod tests {
             self.state.starts.fetch_add(1, Ordering::Relaxed);
             if self.state.enforce_install_lock.load(Ordering::Relaxed) {
                 if self.state.install_lock_held.swap(true, Ordering::Relaxed) {
-                    anyhow::bail!("another install in progress for whisper");
+                    anyhow::bail!("another install in progress for local");
                 }
                 self.owns_install_lock = true;
             }
@@ -2108,7 +2067,6 @@ mod tests {
         let capabilities = Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: true,
         };
         let settings = SettingsCoordinator::load(config_path, capabilities).unwrap();
         let (client, rx, hotkey, hotkey_rx) = client_channels();
@@ -2209,7 +2167,6 @@ mod tests {
             let capabilities = Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             };
             let settings = SettingsCoordinator::load(path, capabilities).unwrap();
             let engines = engine_states();
@@ -2429,7 +2386,7 @@ mod tests {
                     assert_eq!(h.controller.session.state(), State::Recording);
                     assert_eq!(h.controller.active, Some(1));
                     assert!(!h.controller.retired.contains(&1));
-                    assert_eq!(h.controller.owners[&1].engine, EngineKind::Local);
+                    assert!(h.controller.owners.contains(&1));
                     assert_eq!(transcripts_with_count(&h, index + 1).len(), index + 1);
                 }
                 edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Standard)]);
@@ -2565,7 +2522,7 @@ mod tests {
                 );
                 assert_eq!(*h.engine(EngineKind::Local).canceled.lock().unwrap(), [1]);
                 assert_eq!(h.controller.active, Some(2));
-                assert!(!h.controller.owners.contains_key(&1));
+                assert!(!h.controller.owners.contains(&1));
                 edges(&mut h, [HotkeyEdge::Released(HotkeyKey::Standard)]);
                 finish(&mut h, &rx, EngineKind::Local, 2, "new utterance");
                 assert_eq!(
@@ -2706,11 +2663,11 @@ mod tests {
         }
 
         #[test]
-        fn final_from_non_owner_supervisor_is_dropped() {
+        fn final_without_owner_is_dropped() {
             let (mut h, _) = ready();
             utterance(&mut h, HotkeyKey::Standard);
             h.controller
-                .submit_final(EngineKind::Remote, final_message(1, "wrong engine"));
+                .submit_final(final_message(999, "missing owner"));
             assert_no_submission(&mut h);
             assert_eq!(h.controller.session.state(), State::Finalizing);
         }
@@ -2965,19 +2922,9 @@ mod tests {
                         ..SettingsPatch::default()
                     })
                     .unwrap();
-                for (gen, engine, text) in [
-                    (10, EngineKind::Local, "甲、乙"),
-                    (11, EngineKind::Local, "甲、乙"),
-                    (12, EngineKind::Local, "甲、乙"),
-                ] {
-                    h.controller.owners.insert(
-                        gen,
-                        Owner {
-                            key: HotkeyKey::Standard,
-                            engine,
-                        },
-                    );
-                    h.controller.submit_final(engine, final_message(gen, text));
+                for (gen, text) in [(10, "甲、乙"), (11, "甲、乙"), (12, "甲、乙")] {
+                    h.controller.owners.insert(gen);
+                    h.controller.submit_final(final_message(gen, text));
                 }
                 let deadline = Instant::now() + Duration::from_secs(1);
                 let mut texts = Vec::new();
@@ -3025,10 +2972,6 @@ mod tests {
         assert_eq!(
             h.engine(EngineKind::Local).builds.load(Ordering::Relaxed),
             2
-        );
-        assert_eq!(
-            h.engine(EngineKind::Whisper).builds.load(Ordering::Relaxed),
-            0
         );
         assert_eq!(
             *h.engine(EngineKind::Local).observed_enabled.lock().unwrap(),
@@ -3898,23 +3841,12 @@ mod tests {
         });
         let now = Instant::now();
         session.handle(Input::Engine(Event::Ready { sr: SAMPLE_RATE }), now);
-        let pressed = hotkey_input(
-            HotkeyEdge::Pressed(HotkeyKey::Standard),
-            false,
-            false,
-            EngineKind::Local,
-        )
-        .unwrap();
+        let pressed = hotkey_input(HotkeyEdge::Pressed(HotkeyKey::Standard), false, false).unwrap();
         session.handle(pressed, now);
         assert_eq!(session.state(), State::Recording);
 
-        let released = hotkey_input(
-            HotkeyEdge::Released(HotkeyKey::Standard),
-            false,
-            true,
-            EngineKind::Local,
-        )
-        .unwrap();
+        let released =
+            hotkey_input(HotkeyEdge::Released(HotkeyKey::Standard), false, true).unwrap();
         session.handle(released, now + Duration::from_millis(1));
         assert_eq!(session.state(), State::Finalizing);
         session.handle(
@@ -4135,7 +4067,10 @@ mod tests {
         assert_eq!(snapshot.hotkey, "Alt+Shift+Space");
         // The file still carries the retired key with the same chord; the next launch validates it.
         let reloaded = Config::load(Some(&path)).unwrap();
-        assert_eq!(reloaded.long_hotkey, "Alt+Shift+Space");
+        assert_eq!(reloaded.engine, EngineKind::Local);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("long_hotkey = \"Alt+Shift+Space\""));
         reloaded.validate(capabilities).unwrap();
     }
 

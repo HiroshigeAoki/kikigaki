@@ -1,4 +1,4 @@
-/// Removes Whisper's Japanese punctuation and question marks, then removes whitespace
+/// Removes engine-generated Japanese punctuation and question marks, then removes whitespace
 /// unless both neighbouring characters are ASCII (so English phrases keep their spaces
 /// while spaces next to Japanese text go). Preserved whitespace runs remain unchanged.
 pub fn strip_whisper_punct(s: &str) -> String {

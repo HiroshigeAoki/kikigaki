@@ -7,8 +7,6 @@
 ```toml
 engine = "local"
 hotkey = "Alt+Space"
-long_key = false
-long_hotkey = "Alt+Shift+Space"
 paste_method = "clipboard"
 strip_trailing_period = true
 silence_pad_ms = 500
@@ -48,11 +46,17 @@ server_punctuates = true
 
 `punct.enabled` は `"auto"` / `true` / `false` を取り、`"auto"` は句読点サポート付きビルドでのみ有効になる。
 
-## 長文キー
+## 廃止した設定と不明な項目
 
-`long_key` は真偽値で、既定値は `false`。`true` にするとWhisperによる長文キーを有効にする。設定画面の「長文キー（高精度）を使う」と同じ項目で、Apple Silicon搭載Macのビルドでのみ働く。`long_hotkey` は長文キーの組み合わせで、`hotkey` と同じ組み合わせは指定できない。`long_hotkey` が未設定で `hotkey` がすでに `Alt+Shift+Space` の場合、長文キーの既定値は `Ctrl+Alt+Space` になる。この値は、設定画面で項目を変更したときにファイルへ書き込まれる。
+`long_key`、`long_hotkey`、`auto_long_ms`、`[asr]`の`blank_penalty`は無視する。アプリはログに警告を出す。古い版でも設定ファイルを読めるよう、これらの項目を書き換えたり削除したりしない。
 
-以前の版で `engine = "whisper"` を設定していた場合、起動時に `engine = "local"` と `long_key = true` として読み込む。設定画面で項目を変更すると、この値がファイルにも書き戻される。`engine` に指定できるのは `"local"` と `"remote"` のみ。
+`engine = "whisper"`は`engine = "local"`として読み込み、警告を出す。`engine`に指定できるのは`"local"`と`"remote"`である。
+
+不明な項目は名前を含む警告を出して無視する。既知の項目で型が違う場合はエラーとなり、アプリに設定エラーを表示する。旧版のトップレベルのリモート設定項目(`ws_url`、`hayamimi_dir`、`python`、`spawn_sidecar`、`extra_args`、`connect_timeout_ms`)も引き続きエラーとなる。これらは`[remote]`へ移す。
+
+ダウンロード済みのWhisperモデルはアプリでは削除しない。約874MBで、保存先は`<models_dir>/whisper-large-v3-turbo-q8_0/`である。macOSの既定の保存先は`~/Library/Application Support/kikigaki/models/whisper-large-v3-turbo-q8_0/`となる。古い版を使わなくなったら手動で削除できる。
+
+古い版が保存した`<models_dir>/hotwords/bpe.vocab`も使わない。現在は`hotwords/<model-id>/bpe.vocab`を使うため、旧ファイルは削除できる。
 
 ## 旧設定からの移行
 
@@ -70,6 +74,6 @@ server_punctuates = true
 
 `asr.haas_hotwords_score` は、Haas使用時に `asr.hotwords_score` の代わりに使う認識バイアスの強さで、既定値は `1.5`。
 
-動作だけを元に戻す場合は、`builtin_replace_dict = false` に設定するか、設定画面のトグルをオフにする。古いkikigakiバイナリへダウングレードする場合は、`builtin_replace_dict`、`asr.hotwords_score`、`asr.model`、`asr.haas_hotwords_score` の行を削除すること。設定スキーマは未知の項目を拒否するため、未対応の行を残したままダウングレードすると起動できない。
+動作だけを元に戻す場合は、`builtin_replace_dict = false` に設定するか、設定画面のトグルをオフにする。古いkikigakiバイナリへダウングレードする場合は、`builtin_replace_dict`、`asr.hotwords_score`、`asr.model`、`asr.haas_hotwords_score` の行を削除すること。古い版は未知の項目を拒否するため、未対応の行を残したままダウングレードすると起動できない。
 
 メンテナ向け: 生成する `bpe.vocab` のSHA-256固定値は、`ASR_MODEL_ID` が示すモデルの `tokens.txt` に対応している。ASRモデルを更新するときは固定値を更新し、ホットワード評価ハーネスを再実行すること。

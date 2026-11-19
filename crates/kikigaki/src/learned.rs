@@ -31,6 +31,7 @@ fn to_core_rules(rules: &[LearnedRule]) -> Vec<Rule> {
         .map(|rule| Rule {
             from: rule.from.clone(),
             to: rule.to.clone(),
+            whole_word: false,
         })
         .collect()
 }

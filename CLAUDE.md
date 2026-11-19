@@ -45,6 +45,8 @@ Development happens on Linux; macOS builds run on a separate build Mac over SSH.
 - `scripts/hotword-eval/` — offline hotword-biasing evaluation tooling (list
   generator, synthesized bbpe vocab, Mac TTS audio, `hotword-eval` bin, scorer);
   self-tests run in `check.sh`. See `docs/plans/2026-09-01-hotword-eval.md`.
+- `scripts/transcript-terms/` — mine private dictation tokens, approve user terms, build
+  replacement rules, and summarize replay hits.
 
 ## Conventions
 

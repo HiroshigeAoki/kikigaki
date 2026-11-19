@@ -65,6 +65,13 @@ else
   echo "SKIP: python3 is unavailable; hotword evaluation self-tests not run"
 fi
 
+echo "== transcript term tool self-tests =="
+if command -v python3 >/dev/null 2>&1; then
+  python3 scripts/transcript-terms/terms.py --self-test
+else
+  echo "SKIP: python3 is unavailable; transcript term tool self-tests not run"
+fi
+
 echo "== icon assets =="
 if command -v uv >/dev/null 2>&1; then
   uv run scripts/icons/make_icons.py --self-test

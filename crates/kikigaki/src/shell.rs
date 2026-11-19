@@ -240,7 +240,6 @@ fn start_controller(
         local_asr_cfg: cfg.asr.clone(),
         local_vad_cfg: cfg.vad.clone(),
         hotwords_enabled: AtomicBool::new(cfg.builtin_replace_dict),
-        hotwords_score: cfg.asr.active_hotwords_score(),
         remote_cfg: cfg.remote.clone(),
     });
     let builtin = match kikigaki_core::replace::builtin_rules() {
@@ -397,7 +396,6 @@ struct TauriEngineFactory {
     local_asr_cfg: kikigaki_core::config::AsrConfig,
     local_vad_cfg: kikigaki_core::config::VadConfig,
     hotwords_enabled: AtomicBool,
-    hotwords_score: f32,
     #[cfg_attr(not(feature = "remote-engine"), allow(dead_code))]
     remote_cfg: kikigaki_core::config::RemoteConfig,
 }
@@ -410,11 +408,8 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
         match kind {
             kikigaki_core::config::EngineKind::Local => {
                 let enabled = self.hotwords_enabled.load(Ordering::Relaxed);
-                let hotwords_score = kikigaki_engine::hotwords::resolve_hotword_arg(
-                    enabled,
-                    self.hotwords_score,
-                    self.local_asr_cfg.decoding_method,
-                );
+                let hotwords_score =
+                    kikigaki_engine::hotwords::configured_hotword_arg(enabled, &self.local_asr_cfg);
                 if enabled && hotwords_score.is_none() {
                     tracing::warn!(
                         "hotword biasing requires modified_beam_search; continuing without hotwords"

@@ -168,9 +168,8 @@ pub fn build_recognizer_with_hotwords(
 fn create_recognizer(
     models_dir: &Path,
     spec: ModelSpec,
-    mut sherpa_config: OfflineRecognizerConfig,
+    sherpa_config: OfflineRecognizerConfig,
 ) -> anyhow::Result<SherpaAsr> {
-    sherpa_config.model_config.provider = Some(cpu_provider(models_dir));
     let path = models_dir.join(spec.id);
     let recognizer = OfflineRecognizer::create(&sherpa_config)
         .ok_or_else(|| anyhow!("failed to load {} from {}", spec.id, path.display()))?;
@@ -221,7 +220,7 @@ pub(crate) fn recognizer_config(
     sherpa_config.model_config.tokens = Some(path.join(spec.tokens).to_string_lossy().into_owned());
     sherpa_config.model_config.num_threads =
         i32::try_from(config.num_threads).context("ASR thread count exceeds sherpa-onnx range")?;
-    sherpa_config.model_config.provider = Some("cpu".into());
+    sherpa_config.model_config.provider = Some(cpu_provider(models_dir));
     sherpa_config.model_config.model_type = Some(spec.model_type.into());
     sherpa_config.model_config.modeling_unit = spec.modeling_unit.map(str::to_owned);
     sherpa_config.decoding_method = Some(config.decoding_method.as_sherpa_str().into());
@@ -285,6 +284,20 @@ impl Recognizer for SherpaAsr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_recognizers_use_no_spin_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        for model in [AsrModel::Haas, AsrModel::ReazonSpeech] {
+            let config = AsrConfig {
+                model,
+                ..AsrConfig::default()
+            };
+            let actual = recognizer_config(dir.path(), &config, None).unwrap();
+            assert_eq!(actual.model_config.provider, Some(cpu_provider(dir.path())));
+            assert_ne!(actual.model_config.provider.as_deref(), Some("cpu"));
+        }
+    }
 
     #[test]
     fn model_specs_and_haas_recognizer_fields() {
@@ -363,7 +376,10 @@ mod tests {
     #[test]
     fn recognizer_auto_without_hotwords_preserves_baseline_config() {
         let models_dir = Path::new("/models");
-        let config = AsrConfig::default();
+        let config = AsrConfig {
+            model: AsrModel::ReazonSpeech,
+            ..AsrConfig::default()
+        };
         let expected = recognizer_config(models_dir, &config, None).unwrap();
 
         let actual = crate::local::with_hotword_fallback(
@@ -388,7 +404,10 @@ mod tests {
         for score in [f32::NEG_INFINITY, -1.0, 0.0, f32::INFINITY, f32::NAN] {
             let error = build_recognizer_auto(
                 Path::new("/models-that-must-not-be-read"),
-                &AsrConfig::default(),
+                &AsrConfig {
+                    model: kikigaki_core::config::AsrModel::ReazonSpeech,
+                    ..AsrConfig::default()
+                },
                 Some(score),
             )
             .err()
@@ -404,7 +423,10 @@ mod tests {
     #[test]
     fn recognizer_config_preserves_existing_defaults() {
         let models_dir = Path::new("/models");
-        let config = AsrConfig::default();
+        let config = AsrConfig {
+            model: AsrModel::ReazonSpeech,
+            ..AsrConfig::default()
+        };
 
         let actual = recognizer_config(models_dir, &config, None).unwrap();
         let model_dir = models_dir.join(ASR_MODEL_ID);
@@ -466,7 +488,10 @@ mod tests {
 
         let actual = recognizer_config(
             Path::new("/models"),
-            &AsrConfig::default(),
+            &AsrConfig {
+                model: kikigaki_core::config::AsrModel::ReazonSpeech,
+                ..AsrConfig::default()
+            },
             Some((hotwords_file, 2.0, bpe_vocab)),
         )
         .unwrap();
@@ -520,6 +545,7 @@ mod tests {
     fn recognizer_config_rejects_thread_count_outside_sherpa_range() {
         let config = AsrConfig {
             num_threads: u32::MAX,
+            model: kikigaki_core::config::AsrModel::ReazonSpeech,
             ..AsrConfig::default()
         };
 

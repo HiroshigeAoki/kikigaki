@@ -582,7 +582,10 @@ mod tests {
     #[test]
     fn hotword_setup_failure_warns_and_selects_baseline_config() {
         let models_dir = std::path::Path::new("/models");
-        let asr = kikigaki_core::config::AsrConfig::default();
+        let asr = kikigaki_core::config::AsrConfig {
+            model: kikigaki_core::config::AsrModel::ReazonSpeech,
+            ..Default::default()
+        };
         let expected = crate::sherpa::recognizer_config(models_dir, &asr, None).unwrap();
 
         let (actual, warning) = crate::test_support::capture_warnings(|| {

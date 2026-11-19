@@ -43,15 +43,15 @@
   const LONG_PATH_ERROR = 'load whisper model /Users/yamada.taro/Library/Application Support/com.kikigaki.app/models/whisper-large-v3-turbo-q8_0/ggml-large-v3-turbo-q8_0.bin: Failed to create a new whisper context';
 
   const baseSettings = {
-    asr_model: 'reazonspeech',
-    asr_model_applied: 'reazonspeech',
+    asr_model: 'haas',
+    asr_model_applied: 'haas',
     hotkey: 'Ctrl+Space',
     long_key: true,
     long_hotkey: 'Ctrl+Shift+Space',
     long_state: { kind: 'ready' },
     punct_choice: 'on_strip',
     long_available: true,
-    punct_enabled: true,
+    punct_enabled: false,
     strip_trailing_period: true,
     builtin_replace_dict: true,
     transcript_log: false,
@@ -60,7 +60,7 @@
   };
   const baseStatus = {
     state: 'idle', level: 'ok', phase: 'ready', message: null,
-    hotkey: 'Ctrl+Space', punct_enabled: true, strip_trailing_period: true, long_hotkey: 'Ctrl+Shift+Space',
+    hotkey: 'Ctrl+Space', punct_enabled: false, strip_trailing_period: true, long_hotkey: 'Ctrl+Shift+Space',
   };
 
   function snap(over = {}) {
@@ -87,7 +87,7 @@
 
   const FIXTURES = {
     demo: snap(),
-    'haas-pending': snap({ settings: { asr_model: 'haas' } }),
+    'haas-pending': snap({ settings: { asr_model: 'haas', asr_model_applied: 'reazonspeech', punct_enabled: true } }),
     'haas-applied': snap({ settings: { asr_model: 'haas', asr_model_applied: 'haas' } }),
     worst: snap({
       settings: { ...WORST_HOTKEYS, long_state: { kind: 'failed', message: LONG_PATH_ERROR }, transcript_log: true },

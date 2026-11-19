@@ -2888,7 +2888,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "hotkey = \"Alt+Space\"\nengine = \"{engine_name}\"\nlong_key = {}\nstrip_trailing_period = false\nbuiltin_replace_dict = {builtin_replace_dict}\nreplace_file = {:?}\nlearned_file = {:?}\nmetrics_path = {:?}\nmodels_dir = {:?}\n[punct]\nenabled = {}\n",
+                "hotkey = \"Alt+Space\"\nengine = \"{engine_name}\"\nlong_key = {}\nstrip_trailing_period = false\nbuiltin_replace_dict = {builtin_replace_dict}\nreplace_file = {:?}\nlearned_file = {:?}\nmetrics_path = {:?}\nmodels_dir = {:?}\n[asr]\nmodel = \"reazonspeech\"\n[punct]\nenabled = {}\n",
                 boot_long.enabled, replace_file, learned_file, metrics_path, models_dir, punct,
             ),
         )
@@ -2999,7 +2999,7 @@ mod tests {
             let path = temp.path().join("config.toml");
             let replace_file = temp.path().join("replace.toml");
             std::fs::write(&replace_file, "").unwrap();
-            std::fs::write(&path, format!("long_key = {enabled}\nreplace_file = {:?}\nmetrics_path = {:?}\ntranscript_dir = {:?}\nlearned_file = {:?}\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"), temp.path().join("transcripts"), temp.path().join("learned.toml"))).unwrap();
+            std::fs::write(&path, format!("long_key = {enabled}\nreplace_file = {:?}\nmetrics_path = {:?}\ntranscript_dir = {:?}\nlearned_file = {:?}\n[asr]\nmodel = \"reazonspeech\"\n[punct]\nenabled = false\n", replace_file, temp.path().join("metrics.jsonl"), temp.path().join("transcripts"), temp.path().join("learned.toml"))).unwrap();
             let capabilities = Capabilities {
                 punct: true,
                 remote_engine: true,

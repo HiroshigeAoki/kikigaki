@@ -2,11 +2,11 @@
 
 # kikigaki
 
-日本語特化・完全ローカルのプッシュトゥトーク型音声入力アプリ(macOS)。
+日本語特化・完全ローカルのプッシュトゥトーク型音声入力アプリ(macOS/Windows)。
 
 Fast, private Japanese voice typing. 100% local and open source.
 
-`Alt+Space` を押しながら話し、キーを離すと認識結果が最前面のアプリにペーストされる。
+聞き取りキー(macOSでは `Alt+Space`、Windowsでは `Ctrl+Alt+Space`)を押しながら話し、キーを離すと認識結果が最前面のアプリにペーストされる。
 
 - 音声認識・発話区間検出・句読点付与をすべて端末内で実行
 - 既定ではモデルの初回ダウンロードを除きネットワークを使わない
@@ -23,21 +23,27 @@ Fast, private Japanese voice typing. 100% local and open source.
 xattr -d com.apple.quarantine /Applications/kikigaki.app
 ```
 
-初回起動時はオンボーディング画面が開き、マイク権限 → アクセシビリティ権限 → モデルのダウンロードの順に進む。ダウンロードするのはモデルデータのみで約548 MB(展開後は約183 MB)。ONNX Runtimeはアプリに同梱している。リリースは固定の自己署名IDで署名しているため、許可した権限はアップデート後も保持される。
+初回起動時はオンボーディング画面が開き、マイク権限 → アクセシビリティ権限 → モデルのダウンロードの順に進む。ダウンロードするのはモデルデータのみで約480 MB(HaasとSilero VAD)。ONNX Runtimeはアプリに同梱している。リリースは固定の自己署名IDで署名しているため、許可した権限はアップデート後も保持される。
+
+## インストール (Windows)
+
+[Releases](https://github.com/HiroshigeAoki/kikigaki/releases)から `kikigaki-<version>-windows-x64-setup.exe` をダウンロードして実行する。管理者権限は不要で、現在のユーザーのみにインストールされる。署名はしていないため、SmartScreenの警告が出た場合は「詳細情報」→「実行」で起動する。
+
+初回起動時はオンボーディング画面が開き、マイク権限の確認 → モデルのダウンロードの順に進む。アクセシビリティ権限の確認手順はない。ダウンロードするのはモデルデータのみで約480 MB(HaasとSilero VAD)。ONNX Runtimeはアプリに同梱している。ホットキーの既定は `Ctrl+Alt+Space`（`Alt+Space` はWindowsのシステムメニューやPowerToys Runと競合するため）。
 
 ## プライバシー
 
-音声認識(HaasまたはReazonSpeech)、発話区間検出(Silero VAD)、句読点付与(mojicast)は、すべて端末上で実行される。既定構成でネットワークを使うのはモデルの初回ダウンロードだけで、音声データや認識結果を外部サーバーへ送信しない。`remote-engine` 構成でも、既定では同一マシン上のローカルプロセス(`ws://127.0.0.1`)に接続する。
+音声認識(HaasまたはReazonSpeech)、発話区間検出(Silero VAD)、句読点付与は、すべて端末上で実行される。Haasは自身で句読点を出力し、mojicastの句読点モデルは使わない。ReazonSpeechではmojicastで句読点を付与する。既定構成でネットワークを使うのはモデルの初回ダウンロードだけで、音声データや認識結果を外部サーバーへ送信しない。`remote-engine` 構成でも、既定では同一マシン上のローカルプロセス(`ws://127.0.0.1`)に接続する。
 
 ## ファイルの場所
 
-| 項目 | パス |
-| --- | --- |
-| 設定 | `~/.config/kikigaki/config.toml` |
-| 置換辞書 | `~/.config/kikigaki/replace.toml` |
-| モデル | `~/Library/Application Support/kikigaki/models` |
-| ログ | `~/Library/Logs/kikigaki/kikigaki.<date>.log` |
-| レイテンシ計測 | `~/Library/Logs/kikigaki/latency.jsonl` |
+| 項目 | macOS | Windows |
+| --- | --- | --- |
+| 設定 | `~/.config/kikigaki/config.toml` | `%APPDATA%\kikigaki\config.toml` |
+| 置換辞書 | `~/.config/kikigaki/replace.toml` | `%APPDATA%\kikigaki\replace.toml` |
+| モデル | `~/Library/Application Support/kikigaki/models` | `%LOCALAPPDATA%\kikigaki\models` |
+| ログ | `~/Library/Logs/kikigaki/kikigaki.<date>.log` | `%LOCALAPPDATA%\kikigaki\logs\kikigaki.<date>.log` |
+| レイテンシ計測 | `~/Library/Logs/kikigaki/latency.jsonl` | `%LOCALAPPDATA%\kikigaki\logs\latency.jsonl` |
 
 ## 設定
 
@@ -57,7 +63,7 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 ### 置換辞書
 
-`~/.config/kikigaki/replace.toml` に `[[rule]]` を書くと、認識結果を文字列置換できる。ファイルの変更は自動で反映される。
+上の表の置換辞書ファイルに `[[rule]]` を書くと、認識結果を文字列置換できる。ファイルの変更は自動で反映される。
 
 ```toml
 [[rule]]

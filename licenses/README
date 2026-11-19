@@ -2,13 +2,19 @@ kikigaki bundled license texts
 ===============================
 
 This directory ships upstream license texts inside the app bundle
-(Contents/Resources/licenses/), alongside NOTICE at Contents/Resources/NOTICE.
+(Contents/Resources/licenses/), alongside NOTICE at Contents/Resources/NOTICE, on
+macOS. On Windows they install next to the executable, at $INSTDIR\licenses\ and
+$INSTDIR\NOTICE.
 See ../NOTICE for the full attribution list and the static-library inventory.
 
 Files here:
 
 - sherpa-onnx.LICENSE  — Apache License 2.0 (k2-fsa/sherpa-onnx)
 - onnxruntime.LICENSE  — MIT License (microsoft/onnxruntime)
+- onnxruntime-THIRD-PARTY-NOTICES.txt — ONNX Runtime third-party notices
+  (microsoft/onnxruntime v1.27.1, `ThirdPartyNotices.txt`)
+- kissfft.LICENSE      — BSD-3-Clause (mborgerding/kissfft `master`, combined from
+  `COPYING` and `LICENSES/BSD-3-Clause`)
 - silero-vad.LICENSE   — MIT License (snakers4/silero-vad)
 - hayamimi.LICENSE     — MIT License (oboroge0/hayamimi)
 

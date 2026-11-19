@@ -22,7 +22,7 @@
     'ログはここです https://github.com/example-org/mobile-app/actions/runs/18234567890/job/52012345678?pr=142#step:7:1834 を見てください',
     // Single character.
     'あ',
-    // A long dictated paragraph (a 60-second utterance under the 長文 key).
+    // A long dictated paragraph (a 60-second utterance with the standard key).
     '先ほどの件ですが、来週の火曜日に予定していたリリースは、QA チームからの報告で決済画面に再現性のある不具合が見つかったため、木曜日に延期することになりました。影響範囲は iOS と Android の両方で、Web 版は問題ありません。修正 PR はすでに出ていて、レビューが通り次第ステージングに入れて、水曜日の午後に最終確認をする予定です。関係各所への連絡は私のほうでやっておきますので、何か懸念があれば今日中に教えてください。よろしくお願いします。',
     // Emoji + mixed scripts.
     '了解です👍🏻 Claude Code で直しておきます 🙏',
@@ -40,17 +40,13 @@
     WORST_HISTORY.push({ id: 200 - i, at: at(i * 9 + 1), raw: text, text });
   }
 
-  const LONG_PATH_ERROR = 'load whisper model /Users/yamada.taro/Library/Application Support/com.kikigaki.app/models/whisper-large-v3-turbo-q8_0/ggml-large-v3-turbo-q8_0.bin: Failed to create a new whisper context';
+  const MODEL_PATH_ERROR = 'sherpa-onnx: Failed to load model at models/reazonspeech/encoder.int8.onnx: Protobuf parsing failed';
 
   const baseSettings = {
     asr_model: 'haas',
     asr_model_applied: 'haas',
     hotkey: 'Ctrl+Space',
-    long_key: true,
-    long_hotkey: 'Ctrl+Shift+Space',
-    long_state: { kind: 'ready' },
     punct_choice: 'on_strip',
-    long_available: true,
     punct_enabled: false,
     strip_trailing_period: true,
     builtin_replace_dict: true,
@@ -60,12 +56,12 @@
   };
   const baseStatus = {
     state: 'idle', level: 'ok', phase: 'ready', message: null,
-    hotkey: 'Ctrl+Space', punct_enabled: false, strip_trailing_period: true, long_hotkey: 'Ctrl+Shift+Space',
+    hotkey: 'Ctrl+Space', punct_enabled: false, strip_trailing_period: true,
   };
 
   function snap(over = {}) {
     const settings = { ...baseSettings, ...(over.settings || {}) };
-    const status = { ...baseStatus, hotkey: settings.hotkey, long_hotkey: settings.long_key ? settings.long_hotkey : null, ...(over.status || {}) };
+    const status = { ...baseStatus, hotkey: settings.hotkey, ...(over.status || {}) };
     return {
       revision: 1,
       status,
@@ -83,39 +79,32 @@
   });
   const dl = (model, done, total, bytes, totalBytes, failed = false) => ({ model, done, total, bytes, total_bytes: totalBytes, failed });
 
-  const WORST_HOTKEYS = { hotkey: 'Cmd+Alt+Ctrl+Shift+Space', long_hotkey: 'Cmd+Alt+Ctrl+Shift+ArrowRight' };
+  const WORST_HOTKEYS = { hotkey: 'Cmd+Alt+Ctrl+Shift+Space' };
 
   const FIXTURES = {
     demo: snap(),
     'haas-pending': snap({ settings: { asr_model: 'haas', asr_model_applied: 'reazonspeech', punct_enabled: true } }),
     'haas-applied': snap({ settings: { asr_model: 'haas', asr_model_applied: 'haas' } }),
     worst: snap({
-      settings: { ...WORST_HOTKEYS, long_state: { kind: 'failed', message: LONG_PATH_ERROR }, transcript_log: true },
+      settings: { ...WORST_HOTKEYS, transcript_log: true },
       status: {
         state: 'disconnected', level: 'error', phase: 'failed',
         message: '音声エンジンを起動できませんでした',
-        detail: LONG_PATH_ERROR,
+        detail: MODEL_PATH_ERROR,
       },
       autostart: { enabled: false, available: false },
       history: WORST_HISTORY,
     }),
-    empty: snap({ settings: { long_key: false, long_state: null }, history: [] }),
+    empty: snap({ history: [] }),
     one: snap({ history: [DEMO_HISTORY[2]] }),
     'hotkeys-long': snap({ settings: WORST_HOTKEYS }),
     'status-warning': snap({ status: { level: 'warning', message: 'マイクの使用が許可されていません', detail: 'システム設定 › プライバシーとセキュリティ › マイク で kikigaki を許可してください' } }),
     'status-paste': snap({ status: { level: 'warning', message: '文字を貼り付けられません', detail: 'システム設定 › プライバシーとセキュリティ › アクセシビリティ で kikigaki を許可してください' } }),
     'status-installing': snap({ status: { phase: 'installing', message: 'モデルをダウンロード中… 37%' } }),
     'status-engine-failed': snap({ status: { state: 'disconnected', level: 'error', phase: 'failed', message: '音声エンジンが停止しました', detail: 'sherpa-onnx: Failed to load model at /Users/yamada.taro/Library/Application Support/com.kikigaki.app/models/reazonspeech-ja-en-2025-01-17/encoder-epoch-99-avg-1.int8.onnx: Protobuf parsing failed' } }),
-    'status-long-failed': snap({ settings: { long_state: { kind: 'failed', message: LONG_PATH_ERROR } }, status: { level: 'warning', message: '長文エンジンが停止しました — 設定から再試行できます' } }),
-    'status-long-install-failed': snap({ settings: { long_state: { kind: 'failed', message: 'download whisper-large-v3-turbo-q8_0: error sending request for url (https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin): connection closed before message completed' } }, status: { level: 'warning', message: '長文キーのモデルを準備できませんでした — もう一度お試しください' } }),
     // Shape after the Rust wording change: short Japanese title plus raw detail.
-    'status-with-detail': snap({ status: { state: 'disconnected', level: 'error', phase: 'failed', message: '音声エンジンを起動できませんでした', detail: LONG_PATH_ERROR } }),
+    'status-with-detail': snap({ status: { state: 'disconnected', level: 'error', phase: 'failed', message: '音声エンジンを起動できませんでした', detail: MODEL_PATH_ERROR } }),
     'status-recording': snap({ status: { state: 'recording' } }),
-    'long-installing-0': snap({ settings: { long_state: { kind: 'installing', percent: 0 } } }),
-    'long-installing-100': snap({ settings: { long_state: { kind: 'installing', percent: 100 } } }),
-    'long-loading': snap({ settings: { long_state: { kind: 'loading' } } }),
-    'long-off': snap({ settings: { long_key: false, long_state: null } }),
-    'long-unavailable': snap({ settings: { long_key: false, long_state: null, long_available: false } }),
     'onb-fresh': snap({ onboarding: { ...onb(null), microphone: 'not_determined', accessibility_trusted: false } }),
     'onb-mic-denied': snap({ onboarding: { ...onb(null), microphone: 'denied', accessibility_trusted: false } }),
     'onb-dl-0': snap({ onboarding: onb(dl('reazonspeech-ja-en-2025-01-17', 0, 3, 0, 0)) }),

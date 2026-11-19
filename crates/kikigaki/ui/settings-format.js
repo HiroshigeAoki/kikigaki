@@ -63,23 +63,8 @@
       + (KEY_LABELS[key] || key);
   }
 
-  function longStateView(state, retrying) {
-    if (retrying) return { tone: 'busy', text: '再試行中…', percent: null };
-    const kind = state && state.kind;
-    return {
-      tone: kind === 'ready' ? 'ok' : kind === 'failed' ? 'warn'
-        : kind === 'installing' || kind === 'loading' ? 'busy' : 'off',
-      text: longStateText(state),
-      percent: kind === 'installing' && Number.isFinite(state.percent) && state.percent < 100
-        ? Math.max(0, state.percent) : null,
-    };
-  }
-
   function statusKeysLine(settings) {
-    const standard = formatChord(settings.hotkey);
-    const keys = settings.long_key && settings.long_available && settings.long_hotkey
-      ? `標準 ${standard} ／ 長文 ${formatChord(settings.long_hotkey)}` : standard;
-    return `${keys} を押している間だけ聞き取ります`;
+    return `${formatChord(settings.hotkey)} を押している間だけ聞き取ります`;
   }
 
   function chordFromKeyEvent({ code, key, modifiers }) {
@@ -92,18 +77,8 @@
     return [...MODIFIERS.filter((name) => modifiers.includes(name)), chordKey].join('+');
   }
 
-  function longStateText(state) {
-    switch (state && state.kind) {
-      case 'installing': return state.percent >= 100 ? '展開中…' : `ダウンロード中 ${state.percent}%`;
-      case 'loading': return '準備中…';
-      case 'ready': return '準備完了';
-      case 'failed': return '停止中 — モデルを読み込めませんでした';
-      default: return '';
-    }
-  }
-
   function asrModelNote(saved, applied) {
-    if (saved === applied) return '標準キーの認識に使うモデル';
+    if (saved === applied) return '聞き取りに使うモデル';
     return saved === 'haas'
       ? '次の起動から切り替わります。Haas は初回に約 480 MB をダウンロードします'
       : '次の起動から切り替わります';
@@ -116,7 +91,7 @@
 
   const KikigakiFormat = {
     asrModelNote, asrModelFooter,
-    formatChord, longStateView, statusKeysLine, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateText,
+    formatChord, statusKeysLine, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent,
     HISTORY_PAGE: 20,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = KikigakiFormat;

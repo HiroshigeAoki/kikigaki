@@ -1,7 +1,7 @@
 /// Removes engine-generated Japanese punctuation and question marks, then removes whitespace
 /// unless both neighbouring characters are ASCII (so English phrases keep their spaces
 /// while spaces next to Japanese text go). Preserved whitespace runs remain unchanged.
-pub fn strip_whisper_punct(s: &str) -> String {
+pub fn strip_engine_punct(s: &str) -> String {
     let chars: Vec<char> = s
         .chars()
         .filter(|ch| !matches!(ch, '、' | '。' | '?' | '？'))
@@ -40,17 +40,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_whisper_punctuation_and_preserves_other_symbols() {
+    fn strips_engine_punctuation_and_preserves_other_symbols() {
         assert_eq!(
-            strip_whisper_punct("、こんにちは。?？a,b.c!「」"),
+            strip_engine_punct("、こんにちは。?？a,b.c!「」"),
             "こんにちはa,b.c!「」"
         );
-        assert_eq!(strip_whisper_punct(""), "");
-        assert_eq!(strip_whisper_punct("この注意マークは、注意マークの吹き出しのところって、どういう条件で追加されているんですか?"), "この注意マークは注意マークの吹き出しのところってどういう条件で追加されているんですか");
+        assert_eq!(strip_engine_punct(""), "");
+        assert_eq!(strip_engine_punct("この注意マークは、注意マークの吹き出しのところって、どういう条件で追加されているんですか?"), "この注意マークは注意マークの吹き出しのところってどういう条件で追加されているんですか");
     }
 
     #[test]
-    fn strips_whisper_whitespace_except_between_ascii_alphanumerics() {
+    fn strips_engine_whitespace_except_between_ascii_alphanumerics() {
         for (input, expected) in [
             (
                 "他の確認事項を出してください あともすでに mac には",
@@ -64,7 +64,7 @@ mod tests {
             ("a ! b . c , d 「 e 」", "a ! b . c , d「e」"),
             (" \t\u{3000}", ""),
         ] {
-            assert_eq!(strip_whisper_punct(input), expected, "{input:?}");
+            assert_eq!(strip_engine_punct(input), expected, "{input:?}");
         }
     }
 
@@ -80,7 +80,7 @@ mod tests {
                 "Run kubectl apply. Then check the pods, ok",
             ),
         ] {
-            assert_eq!(strip_whisper_punct(input), expected, "{input:?}");
+            assert_eq!(strip_engine_punct(input), expected, "{input:?}");
         }
     }
 

@@ -1268,7 +1268,7 @@ impl Controller {
                 message: status.message().map(str::to_owned),
                 detail: status.detail().map(str::to_owned),
                 hotkey: settings.hotkey.clone(),
-                punct_enabled: settings.punct_enabled,
+                local_punct: settings.local_punct,
                 strip_trailing_period: settings.strip_trailing_period,
             },
             settings,
@@ -2703,7 +2703,7 @@ mod tests {
                 })
                 .unwrap();
             let before = h.controller.settings_snapshot();
-            assert!(before.punct_enabled);
+            assert!(before.local_punct);
             let saved = h
                 .controller
                 .apply_settings(SettingsPatch {
@@ -2713,7 +2713,7 @@ mod tests {
                 .unwrap();
             assert_eq!(saved.asr_model, AsrModel::Haas);
             assert_eq!(saved.asr_model_applied, AsrModel::ReazonSpeech);
-            assert_eq!(saved.punct_enabled, before.punct_enabled);
+            assert_eq!(saved.local_punct, before.local_punct);
             assert_eq!(saved.punct_choice, before.punct_choice);
             assert_eq!(saved.strip_trailing_period, before.strip_trailing_period);
             let mut outputs = Vec::new();

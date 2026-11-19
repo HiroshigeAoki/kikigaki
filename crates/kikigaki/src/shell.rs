@@ -360,7 +360,7 @@ fn default_snapshot(
                 .map(|_| "設定ファイルを読み込めませんでした".to_owned()),
             detail: bootstrap_error.as_ref().map(|error| error.message.clone()),
             hotkey: settings_snapshot.hotkey.clone(),
-            punct_enabled: settings_snapshot.punct_enabled,
+            local_punct: settings_snapshot.local_punct,
             strip_trailing_period: settings_snapshot.strip_trailing_period,
         },
         settings: settings_snapshot,

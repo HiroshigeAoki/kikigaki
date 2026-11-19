@@ -7,7 +7,7 @@ use crate::engine::{join_workers, EngineMsg, SinkError, Waker};
 use crate::protocol;
 use crate::punct::nfkc;
 use crate::replace::{ReplaceFile, Rules};
-use crate::text::{strip_trailing_period, strip_whisper_punct};
+use crate::text::{strip_engine_punct, strip_trailing_period};
 
 /// Adds punctuation to transcription text.
 pub trait Punctuator: Send {
@@ -86,7 +86,7 @@ pub fn optional_mojicast_punctuator(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PostprocessSettings {
     /// Whether to run the local punctuator.
-    pub punct_enabled: bool,
+    pub local_punct: bool,
     /// Whether to remove one trailing Japanese or ASCII period.
     pub strip_trailing_period: bool,
     /// Whether to strip engine-generated punctuation and whitespace outside ASCII words
@@ -183,11 +183,11 @@ impl Pipeline {
         let normalized = nfkc(raw.trim());
         let replaced = self.effective.apply(&normalized);
         let replaced = if self.settings.strip_engine_punct {
-            strip_whisper_punct(&replaced)
+            strip_engine_punct(&replaced)
         } else {
             replaced
         };
-        let punctuated = if self.settings.punct_enabled {
+        let punctuated = if self.settings.local_punct {
             match self.punctuator.punctuate(&replaced) {
                 Ok(text) => text,
                 Err(error) => {
@@ -515,7 +515,7 @@ mod tests {
                 replace,
                 punctuator,
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     strip_trailing_period: strip,
                     strip_engine_punct: false,
                 },
@@ -555,7 +555,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: true,
             },
@@ -567,14 +567,14 @@ mod tests {
     }
 
     #[test]
-    fn whisper_spaces_are_stripped_before_punctuation() {
+    fn engine_spaces_are_stripped_before_punctuation() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (_temp, replace) = replace_file("");
         let mut pipeline = Pipeline::new(
             replace,
             Box::new(RecordingPunctuator(Arc::clone(&seen))),
             PostprocessSettings {
-                punct_enabled: true,
+                local_punct: true,
                 strip_engine_punct: true,
                 ..PostprocessSettings::default()
             },
@@ -601,7 +601,7 @@ mod tests {
                 1,
                 final_msg(1, "一、二。"),
                 PostprocessSettings {
-                    punct_enabled: false,
+                    local_punct: false,
                     strip_trailing_period: false,
                     strip_engine_punct: true,
                 },
@@ -612,7 +612,7 @@ mod tests {
                 2,
                 final_msg(2, "三、四"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     strip_trailing_period: true,
                     strip_engine_punct: false,
                 },
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn nfkc_runs_when_punctuation_is_disabled() {
         let (_temp, mut pipeline) = pipeline(Box::new(NoopPunctuator), false);
-        pipeline.settings.punct_enabled = false;
+        pipeline.settings.local_punct = false;
 
         assert_eq!(pipeline.run("ＡＢＣ①㍉").text, "ABC1ミリ");
     }
@@ -663,7 +663,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -688,7 +688,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -707,7 +707,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -727,7 +727,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -760,7 +760,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -789,7 +789,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -816,7 +816,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -852,7 +852,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -876,7 +876,7 @@ mod tests {
             replace,
             Box::new(RecordingPunctuator(Arc::clone(&seen))),
             PostprocessSettings {
-                punct_enabled: true,
+                local_punct: true,
                 strip_trailing_period: true,
                 strip_engine_punct: false,
             },
@@ -897,7 +897,7 @@ mod tests {
                 1,
                 final_msg(1, "first"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     ..PostprocessSettings::default()
                 },
             )
@@ -907,7 +907,7 @@ mod tests {
                 2,
                 final_msg(2, "second"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     ..PostprocessSettings::default()
                 },
             )
@@ -937,7 +937,7 @@ mod tests {
                 1,
                 final_msg(1, "first"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     ..PostprocessSettings::default()
                 },
             )
@@ -947,7 +947,7 @@ mod tests {
                 2,
                 final_msg(2, "second"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     ..PostprocessSettings::default()
                 },
             )
@@ -967,7 +967,7 @@ mod tests {
                 9,
                 final_msg(9, "intact"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     ..PostprocessSettings::default()
                 },
             )
@@ -987,7 +987,7 @@ mod tests {
                 1,
                 final_msg(1, "one"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     ..PostprocessSettings::default()
                 },
             )
@@ -1004,7 +1004,7 @@ mod tests {
                 3,
                 final_msg(3, "three"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     strip_trailing_period: true,
                     strip_engine_punct: false,
                 },
@@ -1029,7 +1029,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: true,
+                local_punct: true,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -1059,7 +1059,7 @@ mod tests {
                 1,
                 final_msg(1, "x"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     ..PostprocessSettings::default()
                 },
             )
@@ -1075,7 +1075,7 @@ mod tests {
                 2,
                 final_msg(2, "x"),
                 PostprocessSettings {
-                    punct_enabled: true,
+                    local_punct: true,
                     ..PostprocessSettings::default()
                 },
             )
@@ -1090,7 +1090,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },
@@ -1173,7 +1173,7 @@ mod tests {
             replace,
             Box::new(NoopPunctuator),
             PostprocessSettings {
-                punct_enabled: false,
+                local_punct: false,
                 strip_trailing_period: false,
                 strip_engine_punct: false,
             },

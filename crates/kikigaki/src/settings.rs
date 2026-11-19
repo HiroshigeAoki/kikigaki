@@ -31,7 +31,9 @@ pub struct SettingsSnapshot {
     pub asr_model_applied: AsrModel,
     pub hotkey: String,
     pub punct_choice: PunctSetting,
-    pub punct_enabled: bool,
+    /// Whether the local punctuator runs; false when the engine punctuates (Haas), even
+    /// with punctuation on.
+    pub local_punct: bool,
     pub strip_trailing_period: bool,
     pub builtin_replace_dict: bool,
     pub transcript_log: bool,
@@ -96,7 +98,7 @@ impl SettingsCoordinator {
             } else {
                 PunctSetting::On
             },
-            punct_enabled: kikigaki_core::config::punct_effective(
+            local_punct: kikigaki_core::config::punct_effective(
                 &self.config,
                 self.capabilities,
                 self.config.engine,
@@ -455,7 +457,7 @@ mod tests {
             assert_eq!(coordinator.config().asr.model, AsrModel::Haas);
             assert_eq!(saved.asr_model, AsrModel::Haas);
             assert_eq!(saved.asr_model_applied, AsrModel::Haas);
-            assert_eq!(saved.punct_enabled, before.punct_enabled);
+            assert_eq!(saved.local_punct, before.local_punct);
             let json = serde_json::to_value(&saved).unwrap();
             assert_eq!(json["asr_model"], "haas");
             assert_eq!(json["asr_model_applied"], "haas");
@@ -521,7 +523,7 @@ mod tests {
             let mut settings = SettingsCoordinator::load(path, caps).unwrap();
             assert_eq!(settings.applied_asr_model(), model);
             assert_eq!(
-                settings.snapshot().punct_enabled,
+                settings.snapshot().local_punct,
                 model == AsrModel::ReazonSpeech
             );
             // Simulate a saved selection changing independently of the running engine.
@@ -538,7 +540,7 @@ mod tests {
                 .unwrap();
             assert_eq!(settings.applied_asr_model(), model);
             assert_eq!(
-                settings.snapshot().punct_enabled,
+                settings.snapshot().local_punct,
                 model == AsrModel::ReazonSpeech
             );
         }
@@ -807,11 +809,11 @@ mod tests {
                 ..SettingsPatch::default()
             })
             .unwrap();
-        assert!(snapshot.punct_enabled && snapshot.strip_trailing_period);
+        assert!(snapshot.local_punct && snapshot.strip_trailing_period);
     }
 
     #[test]
-    fn strip_trailing_period_patch_persists_without_changing_punct_enabled() {
+    fn strip_trailing_period_patch_persists_without_changing_local_punct() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
         std::fs::write(
@@ -835,7 +837,7 @@ mod tests {
             })
             .unwrap();
 
-        assert!(!snapshot.punct_enabled);
+        assert!(!snapshot.local_punct);
         assert!(!snapshot.strip_trailing_period);
         assert_eq!(coordinator.config().punct.enabled, PunctEnabled::Off);
         let on_disk = std::fs::read_to_string(path).unwrap();
@@ -864,7 +866,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!coordinator.snapshot().punct_enabled);
+        assert!(!coordinator.snapshot().local_punct);
     }
 
     #[test]

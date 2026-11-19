@@ -4124,9 +4124,19 @@ mod tests {
     #[test]
     fn capture_standard_accepts_retired_chord() {
         let mut h = capture_harness();
+        let path = h._temp.path().join("config.toml");
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.insert_str(0, "long_hotkey = \"Alt+Shift+Space\"\n");
+        std::fs::write(&path, raw).unwrap();
+        let capabilities = h.controller.capabilities;
+        h.controller.settings = SettingsCoordinator::load(path.clone(), capabilities).unwrap();
         begin_capture(&mut h, HotkeyKey::Standard).unwrap();
         let snapshot = end_capture(&mut h, HotkeyKey::Standard, Some("Alt+Shift+Space")).unwrap();
         assert_eq!(snapshot.hotkey, "Alt+Shift+Space");
+        // The file still carries the retired key with the same chord; the next launch validates it.
+        let reloaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(reloaded.long_hotkey, "Alt+Shift+Space");
+        reloaded.validate(capabilities).unwrap();
     }
 
     #[test]

@@ -164,13 +164,20 @@ impl Rules {
 
     /// Applies rules left-to-right with the longest source string taking precedence.
     pub fn apply(&self, text: &str) -> String {
-        self.apply_with(text, |_| {})
+        self.apply_with(text, |_, _, _, _| {})
     }
 
     /// Applies rules and records matches using byte offsets in the input.
     pub fn apply_traced(&self, text: &str) -> (String, Vec<Applied>) {
         let mut hits = Vec::new();
-        let output = self.apply_with(text, |hit| hits.push(hit));
+        let output = self.apply_with(text, |from, to, start, end| {
+            hits.push(Applied {
+                from: from.to_owned(),
+                to: to.to_owned(),
+                start,
+                end,
+            });
+        });
         (output, hits)
     }
 
@@ -181,7 +188,7 @@ impl Rules {
             .any(|rule| rule.from.iter().any(|from| from == source))
     }
 
-    fn apply_with(&self, text: &str, mut record: impl FnMut(Applied)) -> String {
+    fn apply_with(&self, text: &str, mut record: impl FnMut(&str, &str, usize, usize)) -> String {
         let mut output = String::with_capacity(text.len());
         let mut start = 0;
         while start < text.len() {
@@ -204,12 +211,7 @@ impl Rules {
             if let Some((from, rule)) = matched {
                 let end = start + from.len();
                 output.push_str(&rule.to);
-                record(Applied {
-                    from: from.clone(),
-                    to: rule.to.clone(),
-                    start,
-                    end,
-                });
+                record(from, &rule.to, start, end);
                 start = end;
             } else {
                 let c = remaining.chars().next().expect("non-empty remaining input");

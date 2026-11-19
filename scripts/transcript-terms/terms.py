@@ -21,173 +21,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-class SelfTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-
-    def test_tokenization(self):
-        self.assertEqual(tokens(' ｶﾀｶﾅ・ア ヷヺヽヾ C++ abc-2. X 123 '),
-                         ['カタカナ', 'ヷヺヽヾ', 'C++', 'abc-2.', 'X'])
-
-    def test_classification(self):
-        terms = {'Backlog': ['バックログ', 'bkl'], 'Short': ['カタカ']}
-        for token, expected in [('バックローグ', ('variant', 'Backlog')),
-                                ('バッキロガ', ('new', '')),
-                                ('カタキ', ('new', '')),
-                                ('キタキ', ('new', '')),
-                                ('BACKLOG', ('variant', 'Backlog')),
-                                ('BKLx', ('variant', 'Backlog')),
-                                ('キキキキキ', ('new', ''))]:
-            with self.subTest(token=token):
-                self.assertEqual(classify(token, terms), expected)
-        self.assertEqual(classify('カタカキ', {'A': ['カタカカ'], 'B': ['カタカク']}), ('new', ''))
-        self.assertEqual(classify('カタカ', {'A': ['カタカ'], 'B': ['カタク']}), ('variant', 'A'))
-
-    def test_katakana_variant_matching(self):
-        cases = [
-            *[(token, ['ハウス', 'ハース'], 'new')
-              for token in ['ケース', 'エース', 'ハーブ', 'ハーツ', 'ピース', 'シース']],
-            ('パスワード', ['ワンパスワード'], 'new'),
-            ('バックローグ', ['バックログ'], 'variant'),
-            ('バックローブ', ['バックログ', 'バックローグ'], 'variant'),
-            ('カタカナテスト', ['カタカナテクス'], 'variant'),
-            ('カタカナテスト', ['カタカナククク'], 'new'),
-            ('キタカナ', ['カタカナ'], 'new'),
-            ('カタ', ['カキ'], 'new'),
-            ('カタカ', ['カタカ'], 'variant'),
-            ('カタカナ', ['カタカキ'], 'variant'),
-            ('カタカナ', ['カタキキ'], 'new'),
-            ('カタカナテス', ['カタカナクク'], 'new'),
-            ('カタカナテス', ['カタカナテク'], 'variant'),
-        ]
-        for token, variants, kind in cases:
-            with self.subTest(token=token, variants=variants):
-                self.assertEqual(classify(token, {'Target': variants}),
-                                 (kind, 'Target' if kind == 'variant' else ''))
-
-    def test_mine_exclusions_counts_and_tsv(self):
-        terms = self.root / 'terms.toml'
-        save_terms(terms, {'Backlog': ['バックログ', 'bkl']}, {'リード'})
-        builtin = self.root / 'builtin.toml'
-        builtin.write_text('[[rule]]\nfrom=["ビルトイン"]\nto="Builtin"\n')
-        logs = self.root / 'logs'
-        logs.mkdir()
-        for name, at in [('b', '2026-01-02T00:00:00Z'), ('a', '2026-01-01T00:00:00Z')]:
-            (logs / f'{name}.jsonl').write_text(json.dumps(dict(at=at, engine='e', text='PRIVATE', raw='ビルトイン Builtin バックログ Backlog bkl リード ｶﾀｶﾅ BACKLOG'))+'\n')
-        rows = mine(logs, terms, builtin, 2)
-        self.assertEqual([r['token'] for r in rows], ['BACKLOG', 'カタカナ'])
-        self.assertEqual(rows[0]['count'], '2')
-        self.assertEqual(rows[0]['first_at'], '2026-01-01T00:00:00Z')
-        self.assertEqual(rows[0]['last_at'], '2026-01-02T00:00:00Z')
-        self.assertEqual(mine(logs, terms, builtin, 3), [])
-        path = self.root / 'candidates.tsv'
-        write_tsv(path, rows)
-        self.assertEqual(read_tsv(path), rows)
-        self.assertNotIn('PRIVATE', path.read_text())
-
-    def test_approve_validation_and_escaping(self):
-        path = self.root / 'terms.toml'
-        save_terms(path, {'Backlog': ['バックログ']}, set())
-        rows = [candidate('バックローグ', 'variant', 'Backlog', 'approve'),
-                candidate('ツール', 'new', 'Tool"\\\n', 'approve'),
-                candidate('トゥール', 'new', 'Tool"\\\n', 'approve'),
-                candidate('リード', 'new', '=keep', 'approve'),
-                candidate('キープ', 'new', '', 'keep'),
-                candidate('無視', 'new', 'Ignore', '')]
-        approve(rows, path)
-        terms, keeps = load_terms(path)
-        self.assertEqual(terms['Backlog'], ['バックログ', 'バックローグ'])
-        self.assertEqual(set(terms['Tool"\\\n']), {'ツール', 'トゥール'})
-        self.assertEqual(keeps, {'リード', 'キープ'})
-        before = path.read_bytes()
-        approve(rows, path)
-        self.assertEqual(path.read_bytes(), before)
-        for document in ['[[term]]\nto=""\nvariants=[]',
-                         '[[term]]\nto="A"\nvariants=[]\n[[term]]\nto="A"\nvariants=[]',
-                         '[[term]]\nto="A"\nvariants=["v"]\n[[term]]\nto="B"\nvariants=["v"]',
-                         '[[term]]\nto="A"\nvariants=["v"]\n[[keep]]\nword="v"']:
-            with self.subTest(document=document):
-                path.write_text(document)
-                with self.assertRaises(TermError):
-                    load_terms(path)
-
-    def test_build_refusal_force_and_determinism(self):
-        terms, out = self.root / 'terms.toml', self.root / 'replace.toml'
-        save_terms(terms, {'Z': ['ゼット'], 'A': ['エー', 'エイ']}, set())
-        out.write_text('handwritten\n')
-        with self.assertRaises(TermError):
-            build(terms, out, False)
-        self.assertEqual(out.read_text(), 'handwritten\n')
-        build(terms, out, True)
-        first = out.read_bytes()
-        self.assertEqual(out.read_text().splitlines()[0], HEADER)
-        rules = tomllib.loads(out.read_text())['rule']
-        self.assertEqual([r['to'] for r in rules], ['A', 'Z'])
-        self.assertTrue(all(r['whole_word'] for r in rules))
-        build(terms, out, False)
-        self.assertEqual(out.read_bytes(), first)
-
-    def test_summarize(self):
-        path = self.root / 'replay.jsonl'
-        records = [dict(at=at, engine=engine, changed=True, baseline='PRIVATE', proposal='PRIVATE',
-                        user_hits=[dict(to='Haas', **{'from': 'ハース'}, left='左'*20, right='右'*20)])
-                   for at, engine in [('2026-01-01T00:00:00Z', 'whisper'),
-                                      ('2025-12-31T23:59:59Z', 'other'),
-                                      ('2026-01-01T09:00:00+09:00', 'other')]]
-        path.write_text(''.join(json.dumps(r)+'\n' for r in records))
-        result = summarize(path, '2026-01-01T00:00:00Z')
-        self.assertIn('records: 3\nchanged records: 3', result)
-        self.assertIn('Haas\t3\twhisper=1\thaas=1\treazon=1', result)
-        for model in ('whisper', 'haas', 'reazon'):
-            self.assertIn(model+'\tハース -> Haas\t…'+'左'*10+'[ハース]'+'右'*10+'…', result)
-        self.assertNotIn('PRIVATE', result)
-        self.assertNotIn('haas\tハース', summarize(path, None))
-
-    def test_suggest_local_http(self):
-        requests = []
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def do_GET(self):
-                requests.append(self.path)
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b'{"data":[{"id":"fixture"}]}')
-
-            def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                requests.append(body)
-                token = body['messages'][-1]['content']
-                self.send_response(200)
-                self.end_headers()
-                reply = {'ツール': 'prefix {"keep_katakana":false,"latin":"Tool"} suffix',
-                         'リード': '{"keep_katakana":true,"latin":""}', 'エラー': 'bad'}[token]
-                self.wfile.write(json.dumps({'choices': [{'message': {'content': reply}}]}).encode())
-        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            path = self.root / 'c.tsv'
-            rows = [candidate(t) for t in ['ツール', 'リード', 'エラー']]
-            rows += [candidate('既存', 'variant', 'Existing'), candidate('済', 'new', 'Done')]
-            write_tsv(path, rows)
-            errors = io.StringIO()
-            with contextlib.redirect_stderr(errors):
-                suggest(path, f'http://127.0.0.1:{server.server_port}', None, 2)
-            self.assertEqual([r['suggested_to'] for r in read_tsv(path)], ['Tool', '=keep', '', 'Existing', 'Done'])
-            self.assertIn('warning:', errors.getvalue())
-            self.assertEqual(len(requests), 4)
-            self.assertEqual(requests[1]['messages'][-1]['content'], 'ツール')
-            self.assertEqual(requests[1]['model'], 'fixture')
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
-
-
 def candidate(token, kind='new', target='', decision=''):
     return dict(token=token, count='1', first_at='', last_at='', kind=kind,
                 suggested_to=target, decision=decision)
@@ -485,6 +318,173 @@ def summarize(path, haas_since):
         lines.append(f'{target}\t{sum(counter.values())}' + ''.join(
             f'\t{m}={counter[m]}' for m in ('whisper', 'haas', 'reazon')))
     return '\n'.join(lines + snippets)
+
+
+class SelfTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_tokenization(self):
+        self.assertEqual(tokens(' ｶﾀｶﾅ・ア ヷヺヽヾ C++ abc-2. X 123 '),
+                         ['カタカナ', 'ヷヺヽヾ', 'C++', 'abc-2.', 'X'])
+
+    def test_classification(self):
+        terms = {'Backlog': ['バックログ', 'bkl'], 'Short': ['カタカ']}
+        for token, expected in [('バックローグ', ('variant', 'Backlog')),
+                                ('バッキロガ', ('new', '')),
+                                ('カタキ', ('new', '')),
+                                ('キタキ', ('new', '')),
+                                ('BACKLOG', ('variant', 'Backlog')),
+                                ('BKLx', ('variant', 'Backlog')),
+                                ('キキキキキ', ('new', ''))]:
+            with self.subTest(token=token):
+                self.assertEqual(classify(token, terms), expected)
+        self.assertEqual(classify('カタカキ', {'A': ['カタカカ'], 'B': ['カタカク']}), ('new', ''))
+        self.assertEqual(classify('カタカ', {'A': ['カタカ'], 'B': ['カタク']}), ('variant', 'A'))
+
+    def test_katakana_variant_matching(self):
+        cases = [
+            *[(token, ['ハウス', 'ハース'], 'new')
+              for token in ['ケース', 'エース', 'ハーブ', 'ハーツ', 'ピース', 'シース']],
+            ('パスワード', ['ワンパスワード'], 'new'),
+            ('バックローグ', ['バックログ'], 'variant'),
+            ('バックローブ', ['バックログ', 'バックローグ'], 'variant'),
+            ('カタカナテスト', ['カタカナテクス'], 'variant'),
+            ('カタカナテスト', ['カタカナククク'], 'new'),
+            ('キタカナ', ['カタカナ'], 'new'),
+            ('カタ', ['カキ'], 'new'),
+            ('カタカ', ['カタカ'], 'variant'),
+            ('カタカナ', ['カタカキ'], 'variant'),
+            ('カタカナ', ['カタキキ'], 'new'),
+            ('カタカナテス', ['カタカナクク'], 'new'),
+            ('カタカナテス', ['カタカナテク'], 'variant'),
+        ]
+        for token, variants, kind in cases:
+            with self.subTest(token=token, variants=variants):
+                self.assertEqual(classify(token, {'Target': variants}),
+                                 (kind, 'Target' if kind == 'variant' else ''))
+
+    def test_mine_exclusions_counts_and_tsv(self):
+        terms = self.root / 'terms.toml'
+        save_terms(terms, {'Backlog': ['バックログ', 'bkl']}, {'リード'})
+        builtin = self.root / 'builtin.toml'
+        builtin.write_text('[[rule]]\nfrom=["ビルトイン"]\nto="Builtin"\n')
+        logs = self.root / 'logs'
+        logs.mkdir()
+        for name, at in [('b', '2026-01-02T00:00:00Z'), ('a', '2026-01-01T00:00:00Z')]:
+            (logs / f'{name}.jsonl').write_text(json.dumps(dict(at=at, engine='e', text='PRIVATE', raw='ビルトイン Builtin バックログ Backlog bkl リード ｶﾀｶﾅ BACKLOG'))+'\n')
+        rows = mine(logs, terms, builtin, 2)
+        self.assertEqual([r['token'] for r in rows], ['BACKLOG', 'カタカナ'])
+        self.assertEqual(rows[0]['count'], '2')
+        self.assertEqual(rows[0]['first_at'], '2026-01-01T00:00:00Z')
+        self.assertEqual(rows[0]['last_at'], '2026-01-02T00:00:00Z')
+        self.assertEqual(mine(logs, terms, builtin, 3), [])
+        path = self.root / 'candidates.tsv'
+        write_tsv(path, rows)
+        self.assertEqual(read_tsv(path), rows)
+        self.assertNotIn('PRIVATE', path.read_text())
+
+    def test_approve_validation_and_escaping(self):
+        path = self.root / 'terms.toml'
+        save_terms(path, {'Backlog': ['バックログ']}, set())
+        rows = [candidate('バックローグ', 'variant', 'Backlog', 'approve'),
+                candidate('ツール', 'new', 'Tool"\\\n', 'approve'),
+                candidate('トゥール', 'new', 'Tool"\\\n', 'approve'),
+                candidate('リード', 'new', '=keep', 'approve'),
+                candidate('キープ', 'new', '', 'keep'),
+                candidate('無視', 'new', 'Ignore', '')]
+        approve(rows, path)
+        terms, keeps = load_terms(path)
+        self.assertEqual(terms['Backlog'], ['バックログ', 'バックローグ'])
+        self.assertEqual(set(terms['Tool"\\\n']), {'ツール', 'トゥール'})
+        self.assertEqual(keeps, {'リード', 'キープ'})
+        before = path.read_bytes()
+        approve(rows, path)
+        self.assertEqual(path.read_bytes(), before)
+        for document in ['[[term]]\nto=""\nvariants=[]',
+                         '[[term]]\nto="A"\nvariants=[]\n[[term]]\nto="A"\nvariants=[]',
+                         '[[term]]\nto="A"\nvariants=["v"]\n[[term]]\nto="B"\nvariants=["v"]',
+                         '[[term]]\nto="A"\nvariants=["v"]\n[[keep]]\nword="v"']:
+            with self.subTest(document=document):
+                path.write_text(document)
+                with self.assertRaises(TermError):
+                    load_terms(path)
+
+    def test_build_refusal_force_and_determinism(self):
+        terms, out = self.root / 'terms.toml', self.root / 'replace.toml'
+        save_terms(terms, {'Z': ['ゼット'], 'A': ['エー', 'エイ']}, set())
+        out.write_text('handwritten\n')
+        with self.assertRaises(TermError):
+            build(terms, out, False)
+        self.assertEqual(out.read_text(), 'handwritten\n')
+        build(terms, out, True)
+        first = out.read_bytes()
+        self.assertEqual(out.read_text().splitlines()[0], HEADER)
+        rules = tomllib.loads(out.read_text())['rule']
+        self.assertEqual([r['to'] for r in rules], ['A', 'Z'])
+        self.assertTrue(all(r['whole_word'] for r in rules))
+        build(terms, out, False)
+        self.assertEqual(out.read_bytes(), first)
+
+    def test_summarize(self):
+        path = self.root / 'replay.jsonl'
+        records = [dict(at=at, engine=engine, changed=True, baseline='PRIVATE', proposal='PRIVATE',
+                        user_hits=[dict(to='Haas', **{'from': 'ハース'}, left='左'*20, right='右'*20)])
+                   for at, engine in [('2026-01-01T00:00:00Z', 'whisper'),
+                                      ('2025-12-31T23:59:59Z', 'other'),
+                                      ('2026-01-01T09:00:00+09:00', 'other')]]
+        path.write_text(''.join(json.dumps(r)+'\n' for r in records))
+        result = summarize(path, '2026-01-01T00:00:00Z')
+        self.assertIn('records: 3\nchanged records: 3', result)
+        self.assertIn('Haas\t3\twhisper=1\thaas=1\treazon=1', result)
+        for model in ('whisper', 'haas', 'reazon'):
+            self.assertIn(model+'\tハース -> Haas\t…'+'左'*10+'[ハース]'+'右'*10+'…', result)
+        self.assertNotIn('PRIVATE', result)
+        self.assertNotIn('haas\tハース', summarize(path, None))
+
+    def test_suggest_local_http(self):
+        requests = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"data":[{"id":"fixture"}]}')
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                requests.append(body)
+                token = body['messages'][-1]['content']
+                self.send_response(200)
+                self.end_headers()
+                reply = {'ツール': 'prefix {"keep_katakana":false,"latin":"Tool"} suffix',
+                         'リード': '{"keep_katakana":true,"latin":""}', 'エラー': 'bad'}[token]
+                self.wfile.write(json.dumps({'choices': [{'message': {'content': reply}}]}).encode())
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            path = self.root / 'c.tsv'
+            rows = [candidate(t) for t in ['ツール', 'リード', 'エラー']]
+            rows += [candidate('既存', 'variant', 'Existing'), candidate('済', 'new', 'Done')]
+            write_tsv(path, rows)
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                suggest(path, f'http://127.0.0.1:{server.server_port}', None, 2)
+            self.assertEqual([r['suggested_to'] for r in read_tsv(path)], ['Tool', '=keep', '', 'Existing', 'Done'])
+            self.assertIn('warning:', errors.getvalue())
+            self.assertEqual(len(requests), 4)
+            self.assertEqual(requests[1]['messages'][-1]['content'], 'ツール')
+            self.assertEqual(requests[1]['model'], 'fixture')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 def main():

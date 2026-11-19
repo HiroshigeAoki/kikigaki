@@ -178,7 +178,6 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: false,
         };
 
         assert!(StartupPlan::from_config(&config, caps).required.is_empty());
@@ -195,32 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn target_plan_uses_the_candidate_engine_and_its_effective_punctuation() {
-        let models_dir = PathBuf::from("candidate-models");
-        let plan = StartupPlan::for_target(
-            EngineKind::Whisper,
-            AsrModel::ReazonSpeech,
-            models_dir.clone(),
-            Capabilities {
-                punct: true,
-                remote_engine: true,
-                long_key: false,
-            },
-            false,
-        );
-
-        assert_eq!(plan.engine, EngineKind::Whisper);
-        assert_eq!(plan.models_dir, models_dir);
-        assert_eq!(
-            plan.required
-                .iter()
-                .map(|model| model.id)
-                .collect::<Vec<_>>(),
-            [crate::models::VAD_MODEL_ID, crate::models::WHISPER_MODEL_ID,]
-        );
-    }
-
-    #[test]
     fn empty_install_report_is_warm() {
         let temp = tempfile::tempdir().unwrap();
         let config = Config {
@@ -233,7 +206,6 @@ mod tests {
             Capabilities {
                 punct: true,
                 remote_engine: true,
-                long_key: false,
             },
         );
         let (tx, rx) = mpsc::sync_channel(1);

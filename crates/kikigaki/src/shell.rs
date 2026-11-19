@@ -415,9 +415,6 @@ impl crate::controller::EngineFactory for TauriEngineFactory {
             kikigaki_core::config::EngineKind::Remote => {
                 anyhow::bail!("engine = \"remote\" requires a build with the remote-engine feature")
             }
-            kikigaki_core::config::EngineKind::Whisper => {
-                anyhow::bail!("the Whisper engine is no longer available")
-            }
         }
     }
 

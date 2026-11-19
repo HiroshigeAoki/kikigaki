@@ -263,7 +263,6 @@ for required in \
   "$RESOURCES/NOTICE" \
   "$RESOURCES/licenses/sherpa-onnx.LICENSE" \
   "$RESOURCES/licenses/onnxruntime.LICENSE" \
-  "$RESOURCES/licenses/whisper-cpp.LICENSE" \
   "$RESOURCES/licenses/silero-vad.LICENSE" \
   "$RESOURCES/licenses/hayamimi.LICENSE" \
   "$RESOURCES/licenses/README"; do

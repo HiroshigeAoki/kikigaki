@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""Mine private transcript tokens into explicitly approved replacement rules."""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import io
+import json
+import re
+import sys
+import tempfile
+import threading
+import tomllib
+import unicodedata
+import unittest
+import urllib.request
+from collections import Counter
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+class SelfTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_tokenization(self):
+        self.assertEqual(tokens(' ｶﾀｶﾅ・ア ヷヺヽヾ C++ abc-2. X 123 '),
+                         ['カタカナ', 'ヷヺヽヾ', 'C++', 'abc-2.', 'X'])
+
+    def test_classification(self):
+        terms = {'Backlog': ['バックログ', 'bkl'], 'Short': ['カタカ']}
+        for token, expected in [('バックローグ', ('variant', 'Backlog')),
+                                ('バッキロガ', ('new', '')),
+                                ('カタキ', ('new', '')),
+                                ('キタキ', ('new', '')),
+                                ('BACKLOG', ('variant', 'Backlog')),
+                                ('BKLx', ('variant', 'Backlog')),
+                                ('キキキキキ', ('new', ''))]:
+            with self.subTest(token=token):
+                self.assertEqual(classify(token, terms), expected)
+        self.assertEqual(classify('カタカキ', {'A': ['カタカカ'], 'B': ['カタカク']}), ('new', ''))
+        self.assertEqual(classify('カタカ', {'A': ['カタカ'], 'B': ['カタク']}), ('variant', 'A'))
+
+    def test_katakana_variant_matching(self):
+        cases = [
+            *[(token, ['ハウス', 'ハース'], 'new')
+              for token in ['ケース', 'エース', 'ハーブ', 'ハーツ', 'ピース', 'シース']],
+            ('パスワード', ['ワンパスワード'], 'new'),
+            ('バックローグ', ['バックログ'], 'variant'),
+            ('バックローブ', ['バックログ', 'バックローグ'], 'variant'),
+            ('カタカナテスト', ['カタカナテクス'], 'variant'),
+            ('カタカナテスト', ['カタカナククク'], 'new'),
+            ('キタカナ', ['カタカナ'], 'new'),
+            ('カタ', ['カキ'], 'new'),
+            ('カタカ', ['カタカ'], 'variant'),
+            ('カタカナ', ['カタカキ'], 'variant'),
+            ('カタカナ', ['カタキキ'], 'new'),
+            ('カタカナテス', ['カタカナクク'], 'new'),
+            ('カタカナテス', ['カタカナテク'], 'variant'),
+        ]
+        for token, variants, kind in cases:
+            with self.subTest(token=token, variants=variants):
+                self.assertEqual(classify(token, {'Target': variants}),
+                                 (kind, 'Target' if kind == 'variant' else ''))
+
+    def test_mine_exclusions_counts_and_tsv(self):
+        terms = self.root / 'terms.toml'
+        save_terms(terms, {'Backlog': ['バックログ', 'bkl']}, {'リード'})
+        builtin = self.root / 'builtin.toml'
+        builtin.write_text('[[rule]]\nfrom=["ビルトイン"]\nto="Builtin"\n')
+        logs = self.root / 'logs'
+        logs.mkdir()
+        for name, at in [('b', '2026-01-02T00:00:00Z'), ('a', '2026-01-01T00:00:00Z')]:
+            (logs / f'{name}.jsonl').write_text(json.dumps(dict(at=at, engine='e', text='PRIVATE', raw='ビルトイン Builtin バックログ Backlog bkl リード ｶﾀｶﾅ BACKLOG'))+'\n')
+        rows = mine(logs, terms, builtin, 2)
+        self.assertEqual([r['token'] for r in rows], ['BACKLOG', 'カタカナ'])
+        self.assertEqual(rows[0]['count'], '2')
+        self.assertEqual(rows[0]['first_at'], '2026-01-01T00:00:00Z')
+        self.assertEqual(rows[0]['last_at'], '2026-01-02T00:00:00Z')
+        self.assertEqual(mine(logs, terms, builtin, 3), [])
+        path = self.root / 'candidates.tsv'
+        write_tsv(path, rows)
+        self.assertEqual(read_tsv(path), rows)
+        self.assertNotIn('PRIVATE', path.read_text())
+
+    def test_approve_validation_and_escaping(self):
+        path = self.root / 'terms.toml'
+        save_terms(path, {'Backlog': ['バックログ']}, set())
+        rows = [candidate('バックローグ', 'variant', 'Backlog', 'approve'),
+                candidate('ツール', 'new', 'Tool"\\\n', 'approve'),
+                candidate('トゥール', 'new', 'Tool"\\\n', 'approve'),
+                candidate('リード', 'new', '=keep', 'approve'),
+                candidate('キープ', 'new', '', 'keep'),
+                candidate('無視', 'new', 'Ignore', '')]
+        approve(rows, path)
+        terms, keeps = load_terms(path)
+        self.assertEqual(terms['Backlog'], ['バックログ', 'バックローグ'])
+        self.assertEqual(set(terms['Tool"\\\n']), {'ツール', 'トゥール'})
+        self.assertEqual(keeps, {'リード', 'キープ'})
+        before = path.read_bytes()
+        approve(rows, path)
+        self.assertEqual(path.read_bytes(), before)
+        for document in ['[[term]]\nto=""\nvariants=[]',
+                         '[[term]]\nto="A"\nvariants=[]\n[[term]]\nto="A"\nvariants=[]',
+                         '[[term]]\nto="A"\nvariants=["v"]\n[[term]]\nto="B"\nvariants=["v"]',
+                         '[[term]]\nto="A"\nvariants=["v"]\n[[keep]]\nword="v"']:
+            with self.subTest(document=document):
+                path.write_text(document)
+                with self.assertRaises(TermError):
+                    load_terms(path)
+
+    def test_build_refusal_force_and_determinism(self):
+        terms, out = self.root / 'terms.toml', self.root / 'replace.toml'
+        save_terms(terms, {'Z': ['ゼット'], 'A': ['エー', 'エイ']}, set())
+        out.write_text('handwritten\n')
+        with self.assertRaises(TermError):
+            build(terms, out, False)
+        self.assertEqual(out.read_text(), 'handwritten\n')
+        build(terms, out, True)
+        first = out.read_bytes()
+        self.assertEqual(out.read_text().splitlines()[0], HEADER)
+        rules = tomllib.loads(out.read_text())['rule']
+        self.assertEqual([r['to'] for r in rules], ['A', 'Z'])
+        self.assertTrue(all(r['whole_word'] for r in rules))
+        build(terms, out, False)
+        self.assertEqual(out.read_bytes(), first)
+
+    def test_summarize(self):
+        path = self.root / 'replay.jsonl'
+        records = [dict(at=at, engine=engine, changed=True, baseline='PRIVATE', proposal='PRIVATE',
+                        user_hits=[dict(to='Haas', **{'from': 'ハース'}, left='左'*20, right='右'*20)])
+                   for at, engine in [('2026-01-01T00:00:00Z', 'whisper'),
+                                      ('2025-12-31T23:59:59Z', 'other'),
+                                      ('2026-01-01T09:00:00+09:00', 'other')]]
+        path.write_text(''.join(json.dumps(r)+'\n' for r in records))
+        result = summarize(path, '2026-01-01T00:00:00Z')
+        self.assertIn('records: 3\nchanged records: 3', result)
+        self.assertIn('Haas\t3\twhisper=1\thaas=1\treazon=1', result)
+        for model in ('whisper', 'haas', 'reazon'):
+            self.assertIn(model+'\tハース -> Haas\t…'+'左'*10+'[ハース]'+'右'*10+'…', result)
+        self.assertNotIn('PRIVATE', result)
+        self.assertNotIn('haas\tハース', summarize(path, None))
+
+    def test_suggest_local_http(self):
+        requests = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"data":[{"id":"fixture"}]}')
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                requests.append(body)
+                token = body['messages'][-1]['content']
+                self.send_response(200)
+                self.end_headers()
+                reply = {'ツール': 'prefix {"keep_katakana":false,"latin":"Tool"} suffix',
+                         'リード': '{"keep_katakana":true,"latin":""}', 'エラー': 'bad'}[token]
+                self.wfile.write(json.dumps({'choices': [{'message': {'content': reply}}]}).encode())
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            path = self.root / 'c.tsv'
+            rows = [candidate(t) for t in ['ツール', 'リード', 'エラー']]
+            rows += [candidate('既存', 'variant', 'Existing'), candidate('済', 'new', 'Done')]
+            write_tsv(path, rows)
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                suggest(path, f'http://127.0.0.1:{server.server_port}', None, 2)
+            self.assertEqual([r['suggested_to'] for r in read_tsv(path)], ['Tool', '=keep', '', 'Existing', 'Done'])
+            self.assertIn('warning:', errors.getvalue())
+            self.assertEqual(len(requests), 4)
+            self.assertEqual(requests[1]['messages'][-1]['content'], 'ツール')
+            self.assertEqual(requests[1]['model'], 'fixture')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
+def candidate(token, kind='new', target='', decision=''):
+    return dict(token=token, count='1', first_at='', last_at='', kind=kind,
+                suggested_to=target, decision=decision)
+
+
+HEADER = '# Generated by scripts/transcript-terms/terms.py build — edit the terms file, not this file.'
+FIELDS = ['token', 'count', 'first_at', 'last_at', 'kind', 'suggested_to', 'decision']
+KATA = r'[ァ-ヺーヽヾ]'
+ASCII = r'[A-Za-z][A-Za-z0-9.+-]*'
+TOKEN_RE = re.compile(KATA + r'{2,}|' + ASCII)
+
+
+class TermError(ValueError):
+    """An expected input error safe to report without transcript contents."""
+
+
+def tokens(raw):
+    return TOKEN_RE.findall(unicodedata.normalize('NFKC', raw.strip()))
+
+
+def distance(left, right):
+    previous = list(range(len(right) + 1))
+    for i, a in enumerate(left, 1):
+        current = [i]
+        for j, b in enumerate(right, 1):
+            current.append(min(current[-1] + 1, previous[j] + 1,
+                               previous[j - 1] + (a != b)))
+        previous = current
+    return previous[-1]
+
+
+def classify(token, terms):
+    matches = []
+    katakana = re.fullmatch(KATA + '+', token) is not None
+    for target, variants in terms.items():
+        scores = []
+        if not katakana and token.lower() == target.lower():
+            scores.append(0)
+        for variant in variants:
+            if katakana and re.fullmatch(KATA + '+', variant) and token[0] == variant[0]:
+                score = distance(token, variant)
+                if score <= (0 if len(token) <= 3 else 1 if len(token) <= 6 else 2):
+                    scores.append(score)
+            elif not katakana and len(variant) >= 3 and re.fullmatch(ASCII, variant):
+                score = distance(token.lower(), variant.lower())
+                if score <= 1:
+                    scores.append(score)
+        if scores:
+            matches.append((min(scores), target))
+    matches.sort()
+    if matches and (len(matches) == 1 or matches[0][0] < matches[1][0]):
+        return 'variant', matches[0][1]
+    return 'new', ''
+
+
+def read_toml(path):
+    try:
+        return tomllib.loads(path.read_text(encoding='utf-8'))
+    except tomllib.TOMLDecodeError as error:
+        # TOML diagnostics can include private input; report only the file.
+        raise TermError(f'{path}: invalid TOML') from error
+
+
+def nonempty(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise TermError(f'{field} must be a non-empty string')
+    return value
+
+
+def validate(terms, keeps):
+    owners = set()
+    for target, variants in terms.items():
+        nonempty(target, 'term.to')
+        if not isinstance(variants, list):
+            raise TermError('term.variants must be an array of strings')
+        for variant in variants:
+            nonempty(variant, 'variant')
+            if variant in owners:
+                raise TermError('duplicate variant across terms or within a term')
+            if variant in keeps:
+                raise TermError('variant and keep words overlap')
+            owners.add(variant)
+    for word in keeps:
+        nonempty(word, 'keep.word')
+
+
+def load_terms(path):
+    if not path.exists():
+        return {}, set()
+    document = read_toml(path)
+    terms, keeps = {}, set()
+    for key in ('term', 'keep'):
+        if not isinstance(document.get(key, []), list):
+            raise TermError(f'{key} must be an array of tables')
+    for term in document.get('term', []):
+        if not isinstance(term, dict):
+            raise TermError('term must be a table')
+        target = nonempty(term.get('to'), 'term.to')
+        if target in terms:
+            raise TermError('duplicate term.to')
+        terms[target] = term.get('variants')
+    for keep in document.get('keep', []):
+        if not isinstance(keep, dict):
+            raise TermError('keep must be a table')
+        keeps.add(nonempty(keep.get('word'), 'keep.word'))
+    validate(terms, keeps)
+    return terms, keeps
+
+
+def quote(value):
+    # JSON's basic string escapes are also TOML escapes (ensure_ascii=False
+    # avoids JSON surrogate pairs, which TOML deliberately forbids).
+    return json.dumps(value, ensure_ascii=False).replace(chr(127), r'')
+
+
+def array(values):
+    return '[' + ', '.join(quote(v) for v in sorted(values)) + ']'
+
+
+def save_terms(path, terms, keeps):
+    validate(terms, keeps)
+    blocks = [f'[[term]]\nto = {quote(t)}\nvariants = {array(v)}\n'
+              for t, v in sorted(terms.items())]
+    blocks += [f'[[keep]]\nword = {quote(w)}\n' for w in sorted(keeps)]
+    path.write_text('\n'.join(blocks), encoding='utf-8')
+
+
+def timestamp(value):
+    try:
+        result = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if result.tzinfo is None:
+            raise ValueError()
+        return result
+    except (ValueError, AttributeError) as error:
+        raise TermError('expected RFC3339 timestamp with timezone') from error
+
+
+def jsonl(path):
+    with path.open(encoding='utf-8') as source:
+        for number, line in enumerate(source, 1):
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise TermError(f'{path}:{number}: invalid JSON record') from error
+            if not isinstance(value, dict):
+                raise TermError(f'{path}:{number}: expected JSON object')
+            yield value
+
+
+def mine(directory, terms_path, builtin, min_count):
+    terms, keeps = load_terms(terms_path)
+    excluded = set(terms) | keeps | {v for vs in terms.values() for v in vs}
+    for rule in read_toml(builtin).get('rule', []):
+        excluded.update(rule['from'])
+        excluded.add(rule['to'])
+    if not directory.is_dir():
+        raise TermError(f'{directory}: transcripts directory does not exist')
+    found = {}
+    for path in sorted(directory.glob('*.jsonl')):
+        for record in jsonl(path):
+            if not all(isinstance(record.get(k), str) for k in ('at', 'engine', 'raw', 'text')):
+                raise TermError(f'{path}: transcript fields must be strings')
+            at = record['at']
+            instant = timestamp(at)
+            for token in tokens(record['raw']):
+                if token in excluded:
+                    continue
+                if token not in found:
+                    found[token] = [0, at, at]
+                entry = found[token]
+                entry[0] += 1
+                if instant < timestamp(entry[1]):
+                    entry[1] = at
+                if instant > timestamp(entry[2]):
+                    entry[2] = at
+    rows = []
+    for token, (count, first, last) in sorted(found.items(), key=lambda item: (-item[1][0], item[0])):
+        if count >= min_count:
+            kind, target = classify(token, terms)
+            row = candidate(token, kind, target)
+            row.update(count=str(count), first_at=first, last_at=last)
+            rows.append(row)
+    return rows
+
+
+def read_tsv(path):
+    with path.open(encoding='utf-8', newline='') as source:
+        reader = csv.DictReader(source, delimiter='\t')
+        if reader.fieldnames != FIELDS:
+            raise TermError(f'{path}: unexpected TSV header')
+        rows = list(reader)
+        if any(None in row or any(v is None for v in row.values()) for row in rows):
+            raise TermError(f'{path}: malformed TSV row')
+        return rows
+
+
+def write_tsv(path, rows):
+    def write(stream):
+        writer = csv.DictWriter(stream, fieldnames=FIELDS, delimiter='\t', lineterminator='\n')
+        writer.writeheader()
+        writer.writerows(rows)
+    if path is None:
+        write(sys.stdout)
+    else:
+        with path.open('w', encoding='utf-8', newline='') as stream:
+            write(stream)
+
+
+def approve(rows, path):
+    terms, keeps = load_terms(path)
+    for row in rows:
+        token, target, decision = row['token'], row['suggested_to'], row['decision']
+        if decision == 'keep' or (decision == 'approve' and target == '=keep'):
+            keeps.add(nonempty(token, 'token'))
+        elif decision == 'approve':
+            nonempty(token, 'token')
+            nonempty(target, 'suggested_to')
+            if row['kind'] == 'variant' and target not in terms:
+                raise TermError('variant target does not exist')
+            variants = terms.setdefault(target, [])
+            if token not in variants:
+                variants.append(token)
+    save_terms(path, terms, keeps)
+
+
+def build(terms_path, out, force):
+    terms, _ = load_terms(terms_path)
+    if out.exists() and not force:
+        with out.open(encoding='utf-8') as source:
+            if source.readline().rstrip('\r\n') != HEADER:
+                raise TermError(f'{out}: refusing to overwrite a file without the generated header; use --force')
+    blocks = [f'[[rule]]\nfrom = {array(v)}\nto = {quote(t)}\nwhole_word = true\n'
+              for t, v in sorted(terms.items())]
+    out.write_text(HEADER + '\n\n' + '\n'.join(blocks), encoding='utf-8')
+
+
+def request_json(url, timeout, body=None):
+    request = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(),
+                                     headers={'Content-Type': 'application/json'})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def first_object(reply):
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'\{', reply):
+        try:
+            value, _ = decoder.raw_decode(reply[match.start():])
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            continue
+    raise TermError('no JSON object in reply')
+
+
+def suggest(path, url, model, timeout):
+    rows = read_tsv(path)
+    for number, row in enumerate(rows, 2):
+        if row['kind'] != 'new' or row['suggested_to']:
+            continue
+        try:
+            if model is None:
+                model = request_json(url.rstrip('/') + '/v1/models', timeout)['data'][0]['id']
+            result = request_json(url.rstrip('/') + '/v1/chat/completions', timeout, {
+                'model': model,
+                'messages': [
+                    {'role': 'system', 'content': 'Classify the supplied token in Japanese technical writing: a word normally written in katakana, or a product/proper noun/acronym normally written in Latin script. Answer JSON only: {"keep_katakana": bool, "latin": "<spelling or empty>"}.'},
+                    {'role': 'user', 'content': row['token']}]})
+            value = first_object(result['choices'][0]['message']['content'])
+            if not isinstance(value.get('keep_katakana'), bool) or not isinstance(value.get('latin'), str):
+                raise TermError('invalid classification')
+            row['suggested_to'] = '=keep' if value['keep_katakana'] else value['latin']
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            # Do not echo server replies or transcript data in diagnostics.
+            print(f'warning: candidate row {number}: suggestion failed', file=sys.stderr)
+    write_tsv(path, rows)
+
+
+def summarize(path, haas_since):
+    since = timestamp(haas_since) if haas_since else None
+    records, changed = 0, 0
+    counts = {}
+    snippets = []
+    for record in jsonl(path):
+        records += 1
+        changed += bool(record['changed'])
+        model = ('whisper' if record['engine'] == 'whisper' else
+                 'haas' if since is not None and timestamp(record['at']) >= since else 'reazon')
+        for hit in record['user_hits']:
+            counts.setdefault(hit['to'], Counter())[model] += 1
+            snippets.append(f"{model}\t{hit['from']} -> {hit['to']}\t…{hit['left'][-10:]}[{hit['from']}]{hit['right'][:10]}…")
+    lines = [f'records: {records}', f'changed records: {changed}',
+             'target\ttotal\twhisper\thaas\treazon']
+    for target, counter in sorted(counts.items()):
+        lines.append(f'{target}\t{sum(counter.values())}' + ''.join(
+            f'\t{m}={counter[m]}' for m in ('whisper', 'haas', 'reazon')))
+    return '\n'.join(lines + snippets)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--self-test', action='store_true')
+    commands = parser.add_subparsers(dest='command')
+    mining = commands.add_parser('mine')
+    for name in ('transcripts', 'terms', 'builtin'):
+        mining.add_argument('--'+name, type=Path, required=True)
+    mining.add_argument('--min-count', type=int, default=1)
+    mining.add_argument('--out', type=Path)
+    suggesting = commands.add_parser('suggest')
+    suggesting.add_argument('--candidates', type=Path, required=True)
+    suggesting.add_argument('--url', required=True)
+    suggesting.add_argument('--model')
+    suggesting.add_argument('--timeout', type=float, default=30)
+    approving = commands.add_parser('approve')
+    approving.add_argument('--candidates', type=Path, required=True)
+    approving.add_argument('--terms', type=Path, required=True)
+    building = commands.add_parser('build')
+    building.add_argument('--terms', type=Path, required=True)
+    building.add_argument('--out', type=Path, required=True)
+    building.add_argument('--force', action='store_true')
+    summary = commands.add_parser('summarize')
+    summary.add_argument('--replay', type=Path, required=True)
+    summary.add_argument('--haas-since')
+    args = parser.parse_args()
+    if args.self_test:
+        if args.command:
+            parser.error('--self-test cannot be combined with a subcommand')
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
+        return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+    if not args.command:
+        parser.error('a subcommand is required')
+    try:
+        if args.command == 'mine':
+            if args.min_count < 1:
+                raise TermError('--min-count must be positive')
+            write_tsv(args.out, mine(args.transcripts, args.terms, args.builtin, args.min_count))
+        elif args.command == 'suggest':
+            suggest(args.candidates, args.url, args.model, args.timeout)
+        elif args.command == 'approve':
+            approve(read_tsv(args.candidates), args.terms)
+        elif args.command == 'build':
+            build(args.terms, args.out, args.force)
+        else:
+            print(summarize(args.replay, args.haas_since))
+    except (TermError, OSError, UnicodeError) as error:
+        print(f'error: {error}', file=sys.stderr)
+        return 2
+    except (KeyError, TypeError, AttributeError) as error:
+        print('error: invalid input structure', file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

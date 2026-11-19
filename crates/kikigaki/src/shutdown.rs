@@ -1,12 +1,12 @@
 //! Idempotent process-shutdown coordination.
 
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
 const RUNNING: u8 = 0;
 const JOINING: u8 = 1;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 const EXITING: u8 = 2;
 
 pub(crate) struct ShutdownState(AtomicU8);
@@ -32,7 +32,7 @@ impl ShutdownState {
         self.0.load(Ordering::SeqCst) == RUNNING
     }
 
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
     pub(crate) fn mark_exiting(&self) {
         self.0.store(EXITING, Ordering::SeqCst);
         tracing::info!(from = "Joining", to = "Exiting", "shutdown state changed");
@@ -41,7 +41,7 @@ impl ShutdownState {
     /// Blocks until `mark_exiting` has run (true) or the timeout elapses (false).
     ///
     /// Shutdown-only path, so a coarse poll is fine; no condvar needed.
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
     pub(crate) fn wait_until_exiting(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -56,12 +56,12 @@ impl ShutdownState {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn begin_shutdown(app: &tauri::AppHandle) {
     begin_shutdown_with_code(app, 0);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn join_controller_and_log(state: &crate::shell::ShellState) {
     if let Some((controller, _death_monitor)) = state.controller.lock().unwrap().take() {
         if controller.join(std::time::Duration::from_secs(5)) {
@@ -72,7 +72,7 @@ fn join_controller_and_log(state: &crate::shell::ShellState) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn begin_shutdown_with_code(app: &tauri::AppHandle, code: i32) {
     use tauri::Manager;
 
@@ -107,7 +107,7 @@ pub(crate) fn begin_shutdown_with_code(app: &tauri::AppHandle, code: i32) {
 /// event, logout, Activity Monitor quit) reaches us through tao's `applicationWillTerminate` →
 /// `RunEvent::Exit`, after which the process ends as soon as the callback returns. The only way to
 /// honor "every quit source joins the controller" there is to block inside the callback.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn finish_synchronously(app: &tauri::AppHandle, source: &'static str) {
     use tauri::Manager;
 

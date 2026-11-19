@@ -37,6 +37,8 @@ pub enum ControllerCmd {
     /// Delivered by event producers so the run loop drains their queues without waiting for the
     /// poll tick.
     Wake,
+    #[cfg(target_os = "windows")]
+    MicPrepared(anyhow::Result<crate::mic::BuiltStream>),
     ApplySettings {
         patch: SettingsPatch,
         reply: ReplyTx<crate::settings::SettingsSnapshot>,
@@ -87,6 +89,17 @@ pub trait EngineFactory: Send + Sync {
 }
 
 pub trait MicPort: Send {
+    #[cfg(target_os = "windows")]
+    fn set_controller(&mut self, _client: ControllerClient) {}
+    #[cfg(target_os = "windows")]
+    fn install_prepared(&mut self, _result: anyhow::Result<crate::mic::BuiltStream>) {}
+    fn captured_audio(&self) -> bool {
+        false
+    }
+
+    fn prepare(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn start(&mut self, sink: kikigaki_core::engine::AudioSink) -> anyhow::Result<()>;
     fn stop(&mut self);
 }
@@ -131,7 +144,7 @@ pub enum BootstrapOutcome {
     ConfigError(crate::status::BootstrapError),
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 impl BootstrapOutcome {
     pub(crate) fn label(&self) -> &'static str {
         match self {
@@ -157,8 +170,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PASTE_TIMEOUT: Duration = Duration::from_secs(3);
 const MICROPHONE_PERMISSION_DENIED: &str = "マイクの使用が許可されていません";
-const MICROPHONE_PERMISSION_DETAIL: &str =
-    "システム設定 › プライバシーとセキュリティ › マイク で kikigaki を許可してください";
+use crate::platform::MICROPHONE_PERMISSION_DETAIL;
 
 impl ControllerClient {
     pub fn sender_for_handle(&self) -> SyncSender<ControllerCmd> {
@@ -368,6 +380,12 @@ fn run(
     controller_client: ControllerClient,
     poll_interval: Duration,
 ) {
+    #[cfg(target_os = "windows")]
+    let mic = {
+        let mut mic = mic;
+        mic.set_controller(controller_client.clone());
+        mic
+    };
     let waker: Waker = Arc::new(move || controller_client.wake());
     let (mut controller, auto_start) = Controller::new(
         cfg,
@@ -428,6 +446,8 @@ const PASTE_FAILED_DETAIL: &str =
     "システム設定 › プライバシーとセキュリティ › アクセシビリティ で kikigaki を許可してください";
 
 struct Controller {
+    warm_mic: bool,
+    mic_warning: Option<crate::status::StatusText>,
     settings: SettingsCoordinator,
     session: Session,
     mic: Box<dyn MicPort>,
@@ -530,6 +550,8 @@ impl Controller {
             EngineSupervisor::new(Box::new(move || supervisor_factory.build(standard_engine)))
                 .with_waker(Arc::clone(&waker));
         let controller = Self {
+            warm_mic: cfg!(target_os = "windows"),
+            mic_warning: None,
             settings,
             session,
             mic,
@@ -588,6 +610,8 @@ impl Controller {
         }
         self.dirty = true;
         match command {
+            #[cfg(target_os = "windows")]
+            ControllerCmd::MicPrepared(result) => self.mic.install_prepared(result),
             ControllerCmd::ApplySettings { patch, reply } => {
                 let result = self.apply_settings(patch);
                 let _ = reply.send(result);
@@ -741,6 +765,7 @@ impl Controller {
 
     fn handle_hotkey_edge(&mut self, edge: HotkeyEdge, outputs: &mut Vec<Output>) {
         let pressed = matches!(edge, HotkeyEdge::Pressed(_));
+        tracing::debug!(pressed, "hotkey edge");
         if !pressed && self.active.is_none_or(|gen| !self.owners.contains(&gen)) {
             return;
         }
@@ -1057,6 +1082,11 @@ impl Controller {
                             .try_into()
                             .unwrap_or(u64::MAX);
                         tracing::info!(process_to_ready_ms, "engine ready");
+                        if self.warm_mic && self.session.state() != State::Recording {
+                            if let Err(error) = self.mic.prepare() {
+                                tracing::warn!(%error, "microphone prepare failed; will open per press");
+                            }
+                        }
                         if self.first_ready {
                             append_metric(
                                 self.settings.config(),
@@ -1113,26 +1143,33 @@ impl Controller {
                         .and(self.supervisor.as_ref())
                         .and_then(EngineSupervisor::sink);
                     if let Some(sink) = sink {
-                        let permission_denied = microphone_permission_denied();
+                        let warning = microphone_warning(
+                            crate::permissions::microphone_permission(),
+                            cfg!(target_os = "windows"),
+                        );
                         let standard_failed = matches!(
                             self.status,
                             Status::StartupFailed(_) | Status::EngineFailed(_)
                         );
-                        if permission_denied && !standard_failed {
-                            self.status = Status::Warning(crate::status::StatusText::new(
-                                MICROPHONE_PERMISSION_DENIED,
-                                MICROPHONE_PERMISSION_DETAIL,
-                            ));
+                        if let Some((title, detail)) = warning.filter(|_| !standard_failed) {
+                            let text = crate::status::StatusText::new(title, detail);
+                            self.mic_warning = Some(text.clone());
+                            self.status = Status::Warning(text);
                         }
                         if let Err(error) = self.mic.start(sink) {
                             tracing::warn!(%error, "microphone unavailable");
-                            if !standard_failed {
-                                self.status = Status::Warning(crate::status::StatusText::new(
+                            if !standard_failed
+                                && (!cfg!(target_os = "windows") || warning.is_none())
+                            {
+                                let text = crate::status::StatusText::new(
                                     "マイクを使えません",
                                     error.to_string(),
-                                ));
+                                );
+                                self.mic_warning = Some(text.clone());
+                                self.status = Status::Warning(text);
                             }
-                        } else if !permission_denied
+                        } else if warning.is_none()
+                            && (!cfg!(target_os = "windows") || self.mic_warning.is_none())
                             && !matches!(
                                 &self.status,
                                 Status::Installing(_) | Status::EngineFailed(_)
@@ -1277,6 +1314,7 @@ impl Controller {
                 strip_trailing_period: settings.strip_trailing_period,
             },
             settings,
+            platform: crate::platform::NAME,
             // The platform shell replaces this Tauri-free placeholder before publishing.
             autostart: AutostartState {
                 enabled: false,
@@ -1320,6 +1358,17 @@ impl Controller {
     }
 
     fn publish_if_changed(&mut self) {
+        if cfg!(target_os = "windows")
+            && clear_captured_mic_warning(
+                &self.status,
+                self.mic_warning.as_ref(),
+                self.mic.captured_audio(),
+            )
+        {
+            self.mic_warning = None;
+            self.status = Status::Ok;
+            self.dirty = true;
+        }
         if !self.dirty {
             return;
         }
@@ -1418,14 +1467,35 @@ fn send_command(supervisor: &EngineSupervisor, command: EngineCmd) {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn microphone_permission_denied() -> bool {
-    !crate::permissions::microphone_permission().is_granted()
+fn clear_captured_mic_warning(
+    status: &Status,
+    own: Option<&crate::status::StatusText>,
+    captured: bool,
+) -> bool {
+    captured && matches!(status, Status::Warning(text) if Some(text) == own)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn microphone_permission_denied() -> bool {
-    false
+fn microphone_warning(
+    permission: crate::permissions::MicPermission,
+    windows: bool,
+) -> Option<(&'static str, &'static str)> {
+    use crate::permissions::MicPermission;
+    if !windows {
+        return (!permission.is_granted())
+            .then_some((MICROPHONE_PERMISSION_DENIED, MICROPHONE_PERMISSION_DETAIL));
+    }
+    match permission {
+        MicPermission::Denied => Some((MICROPHONE_PERMISSION_DENIED, MICROPHONE_PERMISSION_DETAIL)),
+        MicPermission::Busy => Some((
+            "マイクを使えません",
+            "ほかのアプリがマイクを使っています。閉じてから、もう一度確認してください。",
+        )),
+        MicPermission::Unavailable => Some((
+            "マイクを使えません",
+            "マイクが見つかりません。接続してから、もう一度確認してください。",
+        )),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1739,6 +1809,8 @@ mod tests {
 
     #[derive(Default)]
     struct MicState {
+        prepares: AtomicUsize,
+        prepare_fails: AtomicBool,
         starts: AtomicUsize,
         stops: AtomicUsize,
         running: AtomicBool,
@@ -1747,6 +1819,15 @@ mod tests {
     struct FakeMic(Arc<MicState>);
 
     impl MicPort for FakeMic {
+        fn prepare(&mut self) -> anyhow::Result<()> {
+            self.0.prepares.fetch_add(1, Ordering::Relaxed);
+            anyhow::ensure!(
+                !self.0.prepare_fails.load(Ordering::Relaxed),
+                "scripted prepare failure"
+            );
+            Ok(())
+        }
+
         fn start(&mut self, _sink: AudioSink) -> anyhow::Result<()> {
             self.0.starts.fetch_add(1, Ordering::Relaxed);
             self.0.running.store(true, Ordering::Relaxed);
@@ -2250,6 +2331,90 @@ mod tests {
                 });
             self.turn();
         }
+    }
+
+    #[test]
+    fn warm_mic_ready_prepares_and_press_release_does_not_prepare_again() {
+        let mut h = LifecycleHarness::new();
+        let mic = Arc::new(MicState::default());
+        h.controller.mic = Box::new(FakeMic(Arc::clone(&mic)));
+        h.controller.warm_mic = true;
+        h.boot(false);
+        assert!(poll(|| {
+            h.turn();
+            mic.prepares.load(Ordering::Relaxed) == 1
+        }));
+        assert_eq!(mic.starts.load(Ordering::Relaxed), 0);
+        let mut outputs = Vec::new();
+        h.controller
+            .handle_hotkey_edge(HotkeyEdge::Pressed(HotkeyKey::Standard), &mut outputs);
+        h.controller.execute_outputs(std::mem::take(&mut outputs));
+        assert_eq!(mic.starts.load(Ordering::Relaxed), 1);
+        h.engine(EngineKind::Local).send(EngineMsg::Ready);
+        h.turn();
+        assert_eq!(h.controller.session.state(), State::Recording);
+        assert_eq!(mic.prepares.load(Ordering::Relaxed), 1);
+        h.controller
+            .handle_hotkey_edge(HotkeyEdge::Released(HotkeyKey::Standard), &mut outputs);
+        h.controller.execute_outputs(outputs);
+        assert_eq!(mic.stops.load(Ordering::Relaxed), 1);
+        assert_eq!(mic.prepares.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cold_mic_ready_does_not_prepare() {
+        let mut h = LifecycleHarness::new();
+        let mic = Arc::new(MicState::default());
+        h.controller.mic = Box::new(FakeMic(Arc::clone(&mic)));
+        h.controller.warm_mic = false;
+        h.boot(false);
+        assert!(poll(|| {
+            h.turn();
+            h.controller.session.state() == State::Idle
+        }));
+        assert_eq!(mic.prepares.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_warm_prepare_preserves_ready_and_press_retries_normally() {
+        let mut h = LifecycleHarness::new();
+        let mic = Arc::new(MicState::default());
+        mic.prepare_fails.store(true, Ordering::Relaxed);
+        h.controller.mic = Box::new(FakeMic(Arc::clone(&mic)));
+        h.controller.warm_mic = true;
+        h.boot(false);
+        assert!(poll(|| {
+            h.turn();
+            mic.prepares.load(Ordering::Relaxed) == 1
+        }));
+        assert_eq!(h.controller.session.state(), State::Idle);
+        assert!(matches!(h.controller.status, Status::Ok));
+        let mut outputs = Vec::new();
+        h.controller
+            .handle_hotkey_edge(HotkeyEdge::Pressed(HotkeyKey::Standard), &mut outputs);
+        h.controller.execute_outputs(outputs);
+        assert_eq!(mic.starts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn superseded_hotword_ready_does_not_prepare_microphone() {
+        let mut h = LifecycleHarness::new();
+        let mic = Arc::new(MicState::default());
+        h.controller.mic = Box::new(FakeMic(Arc::clone(&mic)));
+        h.controller.warm_mic = true;
+        h.boot(true);
+        assert!(poll(|| {
+            h.turn();
+            !h.engine(EngineKind::Local)
+                .event_senders
+                .lock()
+                .unwrap()
+                .is_empty()
+        }));
+        h.controller.hotwords_desired = !h.controller.hotwords_applied;
+        h.engine(EngineKind::Local).send(EngineMsg::Ready);
+        h.turn();
+        assert_eq!(mic.prepares.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2898,7 +3063,11 @@ mod tests {
             utterance(&mut h, HotkeyKey::Standard);
             h.engine(EngineKind::Local)
                 .send(final_message(1, "queued before abort"));
-            h.turn();
+            // Queue postprocessing without draining its completion in the same turn:
+            // a fast worker could otherwise paste before the simulated disconnect.
+            let mut outputs = Vec::new();
+            h.controller.handle_engine_messages(&mut outputs);
+            h.controller.execute_outputs(outputs);
             rx.recv_timeout(Duration::from_secs(1)).unwrap();
             h.disconnected(None);
             h.turn();
@@ -3124,6 +3293,17 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         harness
+    }
+
+    #[test]
+    fn snapshot_serializes_the_compiled_platform() {
+        let harness = ready_harness();
+        let snapshot = latest(&harness).unwrap();
+        assert_eq!(snapshot.platform, crate::platform::NAME);
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap()["platform"],
+            crate::platform::NAME
+        );
     }
 
     fn latest(harness: &Harness) -> Option<UiSnapshot> {
@@ -4823,5 +5003,67 @@ mod tests {
         );
         let snapshot = wait_snapshot(&harness, |snapshot| snapshot.bootstrap_error.is_some());
         assert_eq!(snapshot.bootstrap_error.unwrap().message, "bad config");
+    }
+}
+
+#[cfg(test)]
+mod mic_warning_policy_tests {
+    use super::*;
+    use crate::permissions::MicPermission::*;
+
+    #[test]
+    fn only_denied_claims_permission_denial() {
+        assert_eq!(
+            microphone_warning(Denied, true).unwrap().0,
+            MICROPHONE_PERMISSION_DENIED
+        );
+        for permission in [Authorized, NotDetermined, Unknown, Restricted] {
+            assert!(microphone_warning(permission, true).is_none());
+        }
+        assert_eq!(
+            microphone_warning(Busy, true).unwrap().1,
+            "ほかのアプリがマイクを使っています。閉じてから、もう一度確認してください。"
+        );
+        assert_eq!(
+            microphone_warning(Unavailable, true).unwrap().1,
+            "マイクが見つかりません。接続してから、もう一度確認してください。"
+        );
+    }
+
+    #[test]
+    fn captured_audio_clears_only_the_controllers_own_mic_warning() {
+        let mic = crate::status::StatusText::new("マイクを使えません", "device error");
+        let own = Status::Warning(mic.clone());
+        assert!(!clear_captured_mic_warning(&own, Some(&mic), false));
+        assert!(clear_captured_mic_warning(&own, Some(&mic), true));
+        assert!(!clear_captured_mic_warning(&own, None, true));
+        assert!(!clear_captured_mic_warning(
+            &Status::Warning("other warning".into()),
+            Some(&mic),
+            true
+        ));
+        assert!(!clear_captured_mic_warning(
+            &Status::engine_failed("engine error"),
+            Some(&mic),
+            true
+        ));
+    }
+
+    #[test]
+    fn macos_warning_policy_is_unchanged() {
+        for permission in [
+            NotDetermined,
+            Restricted,
+            Denied,
+            Busy,
+            Unavailable,
+            Unknown,
+        ] {
+            assert_eq!(
+                microphone_warning(permission, false).unwrap().0,
+                MICROPHONE_PERMISSION_DENIED
+            );
+        }
+        assert!(microphone_warning(Authorized, false).is_none());
     }
 }

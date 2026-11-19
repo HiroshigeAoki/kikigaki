@@ -8,18 +8,21 @@ use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use kikigaki_core::config::PasteMethod;
 
 /// How long the pasted text stays on the clipboard before the previous content is restored.
-/// The target app reads the clipboard when it handles Cmd+V, which is usually well within
+/// The target app reads the clipboard when it handles the paste shortcut, usually well within
 /// this window.
 const RESTORE_DELAY: Duration = Duration::from_millis(300);
 
+const PASTE_FAILURE: &str = if cfg!(target_os = "macos") {
+    "paste failed: grant Accessibility to kikigaki in System Settings"
+} else {
+    "paste failed; the target window may not accept synthetic keyboard input"
+};
+
 pub fn paste(text: &str, method: PasteMethod) -> anyhow::Result<()> {
-    let mut enigo = Enigo::new(&Settings::default())
-        .context("paste failed: grant Accessibility to kikigaki in System Settings")?;
+    let mut enigo = Enigo::new(&Settings::default()).context(PASTE_FAILURE)?;
     match method {
         PasteMethod::Clipboard => paste_via_clipboard(text, &mut enigo),
-        PasteMethod::Type => enigo
-            .text(text)
-            .context("paste failed: grant Accessibility to kikigaki in System Settings"),
+        PasteMethod::Type => enigo.text(text).context(PASTE_FAILURE),
     }
 }
 
@@ -63,6 +66,14 @@ fn restore_queue() -> &'static Mutex<RestoreQueue> {
     QUEUE.get_or_init(|| Mutex::new(RestoreQueue::default()))
 }
 
+/// Maps the OS-neutral paste policy to the key enigo presses.
+fn modifier_key(modifier: crate::platform::PasteModifier) -> Key {
+    match modifier {
+        crate::platform::PasteModifier::Meta => Key::Meta,
+        crate::platform::PasteModifier::Control => Key::Control,
+    }
+}
+
 fn paste_via_clipboard(text: &str, enigo: &mut Enigo) -> anyhow::Result<()> {
     let mut clipboard = Clipboard::new().context("open clipboard")?;
     let ticket = {
@@ -71,16 +82,26 @@ fn paste_via_clipboard(text: &str, enigo: &mut Enigo) -> anyhow::Result<()> {
     };
     clipboard.set_text(text).context("set clipboard text")?;
 
+    let modifier = modifier_key(crate::platform::paste_modifier());
     let paste_result = (|| -> anyhow::Result<()> {
         enigo
-            .key(Key::Meta, Direction::Press)
-            .context("press Command for paste")?;
+            .key(modifier, Direction::Press)
+            .context(if cfg!(target_os = "macos") {
+                "press Command for paste"
+            } else {
+                "press paste modifier"
+            })?;
         let click_result = enigo
             .key(Key::Unicode('v'), Direction::Click)
             .context("press V for paste");
-        let release_result = enigo
-            .key(Key::Meta, Direction::Release)
-            .context("release Command after paste");
+        let release_result =
+            enigo
+                .key(modifier, Direction::Release)
+                .context(if cfg!(target_os = "macos") {
+                    "release Command after paste"
+                } else {
+                    "release paste modifier"
+                });
         click_result?;
         release_result
     })();
@@ -103,12 +124,20 @@ fn paste_via_clipboard(text: &str, enigo: &mut Enigo) -> anyhow::Result<()> {
         }
     });
 
-    paste_result.context("paste failed: grant Accessibility to kikigaki in System Settings")
+    paste_result.context(PASTE_FAILURE)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RestoreQueue;
+    use super::{modifier_key, RestoreQueue};
+    use crate::platform::PasteModifier;
+    use enigo::Key;
+
+    #[test]
+    fn modifier_key_maps_platform_policy_to_enigo_keys() {
+        assert_eq!(modifier_key(PasteModifier::Meta), Key::Meta);
+        assert_eq!(modifier_key(PasteModifier::Control), Key::Control);
+    }
 
     #[test]
     fn single_paste_restores_original_after_delay() {

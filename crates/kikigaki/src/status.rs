@@ -51,6 +51,8 @@ pub struct UiSnapshot {
     pub revision: u64,
     pub status: UiStatus,
     pub settings: crate::settings::SettingsSnapshot,
+    /// Compiled host platform; older clients may ignore this display hint.
+    pub platform: &'static str,
     pub autostart: AutostartState,
     pub onboarding: Option<OnboardingState>,
     pub history: Vec<crate::history::HistoryEntry>,

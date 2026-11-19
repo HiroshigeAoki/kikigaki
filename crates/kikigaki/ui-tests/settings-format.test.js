@@ -105,3 +105,133 @@ test('asrModelFooter describes the applied model', () => {
 test('statusKeysLine shows the standard chord', () => {
   assert.equal(f.statusKeysLine({hotkey:'Ctrl+Alt+Space'}), '⌃⌥Space を押している間だけ聞き取ります');
 });
+
+test('platform chord labels preserve macOS fallback and the wire vocabulary', () => {
+  for (const platform of ['macos', undefined, null, 'unsupported']) {
+    assert.equal(f.formatChord('Ctrl+Alt+Shift+Cmd+Space', platform), '⌃⌥⇧⌘Space');
+  }
+  assert.equal(f.formatChord('Cmd+Alt+Ctrl+Shift+Space', 'windows'), 'Ctrl+Alt+Shift+Win+Space');
+  assert.equal(f.statusKeysLine({ hotkey: 'Ctrl+Space' }, 'windows'), 'Ctrl+Space を押している間だけ聞き取ります');
+  assert.equal(f.formatChord('Ctrl++K', 'windows'), 'Ctrl++K');
+  assert.equal(f.chordFromKeyEvent({ code: 'KeyK', key: 'k', modifiers: ['Cmd', 'Ctrl'] }), 'Ctrl+Cmd+K');
+});
+
+test('onboarding steps and completion follow the host platform', () => {
+  const state = { microphone: 'authorized', accessibility_trusted: false, models_installed: false };
+  for (const platform of ['macos', undefined, null, 'unsupported']) {
+    assert.deepEqual(f.onboardingLayout(state, platform), {
+      showAccessibility: true, stepCount: 3, modelsReady: false, complete: false,
+    });
+    assert.equal(f.onboardingLayout({ ...state, models_installed: true }, platform).complete, false);
+  }
+  assert.deepEqual(f.onboardingLayout(state, 'windows'), {
+    showAccessibility: false, stepCount: 2, modelsReady: true, complete: false,
+  });
+  assert.equal(f.onboardingLayout({ ...state, models_installed: true }, 'windows').complete, true);
+  assert.equal(f.onboardingLayout({ ...state, microphone: 'denied', models_installed: true }, 'windows').complete, false);
+});
+
+
+test('settings DOM uses the snapshot platform, restores macOS steps, and opens microphone settings', async () => {
+  const vm = require('node:vm');
+  const fs = require('node:fs');
+  const elements = new Map();
+  const calls = [];
+  function element(id) {
+    if (!elements.has(id)) elements.set(id, {
+      id, hidden: false, children: [], handlers: {},
+      classList: { toggle() {}, add() {}, remove() {} },
+      addEventListener(name, handler) { this.handlers[name] = handler; },
+      replaceChildren() { this.children = []; },
+      appendChild(child) { this.children.push(child); },
+      setAttribute() {}, removeAttribute() {},
+    });
+    return elements.get(id);
+  }
+  const scenes = ['scene-onboarding', 'scene-settings', 'scene-config-error'].map(element);
+  const context = vm.createContext({
+    window: { addEventListener() {}, KikigakiFormat: f, __TAURI__: {
+      core: { invoke(command, args) {
+        calls.push([command, args]);
+        return command === 'get_snapshot' ? new Promise(() => {}) : Promise.resolve();
+      } },
+      event: { listen: () => Promise.resolve() },
+    } },
+    document: { getElementById: element, createElement: () => ({}), addEventListener() {},
+      querySelectorAll: (selector) => selector === '.scene' ? scenes : [] },
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../ui/settings.js'), 'utf8'), context);
+  const run = (source) => vm.runInContext(source, context);
+  run("renderChord('Ctrl+Cmd+Space')");
+  assert.equal(element('hkKbd').children[0].textContent, '⌃⌘Space');
+  for (const platform of ['windows', 'macos', 'unknown', undefined]) {
+    run(`currentSnapshot = ${JSON.stringify({ platform })}`);
+    run("renderChord('Ctrl+Alt+Cmd+Space')");
+    assert.equal(element('hkKbd').children[0].textContent,
+      platform === 'windows' ? 'Ctrl+Alt+Win+Space' : '⌃⌥⌘Space');
+    run("showOnboarding({ microphone: 'authorized', accessibility_trusted: false, models_installed: false })");
+    assert.equal(element('stepAx').hidden, platform === 'windows');
+    assert.equal(element('onboardingHeroStepCount').textContent, platform === 'windows' ? 2 : 3);
+    assert.equal(element('stepModelsNumber').textContent, platform === 'windows' ? '2' : '3');
+    run("showOnboarding({ microphone: 'authorized', accessibility_trusted: false, models_installed: true })");
+    assert.equal(element('scene-settings').hidden, platform !== 'windows');
+  }
+  run("currentSnapshot = { platform: 'windows' }; showOnboarding({ microphone: 'denied', accessibility_trusted: false, models_installed: false })");
+  await element('stepMicButton').handlers.click({ currentTarget: element('stepMicButton') });
+  for (const state of ['not_determined', 'busy', 'unavailable']) {
+    run(`showOnboarding({ microphone: '${state}', accessibility_trusted: false, models_installed: false })`);
+    const copy = f.microphoneStepCopy(state, 'windows');
+    assert.equal(element('stepMicButton').textContent, copy.button);
+    assert.equal(element('stepMicDetail').textContent, copy.detail);
+    assert.equal(element('stepMicButton').disabled, false);
+    assert.equal(element('stepMicButton').hidden, false);
+    const start = calls.length;
+    await element('stepMicButton').handlers.click({ currentTarget: element('stepMicButton') });
+    assert.equal(calls[start][0], 'request_microphone_access');
+    assert.equal(element('stepMicButton').disabled, false);
+  }
+  const settingsCall = calls.find(([command]) => command === 'open_settings_pane');
+  assert.ok(settingsCall);
+  assert.equal(settingsCall[1].pane, 'microphone');
+});
+
+test('microphone step copy preserves macOS and describes Windows probe failures', () => {
+  for (const platform of ['macos', undefined, null, 'unsupported', 'windows']) {
+    for (const state of ['denied', 'restricted']) {
+      assert.deepEqual(f.microphoneStepCopy(state, platform), {
+        button: platform === 'windows' ? 'Windows の設定を開く' : 'システム設定を開く',
+        detail: platform === 'windows' ? 'Windows の設定で許可してください。' : 'システム設定で許可してください。',
+      });
+    }
+    for (const state of ['authorized', 'not_determined', 'unknown', 'busy', 'unavailable']) {
+      let detail = state === 'authorized' ? '許可済み' : '文字起こしのために必要です。';
+      let button = '許可する';
+      if (platform === 'windows' && ['busy', 'unavailable'].includes(state)) {
+        button = 'もう一度確認';
+        detail = state === 'busy'
+          ? 'ほかのアプリがマイクを使っています。閉じてから、もう一度確認してください。'
+          : 'マイクが見つかりません。接続してから、もう一度確認してください。';
+      }
+      assert.deepEqual(f.microphoneStepCopy(state, platform), { button, detail });
+    }
+  }
+});
+
+test('Windows harness fixtures use the default shortcut and cover microphone states', () => {
+  const vm = require('node:vm');
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('../../../scripts/ui-harness/mock.js'), 'utf8');
+  for (const [name, microphone] of [
+    ['windows', null], ['windows-onboarding', 'authorized'], ['windows-mic-denied', 'denied'],
+    ['windows-mic-fresh', 'not_determined'], ['windows-mic-busy', 'busy'], ['windows-mic-unavailable', 'unavailable'],
+  ]) {
+    const context = { window: {}, location: { search: `?data=${name}` }, URLSearchParams };
+    vm.runInNewContext(source, context);
+    const fixture = context.window.__HARNESS__.fixture;
+    assert.equal(context.window.__HARNESS__.names.includes(name), true);
+    assert.equal(fixture.platform, 'windows');
+    assert.equal(fixture.settings.hotkey, 'Ctrl+Alt+Space');
+    assert.equal(fixture.status.hotkey, 'Ctrl+Alt+Space');
+    assert.equal(fixture.onboarding?.microphone ?? null, microphone);
+  }
+});

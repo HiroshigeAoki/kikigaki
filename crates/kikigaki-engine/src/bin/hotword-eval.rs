@@ -6,37 +6,23 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "whisper")]
-use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, ensure, Context};
 use kikigaki_core::config::AsrConfig;
-#[cfg(feature = "whisper")]
-use kikigaki_core::config::VadConfig;
-use kikigaki_core::models::{ASR_MODEL_ID, WHISPER_MODEL_ID};
+use kikigaki_core::models::ASR_MODEL_ID;
 use kikigaki_engine::audio::load_wav_16k;
 use kikigaki_engine::local::Recognizer;
-#[cfg(feature = "whisper")]
-use kikigaki_engine::local::Vad;
-#[cfg(feature = "whisper")]
-use kikigaki_engine::sherpa::build_vad;
 use kikigaki_engine::sherpa::{build_recognizer, build_recognizer_with_hotwords};
-#[cfg(feature = "whisper")]
-use kikigaki_engine::whisper_engine::{transcribe_utterance, DecodeCancel};
-use kikigaki_engine::whisper_guard::AudioCtxPolicy;
-#[cfg(feature = "whisper")]
-use kikigaki_engine::whisper_recognizer::build_whisper_recognizer;
 use serde::Serialize;
 
 const DEFAULT_HOTWORDS_SCORE: f32 = 1.5;
-const USAGE: &str = "usage: hotword-eval --models-dir D --manifest M.tsv [--manifest M.tsv ...] --wavs-dir W --out R.jsonl [--engine {reazon|whisper}] [--whisper-audio-ctx POLICY] [--hotwords-file F --bpe-vocab V] [--hotwords-score S] [--num-threads N]";
+const USAGE: &str = "usage: hotword-eval --models-dir D --manifest M.tsv [--manifest M.tsv ...] --wavs-dir W --out R.jsonl [--engine reazon] [--hotwords-file F --bpe-vocab V] [--hotwords-score S] [--num-threads N]";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EvalEngine {
     Reazon,
-    Whisper,
 }
 
 #[derive(Debug)]
@@ -50,31 +36,16 @@ struct Args {
     hotwords_score: Option<f32>,
     num_threads: u32,
     engine: EvalEngine,
-    whisper_audio_ctx: Option<AudioCtxPolicy>,
 }
 
 enum EvalRecognizer {
     Reazon(Box<dyn Recognizer>),
-    #[cfg(feature = "whisper")]
-    Whisper {
-        vad: Box<dyn Vad>,
-        recognizer: Box<dyn Recognizer>,
-    },
 }
 
 impl EvalRecognizer {
     fn transcribe(&mut self, samples: &[f32]) -> anyhow::Result<Option<String>> {
         match self {
             Self::Reazon(recognizer) => Ok(recognizer.transcribe(samples)),
-            #[cfg(feature = "whisper")]
-            Self::Whisper { vad, recognizer } => {
-                vad.reset().context("reset VAD for Whisper utterance")?;
-                Ok(Some(transcribe_utterance(
-                    vad.as_mut(),
-                    recognizer.as_mut(),
-                    samples,
-                )))
-            }
         }
     }
 }
@@ -173,34 +144,12 @@ fn run() -> anyhow::Result<()> {
                 build_recognizer(&args.models_dir, &asr_config).context("build recognizer")?,
             ),
         }),
-        EvalEngine::Whisper => {
-            #[cfg(feature = "whisper")]
-            {
-                let vad = build_vad(&args.models_dir, &VadConfig::default())
-                    .context("build VAD for Whisper")?;
-                let recognizer = build_whisper_recognizer(
-                    &args.models_dir,
-                    cfg!(feature = "whisper-metal"),
-                    Arc::new(AtomicBool::new(false)),
-                    DecodeCancel::new(),
-                )
-                .context("build Whisper recognizer")?
-                .with_audio_ctx_policy(args.whisper_audio_ctx.unwrap_or_default());
-                EvalRecognizer::Whisper {
-                    vad: Box::new(vad),
-                    recognizer: Box::new(recognizer),
-                }
-            }
-            #[cfg(not(feature = "whisper"))]
-            unreachable!("parse_args rejects Whisper when the feature is disabled")
-        }
     };
 
     let (mut pending, file) = create_pending_output(&args.out)?;
     let mut writer = BufWriter::new(file);
     let header = RunMetadata {
         condition: match args.engine {
-            EvalEngine::Whisper => "W",
             EvalEngine::Reazon if hotwords.is_some() => "D",
             EvalEngine::Reazon => "B",
         },
@@ -216,15 +165,9 @@ fn run() -> anyhow::Result<()> {
         num_threads: args.num_threads,
         manifest_sha256,
         git_head,
-        model_dir: match args.engine {
-            EvalEngine::Reazon => ASR_MODEL_ID,
-            EvalEngine::Whisper => WHISPER_MODEL_ID,
-        }
-        .to_owned(),
-        whisper_audio_ctx: match args.engine {
-            EvalEngine::Whisper => Some(args.whisper_audio_ctx.unwrap_or_default().to_string()),
-            EvalEngine::Reazon => None,
-        },
+        model_dir: ASR_MODEL_ID.to_owned(),
+        // Preserve the JSONL schema for comparison with older evaluation results.
+        whisper_audio_ctx: None,
     };
     writer
         .write_all(json_line(&header)?.as_bytes())
@@ -486,7 +429,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
     let mut hotwords_score = None;
     let mut num_threads = 1;
     let mut engine = None;
-    let mut whisper_audio_ctx = None;
     let mut arguments = arguments.into_iter();
 
     while let Some(argument) = arguments.next() {
@@ -513,17 +455,9 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
                 let value = take_utf8(&mut arguments, flag)?;
                 let value = match value.as_str() {
                     "reazon" => EvalEngine::Reazon,
-                    "whisper" => EvalEngine::Whisper,
-                    _ => bail!("invalid --engine value {value:?}; expected reazon or whisper"),
+                    _ => bail!("invalid --engine value {value:?}; expected reazon"),
                 };
                 set_once(&mut engine, value, flag)?;
-            }
-            "--whisper-audio-ctx" => {
-                let value = take_utf8(&mut arguments, flag)?;
-                let policy = value
-                    .parse::<AudioCtxPolicy>()
-                    .map_err(|error| anyhow!("invalid {flag} value {value:?}: {error}"))?;
-                set_once(&mut whisper_audio_ctx, policy, flag)?;
             }
             "--num-threads" => {
                 let value = take_utf8(&mut arguments, flag)?;
@@ -544,16 +478,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
         "at least one --manifest is required\n{USAGE}"
     );
     let engine = engine.unwrap_or(EvalEngine::Reazon);
-    if engine == EvalEngine::Whisper {
-        ensure!(
-            hotwords_file.is_none() && bpe_vocab.is_none() && hotwords_score.is_none(),
-            "--engine whisper is incompatible with --hotwords-file, --bpe-vocab, and --hotwords-score"
-        );
-        #[cfg(not(feature = "whisper"))]
-        bail!("--engine whisper requires hotword-eval to be built with the whisper feature");
-    } else if whisper_audio_ctx.is_some() {
-        bail!("--whisper-audio-ctx requires --engine whisper");
-    }
     match (&hotwords_file, &bpe_vocab) {
         (Some(_), None) => bail!("--hotwords-file requires --bpe-vocab\n{USAGE}"),
         (None, Some(_)) => bail!("--bpe-vocab requires --hotwords-file\n{USAGE}"),
@@ -572,7 +496,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
         hotwords_score,
         num_threads,
         engine,
-        whisper_audio_ctx,
     })
 }
 
@@ -799,26 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn serializes_whisper_audio_ctx_in_header() {
-        let header = RunMetadata {
-            condition: "W",
-            hotwords_file_sha256: None,
-            hotwords_line_count: None,
-            hotwords_score: None,
-            bpe_vocab_sha256: None,
-            bpe_vocab_line_count: None,
-            num_threads: 1,
-            manifest_sha256: vec!["manifest-hash".into()],
-            git_head: "012345".into(),
-            model_dir: "whisper-model".into(),
-            whisper_audio_ctx: Some("scaled:1000:128".into()),
-        };
-
-        let serialized = json_line(&header).unwrap();
-        assert!(serialized.contains("\"whisper_audio_ctx\":\"scaled:1000:128\""));
-    }
-
-    #[test]
     fn hotwords_and_bpe_vocab_must_be_supplied_together() {
         let required = [
             "--models-dir",
@@ -865,64 +768,9 @@ mod tests {
     }
 
     #[test]
-    fn engine_whisper_rejects_hotword_flags() {
-        let required = [
-            "--models-dir",
-            "models",
-            "--manifest",
-            "manifest.tsv",
-            "--wavs-dir",
-            "wavs",
-            "--out",
-            "result.jsonl",
-        ];
-        let error = parse_args(
-            required
-                .into_iter()
-                .chain([
-                    "--engine",
-                    "whisper",
-                    "--hotwords-file",
-                    "hotwords.txt",
-                    "--bpe-vocab",
-                    "bpe.vocab",
-                ])
-                .map(OsString::from),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("whisper"));
-    }
-
-    #[test]
-    fn whisper_audio_ctx_rejects_reazon_and_bad_values() {
-        let required = [
-            "--models-dir",
-            "models",
-            "--manifest",
-            "manifest.tsv",
-            "--wavs-dir",
-            "wavs",
-            "--out",
-            "result.jsonl",
-        ];
-        let incompatible = parse_args(
-            required
-                .into_iter()
-                .chain(["--whisper-audio-ctx", "full"])
-                .map(OsString::from),
-        )
-        .unwrap_err();
-        assert!(incompatible.to_string().contains("--engine whisper"));
-
-        let invalid = parse_args(
-            required
-                .into_iter()
-                .chain(["--engine", "whisper", "--whisper-audio-ctx", "1501"])
-                .map(OsString::from),
-        )
-        .unwrap_err();
-        assert!(invalid.to_string().contains("--whisper-audio-ctx"));
+    fn removed_audio_context_option_is_rejected() {
+        let error = parse_args(["--whisper-audio-ctx", "full"].map(OsString::from)).unwrap_err();
+        assert!(error.to_string().contains("unknown argument"));
     }
 
     #[test]
@@ -951,9 +799,8 @@ mod tests {
         assert_eq!(overridden.num_threads, 6);
     }
 
-    #[cfg(not(feature = "whisper"))]
     #[test]
-    fn engine_whisper_requires_the_whisper_feature() {
+    fn engine_whisper_is_rejected() {
         let error = parse_args(
             [
                 "--models-dir",
@@ -971,12 +818,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("built with the whisper feature"));
+        assert!(error.to_string().contains("expected reazon"));
     }
 
-    #[cfg(feature = "whisper")]
     #[test]
-    fn engine_whisper_is_accepted_when_the_feature_is_enabled() {
+    fn explicit_reazon_engine_is_accepted() {
         let args = parse_args(
             [
                 "--models-dir",
@@ -988,44 +834,12 @@ mod tests {
                 "--out",
                 "result.jsonl",
                 "--engine",
-                "whisper",
+                "reazon",
             ]
             .map(OsString::from),
         )
         .unwrap();
-
-        assert_eq!(args.engine, EvalEngine::Whisper);
-    }
-
-    #[cfg(feature = "whisper")]
-    #[test]
-    fn whisper_audio_ctx_is_accepted_with_whisper() {
-        let args = parse_args(
-            [
-                "--models-dir",
-                "models",
-                "--manifest",
-                "manifest.tsv",
-                "--wavs-dir",
-                "wavs",
-                "--out",
-                "result.jsonl",
-                "--engine",
-                "whisper",
-                "--whisper-audio-ctx",
-                "scaled:250:64",
-            ]
-            .map(OsString::from),
-        )
-        .unwrap();
-
-        assert_eq!(
-            args.whisper_audio_ctx,
-            Some(AudioCtxPolicy::Scaled {
-                pad_ms: 250,
-                min: 64,
-            })
-        );
+        assert_eq!(args.engine, EvalEngine::Reazon);
     }
 
     #[test]

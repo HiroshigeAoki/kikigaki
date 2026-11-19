@@ -12,11 +12,11 @@ use kikigaki_core::config::PasteMethod;
 /// this window.
 const RESTORE_DELAY: Duration = Duration::from_millis(300);
 
-#[cfg(target_os = "macos")]
-const PASTE_FAILURE: &str = "paste failed: grant Accessibility to kikigaki in System Settings";
-#[cfg(target_os = "windows")]
-const PASTE_FAILURE: &str =
-    "paste failed; the target window may not accept synthetic keyboard input";
+const PASTE_FAILURE: &str = if cfg!(target_os = "macos") {
+    "paste failed: grant Accessibility to kikigaki in System Settings"
+} else {
+    "paste failed; the target window may not accept synthetic keyboard input"
+};
 
 pub fn paste(text: &str, method: PasteMethod) -> anyhow::Result<()> {
     let mut enigo = Enigo::new(&Settings::default()).context(PASTE_FAILURE)?;

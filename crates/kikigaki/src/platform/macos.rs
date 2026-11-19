@@ -5,6 +5,9 @@ use crate::permissions::MicPermission;
 #[link(name = "AVFoundation", kind = "framework")]
 extern "C" {}
 
+/// macOS requests permission on demand; no startup probe is needed.
+pub fn init_microphone_permission_probe() {}
+
 pub fn microphone_permission() -> MicPermission {
     use objc2::{msg_send, runtime::AnyClass};
     use objc2_foundation::NSString;

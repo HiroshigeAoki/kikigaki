@@ -14,8 +14,6 @@ pub(crate) enum SampleFormat {
     U64,
     F64,
 }
-#[cfg(test)]
-use dasp_sample::{FromSample, Sample};
 
 /// Ranks sample formats by conversion cost, lowest first: `0` is F32 (no
 /// conversion), then I16 (what CoreAudio and WASAPI most commonly offer
@@ -42,6 +40,7 @@ pub(crate) fn format_rank(format: SampleFormat) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dasp_sample::Sample;
 
     #[test]
     fn format_rank_prefers_f32_then_integer_widths() {

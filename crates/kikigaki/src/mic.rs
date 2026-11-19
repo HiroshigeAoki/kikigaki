@@ -61,13 +61,16 @@ fn build_sample_stream<T, F, E>(
 where
     T: SizedSample,
     f32: FromSample<T>,
-    F: FnMut(Vec<f32>) + Send + 'static,
+    F: FnMut(&[f32]) + Send + 'static,
     E: FnMut(cpal::Error) + Send + 'static,
 {
+    let mut conversion_scratch = Vec::new();
     device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
-            on_samples(data.iter().copied().map(f32::from_sample).collect());
+            conversion_scratch.clear();
+            conversion_scratch.extend(data.iter().copied().map(f32::from_sample));
+            on_samples(&conversion_scratch);
         },
         on_error,
         WARM_STREAM.then_some(STREAM_BUILD_TIMEOUT),
@@ -82,7 +85,7 @@ fn build_capture_stream<F, E>(
     on_error: E,
 ) -> Result<cpal::Stream, cpal::Error>
 where
-    F: FnMut(Vec<f32>) + Send + 'static,
+    F: FnMut(&[f32]) + Send + 'static,
     E: FnMut(cpal::Error) + Send + 'static,
 {
     let config = supported.config();
@@ -126,20 +129,14 @@ fn resolve_input_device(host: &cpal::Host) -> anyhow::Result<(cpal::Device, Opti
         return Ok((default, None));
     }
 
-    let default_name = default
-        .description()
-        .ok()
-        .map(|description| description.name().to_owned());
+    let default_name = device_name(&default);
     let log_name = default_name.as_deref().unwrap_or("<unknown>");
 
     if let Some(default_name) = default_name.as_deref() {
         match host.input_devices() {
             Ok(devices) => {
                 for device in devices {
-                    if device
-                        .description()
-                        .is_ok_and(|description| description.name() == default_name)
-                    {
+                    if device_name(&device).as_deref() == Some(default_name) {
                         tracing::info!(name = %default_name, concrete = true, "microphone device resolved");
                         return Ok((device, Some(default_name.to_owned())));
                     }
@@ -159,11 +156,15 @@ fn resolve_input_device(host: &cpal::Host) -> anyhow::Result<(cpal::Device, Opti
     Ok((default, default_name))
 }
 
-fn default_input_device_name(host: &cpal::Host) -> Option<String> {
-    host.default_input_device()?
+fn device_name(device: &cpal::Device) -> Option<String> {
+    device
         .description()
         .ok()
         .map(|description| description.name().to_owned())
+}
+
+fn default_input_device_name(host: &cpal::Host) -> Option<String> {
+    device_name(&host.default_input_device()?)
 }
 
 impl Mic {
@@ -183,12 +184,7 @@ impl Mic {
         if !WARM_STREAM {
             return Ok(());
         }
-        if self.stream.is_some()
-            && self
-                .shared
-                .as_ref()
-                .is_some_and(|shared| !shared.needs_rebuild())
-        {
+        if self.is_warm() {
             return Ok(());
         }
         self.discard_stream();
@@ -221,12 +217,11 @@ impl Mic {
         self.stop();
         let started = Instant::now();
 
+        let mut warm = false;
+        let mut build_ms = None;
+        let mut open_started_at = started;
         if WARM_STREAM {
-            let mut warm = self.stream.is_some()
-                && self
-                    .shared
-                    .as_ref()
-                    .is_some_and(|shared| !shared.needs_rebuild());
+            warm = self.is_warm();
             if warm {
                 let host = cpal::default_host();
                 if let Some(current) = default_input_device_name(&host) {
@@ -241,50 +236,29 @@ impl Mic {
             if !warm {
                 self.prepare()?;
             }
-            let shared = Arc::clone(
-                self.shared
-                    .as_ref()
-                    .expect("prepare installed shared state"),
-            );
-            shared.arm(sink);
-            let play_started_at = Instant::now();
-            if let Err(error) = self
-                .stream
-                .as_ref()
-                .expect("prepare installed stream")
-                .play()
-            {
-                self.discard_stream();
-                return Err(error).context("start microphone stream");
-            }
-            tracing::info!(
-                open_ms = started.elapsed().as_millis(),
-                play_ms = play_started_at.elapsed().as_millis(),
-                warm,
-                "microphone stream started"
-            );
-            return Ok(());
+        } else {
+            let built = Self::build_stream()?;
+            build_ms = Some(built.build_ms);
+            open_started_at = built.entry_at;
+            self.stream = Some(built.stream);
+            self.shared = Some(built.shared);
         }
-
-        let built = Self::build_stream()?;
-        let build_ms = built.build_ms;
-        let entry_at = built.entry_at;
-        self.stream = Some(built.stream);
-        self.shared = Some(built.shared);
-        let shared = Arc::clone(self.shared.as_ref().expect("build installed shared state"));
+        let shared = Arc::clone(self.shared.as_ref().expect("start installed shared state"));
         shared.arm(sink);
         let play_started_at = Instant::now();
-        if let Err(error) = self.stream.as_ref().expect("build installed stream").play() {
+        if let Err(error) = self.stream.as_ref().expect("start installed stream").play() {
             self.discard_stream();
-            return Err(error).context(
-                "start microphone stream; grant Microphone access to kikigaki in System Settings",
-            );
+            return Err(error).context(if WARM_STREAM {
+                "start microphone stream"
+            } else {
+                "start microphone stream; grant Microphone access to kikigaki in System Settings"
+            });
         }
         tracing::info!(
             build_ms,
             play_ms = play_started_at.elapsed().as_millis(),
-            open_ms = entry_at.elapsed().as_millis(),
-            warm = false,
+            open_ms = open_started_at.elapsed().as_millis(),
+            warm,
             "microphone stream started"
         );
         Ok(())
@@ -372,10 +346,10 @@ impl Mic {
                     );
                 }
                 let samples = if passthrough {
-                    data
+                    data.to_vec()
                 } else {
                     mono_scratch.clear();
-                    downmix_into(&data, channels, &mut mono_scratch);
+                    downmix_into(data, channels, &mut mono_scratch);
                     resampled_scratch.clear();
                     resampler.push_into(&mono_scratch, &mut resampled_scratch);
                     resampled_scratch.clone()
@@ -392,11 +366,10 @@ impl Mic {
                 };
                 if sink.as_ref().is_some_and(|sink| {
                     matches!(sink.send(EngineCmd::Audio(samples)), Err(SinkError::Closed))
-                }) {
-                    if !closed_warned {
-                        closed_warned = true;
-                        tracing::warn!("engine command channel closed; microphone audio stopped");
-                    }
+                }) && !closed_warned
+                {
+                    closed_warned = true;
+                    tracing::warn!("engine command channel closed; microphone audio stopped");
                 }
             },
             move |error| {
@@ -471,6 +444,14 @@ impl Mic {
         } else if !WARM_STREAM {
             self.discard_stream();
         }
+    }
+
+    fn is_warm(&self) -> bool {
+        self.stream.is_some()
+            && self
+                .shared
+                .as_ref()
+                .is_some_and(|shared| !shared.needs_rebuild())
     }
 
     fn discard_stream(&mut self) {

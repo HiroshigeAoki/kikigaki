@@ -95,11 +95,6 @@ pub fn autostart_available() -> bool {
     true
 }
 
-pub fn autostart_unavailable_message() -> &'static str {
-    // Unreachable on Windows because `autostart_available()` is always true.
-    "自動起動を設定できません"
-}
-
 pub(crate) fn settings_pane_uri(pane: crate::shell::OnboardingPane) -> Option<&'static str> {
     use crate::shell::OnboardingPane;
 

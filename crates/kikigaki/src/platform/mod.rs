@@ -217,3 +217,9 @@ mod paste_modifier_tests {
         );
     }
 }
+
+pub(crate) const MICROPHONE_PERMISSION_DETAIL: &str = if cfg!(target_os = "windows") {
+    "Windows の設定 › プライバシーとセキュリティ › マイク で kikigaki を許可してください"
+} else {
+    "システム設定 › プライバシーとセキュリティ › マイク で kikigaki を許可してください"
+};

@@ -886,6 +886,7 @@ async fn end_hotkey_capture(
 
 #[tauri::command]
 fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<(), crate::status::UiError> {
+    #[cfg(target_os = "macos")]
     if !crate::platform::autostart_available() {
         return Err(crate::status::UiError {
             code: "not_relocatable",

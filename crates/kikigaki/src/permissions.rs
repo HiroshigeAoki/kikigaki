@@ -38,23 +38,9 @@ impl MicPermission {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub fn microphone_permission() -> MicPermission {
-    crate::platform::microphone_permission()
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub fn request_microphone_access(timeout: std::time::Duration) -> Result<bool, String> {
-    crate::platform::request_microphone_access(timeout)
-}
-
-/// Runs Windows's one-time, synchronous startup probe before the initial onboarding scan.
-#[cfg(target_os = "windows")]
-pub fn init_microphone_permission_probe() {
-    crate::platform::init_microphone_permission_probe();
-}
-
-#[cfg(target_os = "macos")]
-pub fn init_microphone_permission_probe() {}
+pub use crate::platform::{
+    init_microphone_permission_probe, microphone_permission, request_microphone_access,
+};
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(dead_code)]

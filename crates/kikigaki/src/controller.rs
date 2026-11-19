@@ -160,13 +160,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PASTE_TIMEOUT: Duration = Duration::from_secs(3);
 const MICROPHONE_PERMISSION_DENIED: &str = "マイクの使用が許可されていません";
-#[cfg(not(target_os = "windows"))]
-const MICROPHONE_PERMISSION_DETAIL: &str =
-    "システム設定 › プライバシーとセキュリティ › マイク で kikigaki を許可してください";
-
-#[cfg(target_os = "windows")]
-const MICROPHONE_PERMISSION_DETAIL: &str =
-    "Windows の設定 › プライバシーとセキュリティ › マイク で kikigaki を許可してください";
+use crate::platform::MICROPHONE_PERMISSION_DETAIL;
 
 impl ControllerClient {
     pub fn sender_for_handle(&self) -> SyncSender<ControllerCmd> {
@@ -1435,14 +1429,9 @@ fn send_command(supervisor: &EngineSupervisor, command: EngineCmd) {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn microphone_permission_denied() -> bool {
-    !crate::permissions::microphone_permission().is_granted()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn microphone_permission_denied() -> bool {
-    false
+    cfg!(any(target_os = "macos", target_os = "windows"))
+        && !crate::permissions::microphone_permission().is_granted()
 }
 
 #[cfg(test)]

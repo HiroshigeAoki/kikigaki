@@ -66,7 +66,7 @@ server_punctuates = true
 
 `asr.hotwords_score` は、内蔵辞書を有効化した際に適用される、登録語の認識を促す強さで、既定値は `3.0`。変更はkikigakiの再起動後に反映される。`asr.decoding_method = "greedy_search"` と内蔵辞書を同時に有効にした場合、ホットワードによる認識バイアスは利用できない。ログに警告を出し、認識はバイアスなしのベースライン相当で続行する。置換辞書は引き続き適用される。
 
-`asr.model` は `"haas"` (既定)または `"reazonspeech"` を取る。通常は設定画面の「認識モデル」で選ぶ。Haasを選ぶと `model = "haas"`、標準を選ぶと `model = "reazonspeech"` が `[asr]` に保存される。モデル未指定の既存環境でReazonSpeechだけがインストールされている場合は、Haasを選ぶかインストールするまでReazonSpeechを使い続ける。ReazonSpeechを明示的に使い続けるには、`[asr]` に `model = "reazonspeech"` を指定する。変更はkikigakiの再起動後に反映される。
+`asr.model` は `"haas"` (既定)または `"reazonspeech"` を取る。通常は設定画面の「認識モデル」で選ぶ。Haasを選ぶと `model = "haas"`、標準を選ぶと `model = "reazonspeech"` が `[asr]` に保存される。モデル未指定の既存環境でReazonSpeechだけがインストールされている場合は、Haasを選ぶかインストールするまでReazonSpeechを使い続ける。Haasのモデルがすでに入っている場合は、モデル未指定ならHaasを使う。ReazonSpeechを明示的に使い続けるには、`[asr]` に `model = "reazonspeech"` を指定する。変更はkikigakiの再起動後に反映される。
 
 `asr.haas_hotwords_score` は、Haas使用時に `asr.hotwords_score` の代わりに使う認識バイアスの強さで、既定値は `1.5`。
 

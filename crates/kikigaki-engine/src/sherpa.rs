@@ -170,10 +170,21 @@ fn create_recognizer(
     spec: ModelSpec,
     sherpa_config: OfflineRecognizerConfig,
 ) -> anyhow::Result<SherpaAsr> {
+    let sherpa_config = with_no_spin_provider(models_dir, sherpa_config);
     let path = models_dir.join(spec.id);
     let recognizer = OfflineRecognizer::create(&sherpa_config)
         .ok_or_else(|| anyhow!("failed to load {} from {}", spec.id, path.display()))?;
     Ok(SherpaAsr { recognizer, spec })
+}
+
+/// Points a recognizer config at the no-spin CPU provider. Every recognizer, whatever its model,
+/// is created through this, so `recognizer_config` itself stays free of filesystem access.
+fn with_no_spin_provider(
+    models_dir: &Path,
+    mut sherpa_config: OfflineRecognizerConfig,
+) -> OfflineRecognizerConfig {
+    sherpa_config.model_config.provider = Some(cpu_provider(models_dir));
+    sherpa_config
 }
 
 /// Returns the sherpa-onnx CPU provider string, pointing it at a freshly written no-spin config.
@@ -220,7 +231,7 @@ pub(crate) fn recognizer_config(
     sherpa_config.model_config.tokens = Some(path.join(spec.tokens).to_string_lossy().into_owned());
     sherpa_config.model_config.num_threads =
         i32::try_from(config.num_threads).context("ASR thread count exceeds sherpa-onnx range")?;
-    sherpa_config.model_config.provider = Some(cpu_provider(models_dir));
+    sherpa_config.model_config.provider = Some("cpu".into());
     sherpa_config.model_config.model_type = Some(spec.model_type.into());
     sherpa_config.model_config.modeling_unit = spec.modeling_unit.map(str::to_owned);
     sherpa_config.decoding_method = Some(config.decoding_method.as_sherpa_str().into());
@@ -293,9 +304,10 @@ mod tests {
                 model,
                 ..AsrConfig::default()
             };
-            let actual = recognizer_config(dir.path(), &config, None).unwrap();
-            assert_eq!(actual.model_config.provider, Some(cpu_provider(dir.path())));
-            assert_ne!(actual.model_config.provider.as_deref(), Some("cpu"));
+            let base = recognizer_config(dir.path(), &config, None).unwrap();
+            let actual = with_no_spin_provider(dir.path(), base);
+            let expected = format!("cpu:{}", dir.path().join("ort/cpu-no-spin.cfg").display());
+            assert_eq!(actual.model_config.provider, Some(expected));
         }
     }
 

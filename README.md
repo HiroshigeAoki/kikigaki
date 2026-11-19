@@ -28,7 +28,7 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 ## プライバシー
 
-音声認識(ReazonSpeech、長文キーではWhisper)、発話区間検出(Silero VAD)、句読点付与(mojicast)は、すべて端末上で実行される。既定構成でネットワークを使うのはモデルの初回ダウンロードだけで、音声データや認識結果を外部サーバーへ送信しない。`remote-engine` 構成でも、既定では同一マシン上のローカルプロセス(`ws://127.0.0.1`)に接続する。
+音声認識(HaasまたはReazonSpeech、長文キーではWhisper)、発話区間検出(Silero VAD)、句読点付与(mojicast)は、すべて端末上で実行される。既定構成でネットワークを使うのはモデルの初回ダウンロードだけで、音声データや認識結果を外部サーバーへ送信しない。`remote-engine` 構成でも、既定では同一マシン上のローカルプロセス(`ws://127.0.0.1`)に接続する。
 
 ## ファイルの場所
 
@@ -48,7 +48,7 @@ xattr -d com.apple.quarantine /Applications/kikigaki.app
 
 設定画面の「認識モデル」で、標準キーが使うモデルを「標準」(ReazonSpeech)と「Haas」(Haas-ja v1.0、既定)から選べる。
 
-以前からkikigakiを使っていてモデルを選んだことがない環境では、ReazonSpeechだけが入っている間はReazonSpeechを使い続ける。設定画面でHaasを選ぶと切り替わる。ReazonSpeechを使い続けたい場合は、設定画面で「標準」を選ぶ。選んだモデルは設定ファイルの `[asr]` の `model` に保存される。
+以前からkikigakiを使っていてモデルを選んだことがない環境では、ReazonSpeechだけが入っている間はReazonSpeechを使い続ける。Haasのモデルがすでに入っている場合はHaasを使う。設定画面でHaasを選ぶと切り替わる。ReazonSpeechを使い続けたい場合は、設定画面で「標準」を選ぶ。選んだモデルは設定ファイルの `[asr]` の `model` に保存される。
 
 - Haasは一般的な日本語の読み上げ音声で誤りが約半分になる。FLEURS日本語テストセットの文字誤り率はHaasが4.8%、ReazonSpeechが9.0%で、固有名詞や専門用語にも強い
 - 標準はキーを離してから貼り付けまで約0.2秒。Haasはそれより遅く、Apple Silicon搭載Macで短い発話なら約0.4秒が目安となる

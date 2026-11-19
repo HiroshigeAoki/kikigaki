@@ -71,7 +71,7 @@
       </div>
 
       <div class="scene" id="scene-onboarding" hidden>
-        <div class="hero"><h3>kikigaki をはじめる</h3><p>3 つの準備が終わると、ホットキーを押している間の声が文字になります。</p></div>
+        <div class="hero"><h3>kikigaki をはじめる</h3><p><span id="onboardingHeroStepCount">3</span> つの準備が終わると、ホットキーを押している間の声が文字になります。</p></div>
         <div class="steps">
           <div class="step" id="stepMic">
             <div class="n" id="stepMicNumber">1</div>
@@ -93,7 +93,7 @@
           </div>
         </div>
         <p class="note onboarding-note">通信はこのダウンロードのみで、音声は端末の外に出ません。</p>
-        <p class="note onboarding-note">Gatekeeper 未署名（not Apple-notarized）のため、初回のみ右クリック › 開く が必要です。</p>
+        <p class="note onboarding-note" id="onboardingSigningNote">Gatekeeper 未署名（not Apple-notarized）のため、初回のみ右クリック › 開く が必要です。</p>
       </div>
 
       <div class="scene config-error" id="scene-config-error" hidden>

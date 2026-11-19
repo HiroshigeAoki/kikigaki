@@ -14,7 +14,7 @@ window.addEventListener('unhandledrejection', (event) => {
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-const { asrModelNote, asrModelFooter, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, formatChord, statusKeysLine, HISTORY_PAGE } = window.KikigakiFormat;
+const { microphoneStepCopy, onboardingLayout, asrModelNote, asrModelFooter, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, formatChord, statusKeysLine, HISTORY_PAGE } = window.KikigakiFormat;
 
 const EVENT_NAME = 'kikigaki://event';
 const MODIFIER_NAMES = ['Meta', 'Alt', 'Control', 'Shift'];
@@ -68,11 +68,15 @@ function statusMainText(status) {
   }
 }
 
+function currentPlatform() {
+  return currentSnapshot?.platform === 'windows' ? 'windows' : 'macos';
+}
+
 function renderChord(chord) {
   const container = document.getElementById('hkKbd');
   container.replaceChildren();
   const cap = document.createElement('kbd');
-  cap.textContent = formatChord(chord);
+  cap.textContent = formatChord(chord, currentPlatform());
   container.appendChild(cap);
 }
 
@@ -86,7 +90,7 @@ function applyStatus(status) {
   detail.hidden = detailText.length === 0;
   detail.querySelector('pre').textContent = detailText;
   document.getElementById('statusMain').textContent = statusMainText(status);
-  document.getElementById('statusSub').textContent = statusKeysLine(currentSnapshot.settings);
+  document.getElementById('statusSub').textContent = statusKeysLine(currentSnapshot.settings, currentPlatform());
   renderChord(status.hotkey);
 }
 
@@ -105,7 +109,7 @@ function applyPunctSeg(settings) {
 }
 
 function applyHotkeys(settings) {
-  document.getElementById('statusSub').textContent = statusKeysLine(settings);
+  document.getElementById('statusSub').textContent = statusKeysLine(settings, currentPlatform());
   renderChord(settings.hotkey);
   updateCaptureControls();
 }
@@ -210,16 +214,20 @@ function showOnboarding(state) {
   currentOnboarding = state;
   showScene('scene-onboarding');
   const micDone = state.microphone === 'authorized';
-  const micBlocked = state.microphone === 'denied' || state.microphone === 'restricted';
+  const micCopy = microphoneStepCopy(state.microphone, currentPlatform());
+  const layout = onboardingLayout(state, currentPlatform());
+  document.getElementById('stepAx').hidden = !layout.showAccessibility;
+  document.getElementById('onboardingHeroStepCount').textContent = layout.stepCount;
+  document.getElementById('onboardingSigningNote').hidden = currentPlatform() === 'windows';
   setStepState('stepMic', 'stepMicNumber', 1, micDone, !micDone);
   setStepState('stepAx', 'stepAxNumber', 2, state.accessibility_trusted, micDone && !state.accessibility_trusted);
-  setStepState('stepModels', 'stepModelsNumber', 3, state.models_installed, micDone && state.accessibility_trusted && !state.models_installed);
+  setStepState('stepModels', 'stepModelsNumber', layout.stepCount, state.models_installed, layout.modelsReady && !state.models_installed);
 
   const micButton = document.getElementById('stepMicButton');
-  micButton.textContent = micBlocked ? 'システム設定を開く' : '許可する';
+  micButton.textContent = micCopy.button;
   micButton.disabled = micDone;
   micButton.hidden = micDone;
-  document.getElementById('stepMicDetail').textContent = micDone ? '許可済み' : micBlocked ? 'システム設定で許可してください。' : '文字起こしのために必要です。';
+  document.getElementById('stepMicDetail').textContent = micCopy.detail;
 
   const axButton = document.getElementById('stepAxButton');
   axButton.disabled = state.accessibility_trusted;
@@ -250,7 +258,7 @@ function showOnboarding(state) {
     modelsButton.disabled = false;
   }
 
-  if (micDone && state.accessibility_trusted && state.models_installed) showSettings();
+  if (layout.complete) showSettings();
 }
 
 function applySnapshot(snapshot) {

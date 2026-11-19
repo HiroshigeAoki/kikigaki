@@ -369,6 +369,7 @@ fn default_snapshot(
             strip_trailing_period: settings_snapshot.strip_trailing_period,
         },
         settings: settings_snapshot,
+        platform: crate::platform::NAME,
         autostart: autostart_state(app),
         onboarding,
         history: Vec::new(),

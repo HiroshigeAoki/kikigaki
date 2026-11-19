@@ -1282,6 +1282,7 @@ impl Controller {
                 strip_trailing_period: settings.strip_trailing_period,
             },
             settings,
+            platform: crate::platform::NAME,
             // The platform shell replaces this Tauri-free placeholder before publishing.
             autostart: AutostartState {
                 enabled: false,
@@ -3133,6 +3134,17 @@ mod tests {
         );
         wait_snapshot(&harness, |snapshot| snapshot.status.state == "idle");
         harness
+    }
+
+    #[test]
+    fn snapshot_serializes_the_compiled_platform() {
+        let harness = ready_harness();
+        let snapshot = latest(&harness).unwrap();
+        assert_eq!(snapshot.platform, crate::platform::NAME);
+        assert_eq!(
+            serde_json::to_value(snapshot).unwrap()["platform"],
+            crate::platform::NAME
+        );
     }
 
     fn latest(harness: &Harness) -> Option<UiSnapshot> {

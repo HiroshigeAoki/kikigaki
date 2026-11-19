@@ -60,10 +60,11 @@
   };
 
   function snap(over = {}) {
-    const settings = { ...baseSettings, ...(over.settings || {}) };
+    const settings = { ...baseSettings, ...(over.platform === 'windows' ? { hotkey: 'Ctrl+Alt+Space' } : {}), ...(over.settings || {}) };
     const status = { ...baseStatus, hotkey: settings.hotkey, ...(over.status || {}) };
     return {
       revision: 1,
+      platform: over.platform || 'macos',
       status,
       settings,
       autostart: over.autostart || { enabled: true, available: true },
@@ -83,6 +84,9 @@
 
   const FIXTURES = {
     demo: snap(),
+    windows: snap({ platform: 'windows' }),
+    'windows-onboarding': snap({ platform: 'windows', onboarding: onb(null, { accessibility_trusted: false }) }),
+    'windows-mic-denied': snap({ platform: 'windows', onboarding: onb(null, { microphone: 'denied', accessibility_trusted: false }) }),
     'haas-pending': snap({ settings: { asr_model: 'haas', asr_model_applied: 'reazonspeech', local_punct: true } }),
     'haas-applied': snap({ settings: { asr_model: 'haas', asr_model_applied: 'haas' } }),
     worst: snap({
@@ -105,6 +109,9 @@
     // Shape after the Rust wording change: short Japanese title plus raw detail.
     'status-with-detail': snap({ status: { state: 'disconnected', level: 'error', phase: 'failed', message: '音声エンジンを起動できませんでした', detail: MODEL_PATH_ERROR } }),
     'status-recording': snap({ status: { state: 'recording' } }),
+    'windows-mic-fresh': snap({ platform: 'windows', onboarding: { ...onb(null), microphone: 'not_determined', accessibility_trusted: false } }),
+    'windows-mic-busy': snap({ platform: 'windows', onboarding: { ...onb(null), microphone: 'busy', accessibility_trusted: false } }),
+    'windows-mic-unavailable': snap({ platform: 'windows', onboarding: { ...onb(null), microphone: 'unavailable', accessibility_trusted: false } }),
     'onb-fresh': snap({ onboarding: { ...onb(null), microphone: 'not_determined', accessibility_trusted: false } }),
     'onb-mic-denied': snap({ onboarding: { ...onb(null), microphone: 'denied', accessibility_trusted: false } }),
     'onb-dl-0': snap({ onboarding: onb(dl('reazonspeech-ja-en-2025-01-17', 0, 3, 0, 0)) }),

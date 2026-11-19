@@ -52,19 +52,22 @@
       || Object.hasOwn(KEY_LABELS, name);
   }
 
-  function formatChord(chord) {
+  function formatChord(chord, platform) {
     if (typeof chord !== 'string' || !chord) return chord;
     const parts = chord.split('+');
     const key = parts.pop();
     if (!key || MODIFIERS.includes(key) || parts.some((part) => !MODIFIERS.includes(part))
       || new Set(parts).size !== parts.length
       || !(/^[A-Za-z0-9]$|^Space$/.test(key) || isNamedKey(key))) return chord;
+    if (platform === 'windows') {
+      return [...MODIFIERS.filter((name) => parts.includes(name)).map((name) => name === 'Cmd' ? 'Win' : name), KEY_LABELS[key] || key].join('+');
+    }
     return MODIFIERS.map((name, i) => parts.includes(name) ? SYMBOLS[i] : '').join('')
       + (KEY_LABELS[key] || key);
   }
 
-  function statusKeysLine(settings) {
-    return `${formatChord(settings.hotkey)} を押している間だけ聞き取ります`;
+  function statusKeysLine(settings, platform) {
+    return `${formatChord(settings.hotkey, platform)} を押している間だけ聞き取ります`;
   }
 
   function chordFromKeyEvent({ code, key, modifiers }) {
@@ -75,6 +78,28 @@
     else if (isNamedKey(code)) chordKey = code;
     else if (key.length === 1) chordKey = key.toUpperCase();
     return [...MODIFIERS.filter((name) => modifiers.includes(name)), chordKey].join('+');
+  }
+
+  function microphoneStepCopy(state, platform) {
+    if (state === 'denied' || state === 'restricted') {
+      return platform === 'windows'
+        ? { button: 'Windows の設定を開く', detail: 'Windows の設定で許可してください。' }
+        : { button: 'システム設定を開く', detail: 'システム設定で許可してください。' };
+    }
+    if (platform === 'windows' && (state === 'busy' || state === 'unavailable')) {
+      return { button: 'もう一度確認', detail: state === 'busy'
+        ? 'ほかのアプリがマイクを使っています。閉じてから、もう一度確認してください。'
+        : 'マイクが見つかりません。接続してから、もう一度確認してください。' };
+    }
+    return { button: '許可する', detail: state === 'authorized' ? '許可済み' : '文字起こしのために必要です。' };
+  }
+
+  function onboardingLayout(state, platform) {
+    const showAccessibility = platform !== 'windows';
+    const modelsReady = state.microphone === 'authorized'
+      && (!showAccessibility || state.accessibility_trusted);
+    return { showAccessibility, stepCount: showAccessibility ? 3 : 2,
+      modelsReady, complete: modelsReady && state.models_installed };
   }
 
   function asrModelNote(saved, applied) {
@@ -90,7 +115,7 @@
   }
 
   const KikigakiFormat = {
-    asrModelNote, asrModelFooter,
+    asrModelNote, asrModelFooter, onboardingLayout, microphoneStepCopy,
     formatChord, statusKeysLine, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent,
     HISTORY_PAGE: 20,
   };

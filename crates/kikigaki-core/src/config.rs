@@ -1185,6 +1185,7 @@ mod tests {
             Config::default()
         );
     }
+
     #[test]
     fn compatibility_warnings() {
         let temp = tempfile::tempdir().unwrap();

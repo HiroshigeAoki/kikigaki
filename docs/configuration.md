@@ -48,15 +48,15 @@ server_punctuates = true
 
 ## 廃止した設定と不明な項目
 
-`long_key`、`long_hotkey`、`auto_long_ms`、`[asr]`の`blank_penalty`は無視する。アプリはログに警告を出す。古い版でも設定ファイルを読めるよう、これらの項目を書き換えたり削除したりしない。
+`long_key`、`long_hotkey`、`auto_long_ms`、`[asr]` の `blank_penalty` は、公開前の開発版にだけあった項目で、いまは無視する。読み込むとログに警告を出す。開発版に戻しても設定ファイルを読めるよう、アプリはこれらの項目を書き換えたり削除したりしない。
 
-`engine = "whisper"`は`engine = "local"`として読み込み、警告を出す。`engine`に指定できるのは`"local"`と`"remote"`である。
+`engine = "whisper"` は `engine = "local"` として読み込み、警告を出す。`engine` に指定できるのは `"local"` と `"remote"` である。
 
-不明な項目は名前を含む警告を出して無視する。既知の項目で型が違う場合はエラーとなり、アプリに設定エラーを表示する。旧版のトップレベルのリモート設定項目(`ws_url`、`hayamimi_dir`、`python`、`spawn_sidecar`、`extra_args`、`connect_timeout_ms`)も引き続きエラーとなる。これらは`[remote]`へ移す。
+不明な項目は、名前を含む警告をログに出して無視する。既知の項目で型が違う場合はエラーとなり、アプリに設定エラーを表示する。旧版のトップレベルのリモート設定項目(`ws_url`、`hayamimi_dir`、`python`、`spawn_sidecar`、`extra_args`、`connect_timeout_ms`)も引き続きエラーとなる。これらは `[remote]` へ移す。
 
-ダウンロード済みのWhisperモデルはアプリでは削除しない。約874MBで、保存先は`<models_dir>/whisper-large-v3-turbo-q8_0/`である。macOSの既定の保存先は`~/Library/Application Support/kikigaki/models/whisper-large-v3-turbo-q8_0/`となる。古い版を使わなくなったら手動で削除できる。
+開発版でダウンロードしたWhisperモデルは、アプリでは削除しない。約874 MBで、保存先は `<models_dir>/whisper-large-v3-turbo-q8_0/` である。macOSの既定の保存先は `~/Library/Application Support/kikigaki/models/whisper-large-v3-turbo-q8_0/` となる。開発版を使わなくなったら手動で削除できる。
 
-古い版が保存した`<models_dir>/hotwords/bpe.vocab`も使わない。現在は`hotwords/<model-id>/bpe.vocab`を使うため、旧ファイルは削除できる。
+開発版が保存した `<models_dir>/hotwords/bpe.vocab` も、いまは使わない。現在は `hotwords/<model-id>/bpe.vocab` を使うため、このファイルは削除できる。
 
 ## 旧設定からの移行
 

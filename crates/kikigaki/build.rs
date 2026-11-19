@@ -18,7 +18,6 @@ fn main() {
             "request_microphone_access",
             "start_download",
             "retry_download",
-            "retry_long_engine",
             "list_history",
             "clear_history",
             "quit",

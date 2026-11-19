@@ -11,16 +11,6 @@ pub struct UiStatus {
     pub hotkey: String,
     pub punct_enabled: bool,
     pub strip_trailing_period: bool,
-    pub long_hotkey: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LongStateView {
-    Installing { percent: u8 },
-    Loading,
-    Ready,
-    Failed { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -214,7 +204,6 @@ mod tests {
             hotkey: "Alt+Space".into(),
             punct_enabled: false,
             strip_trailing_period: false,
-            long_hotkey: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["message"], "起動できませんでした");
@@ -239,29 +228,6 @@ mod tests {
             assert_eq!(status.message(), Some("日本語"));
             assert_eq!(status.detail(), Some("raw error"));
             assert_eq!(make("title".into()).detail(), None);
-        }
-    }
-
-    #[test]
-    fn long_state_view_serializes_as_tagged() {
-        for (state, expected) in [
-            (
-                LongStateView::Installing { percent: 45 },
-                serde_json::json!({"kind":"installing","percent":45}),
-            ),
-            (
-                LongStateView::Loading,
-                serde_json::json!({"kind":"loading"}),
-            ),
-            (LongStateView::Ready, serde_json::json!({"kind":"ready"})),
-            (
-                LongStateView::Failed {
-                    message: "failed".into(),
-                },
-                serde_json::json!({"kind":"failed","message":"failed"}),
-            ),
-        ] {
-            assert_eq!(serde_json::to_value(state).unwrap(), expected);
         }
     }
 

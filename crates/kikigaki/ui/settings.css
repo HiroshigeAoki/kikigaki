@@ -177,7 +177,6 @@ section.group {
   font-weight: 600;
 }
 .group-title h2 { margin: 0; font: inherit; }
-.row.sub { padding-left: 28px; border-top-style: dashed; }
 
 .row {
   display: flex;
@@ -490,9 +489,7 @@ section.group {
 
 .status { margin-bottom: 8px; }
 .status .t b { font-size: 14px; font-weight: 600; }
-#retryLongEngineButton { margin-top: 8px; }
 .capture-note { margin: 0; padding: 0 14px 10px; color: var(--ink-2); font-size: 12px; }
-.capture-note.sub { padding-left: 28px; }
 .switch { transition: background-color 150ms ease; }
 .switch[aria-busy="true"] { cursor: progress; }
 .btn, .hk, .seg button { transition: background-color 120ms ease; }
@@ -509,10 +506,6 @@ section.group {
 }
 .btn.primary:not(:disabled):active { background: color-mix(in srgb, var(--accent) 86%, var(--ink)); }
 .seg button[aria-pressed="true"]:not(:disabled):active { background: color-mix(in srgb, var(--ink) 86%, black); }
-.pill { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; color: var(--ink-2); font-size: 12px; }
-.pill::before { content: ""; width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--loading); }
-.pill.ok::before { background: var(--ok); }
-.pill.warn::before { background: var(--warning); }
 .bar { width: 200px; max-width: 100%; height: 4px; margin-top: 6px; overflow: hidden; border-radius: 2px; background: var(--line-soft); }
 .bar i { display: block; height: 100%; background: var(--accent); transform-origin: left; }
 .inline-btn { margin-top: 4px; }

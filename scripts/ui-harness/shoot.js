@@ -88,9 +88,9 @@ async function shoot(harnessFile) {
     if (scheme === 'light') {
       await page.goto(url('data=hotkeys-long'));
       await page.waitForTimeout(150);
-      await page.click('#longHkButton');
+      await page.click('#hkButton');
       await page.waitForTimeout(100);
-      await shot(page, 'light-capture-long');
+      await shot(page, 'light-capture-standard');
       await page.goto(url('data=demo&fail=1'));
       await page.waitForTimeout(150);
       await page.click('#punctSeg button[data-value="off"]');

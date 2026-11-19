@@ -61,16 +61,6 @@ test('chordFromKeyEvent uses physical letters and digits, Space and fallback key
   assert.equal(f.chordFromKeyEvent({ code: 'ArrowLeft', key: 'ArrowLeft', modifiers: ['Cmd'] }), 'Cmd+ArrowLeft');
 });
 
-test('longStateText covers absent, installing, extracting, loading, ready and failed states', () => {
-  for (const [state, expected] of [
-    [null, ''], [{ kind: 'installing', percent: 42 }, 'ダウンロード中 42%'],
-    [{ kind: 'installing', percent: 100 }, '展開中…'],
-    [{ kind: 'installing', percent: 101 }, '展開中…'],
-    [{ kind: 'loading' }, '準備中…'], [{ kind: 'ready' }, '準備完了'],
-    [{ kind: 'failed' }, '停止中 — モデルを読み込めませんでした'],
-  ]) assert.equal(f.longStateText(state), expected);
-});
-
 test('HISTORY_PAGE is twenty', () => {
   assert.equal(f.HISTORY_PAGE, 20);
 });
@@ -100,27 +90,9 @@ test('chordFromKeyEvent only keeps code names that formatChord can display', () 
   assert.equal(f.chordFromKeyEvent({ code: 'Home', key: 'Home', modifiers: ['Ctrl'] }), 'Ctrl+Home');
 });
 
-test('longStateView exposes safe tones and progress only during download', () => {
-  for (const [state, tone, percent] of [[null, 'off', null], [{kind:'ready'}, 'ok', null],
-    [{kind:'loading'}, 'busy', null], [{kind:'installing',percent:42}, 'busy', 42],
-    [{kind:'installing',percent:100}, 'busy', null],
-    [{kind:'failed', message:'/private/raw/path'}, 'warn', null]]) {
-    assert.deepEqual(f.longStateView(state, false), {tone, text:f.longStateText(state), percent});
-  }
-  assert.deepEqual(f.longStateView({kind:'failed'}, true), {tone:'busy', text:'再試行中…', percent:null});
-});
-
-test('statusKeysLine includes the long chord only when enabled and available', () => {
-  const settings = {hotkey:'Ctrl+Alt+Space', long_hotkey:'Ctrl+Shift+Space', long_key:true, long_available:true};
-  assert.equal(f.statusKeysLine(settings), '標準 ⌃⌥Space ／ 長文 ⌃⇧Space を押している間だけ聞き取ります');
-  for (const patch of [{long_key:false}, {long_available:false}, {long_hotkey:''}])
-    assert.equal(f.statusKeysLine({...settings, ...patch}), '⌃⌥Space を押している間だけ聞き取ります');
-});
-
-
 test('asrModelNote distinguishes saved and applied models', () => {
   for (const model of ['reazonspeech', 'haas'])
-    assert.equal(f.asrModelNote(model, model), '標準キーの認識に使うモデル');
+    assert.equal(f.asrModelNote(model, model), '聞き取りに使うモデル');
   assert.equal(f.asrModelNote('haas', 'reazonspeech'), '次の起動から切り替わります。Haas は初回に約 480 MB をダウンロードします');
   assert.equal(f.asrModelNote('reazonspeech', 'haas'), '次の起動から切り替わります');
 });
@@ -128,4 +100,8 @@ test('asrModelNote distinguishes saved and applied models', () => {
 test('asrModelFooter describes the applied model', () => {
   assert.equal(f.asrModelFooter('reazonspeech'), 'ReazonSpeech ja-en · Silero VAD · mojicast');
   assert.equal(f.asrModelFooter('haas'), 'Haas-ja v1.0 · Silero VAD');
+});
+
+test('statusKeysLine shows the standard chord', () => {
+  assert.equal(f.statusKeysLine({hotkey:'Ctrl+Alt+Space'}), '⌃⌥Space を押している間だけ聞き取ります');
 });

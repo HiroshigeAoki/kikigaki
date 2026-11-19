@@ -14,7 +14,7 @@ window.addEventListener('unhandledrejection', (event) => {
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
-const { asrModelNote, asrModelFooter, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, longStateView, formatChord, statusKeysLine, HISTORY_PAGE } = window.KikigakiFormat;
+const { asrModelNote, asrModelFooter, statusDotClass, historyTimeLabel, visibleHistory, downloadLabel, chordFromKeyEvent, formatChord, statusKeysLine, HISTORY_PAGE } = window.KikigakiFormat;
 
 const EVENT_NAME = 'kikigaki://event';
 const MODIFIER_NAMES = ['Meta', 'Alt', 'Control', 'Shift'];
@@ -28,8 +28,6 @@ let capturing = null;
 let capturePending = null;
 let captureEnding = false;
 let captureCancelled = false;
-let longKeyPending = false;
-let retryLongPending = false;
 let currentOnboarding = null;
 // Rows the user has expanded to with さらに表示; kept across snapshots so a new utterance
 // does not collapse the list back to the first page.
@@ -70,8 +68,8 @@ function statusMainText(status) {
   }
 }
 
-function renderChord(key, chord) {
-  const container = document.getElementById(key === 'long' ? 'longHkKbd' : 'hkKbd');
+function renderChord(chord) {
+  const container = document.getElementById('hkKbd');
   container.replaceChildren();
   const cap = document.createElement('kbd');
   cap.textContent = formatChord(chord);
@@ -89,8 +87,7 @@ function applyStatus(status) {
   detail.querySelector('pre').textContent = detailText;
   document.getElementById('statusMain').textContent = statusMainText(status);
   document.getElementById('statusSub').textContent = statusKeysLine(currentSnapshot.settings);
-  renderChord('standard', status.hotkey);
-  if (status.long_hotkey) renderChord('long', status.long_hotkey);
+  renderChord(status.hotkey);
 }
 
 function applyAsrModel(settings) {
@@ -108,33 +105,9 @@ function applyPunctSeg(settings) {
 }
 
 function applyHotkeys(settings) {
-  document.getElementById('longHkRow').hidden = !settings.long_key || !settings.long_available;
   document.getElementById('statusSub').textContent = statusKeysLine(settings);
-  document.getElementById('longHkNote').hidden = capturing !== 'long';
-  renderChord('standard', settings.hotkey);
-  renderChord('long', settings.long_hotkey);
+  renderChord(settings.hotkey);
   updateCaptureControls();
-}
-
-function applyLongKey(settings) {
-  document.getElementById('longKeyRow').hidden = !settings.long_available;
-  const control = document.getElementById('longKeySwitch');
-  if (control.getAttribute('aria-busy') !== 'true') control.setAttribute('aria-checked', String(settings.long_key));
-  control.disabled = !settings.long_available || Boolean(capturing || capturePending || captureEnding);
-  const state = settings.long_state;
-  document.getElementById('longStateRow').hidden = !settings.long_key || !state;
-  const view = longStateView(state, retryLongPending);
-  const pill = document.getElementById('longState');
-  pill.textContent = view.text;
-  pill.className = `pill ${view.tone}`;
-  const bar = document.getElementById('longStateBar');
-  if (bar) {
-    bar.hidden = view.percent === null;
-    bar.firstElementChild.style.transform = `scaleX(${(view.percent || 0) / 100})`;
-  }
-  const retry = document.getElementById('retryLongEngineButton');
-  retry.hidden = !settings.long_key || !state || state.kind !== 'failed';
-  retry.disabled = retryLongPending || longKeyPending;
 }
 
 function applyBuiltinReplaceDict(settings) {
@@ -284,7 +257,6 @@ function applySnapshot(snapshot) {
   currentSnapshot = snapshot;
   applyStatus(snapshot.status);
   applyHotkeys(snapshot.settings);
-  applyLongKey(snapshot.settings);
   applyAsrModel(snapshot.settings);
   applyPunctSeg(snapshot.settings);
   applyBuiltinReplaceDict(snapshot.settings);
@@ -347,15 +319,12 @@ document.addEventListener('click', (event) => {
 
 const hotkeyControls = {
   standard: { button: document.getElementById('hkButton'), note: document.getElementById('hkNote'), cap: document.getElementById('hkCap') },
-  long: { button: document.getElementById('longHkButton'), note: document.getElementById('longHkNote'), cap: document.getElementById('longHkCap') },
 };
 
 function updateCaptureControls() {
   for (const [key, control] of Object.entries(hotkeyControls)) {
-    control.button.disabled = Boolean((capturePending && capturePending !== key) || captureEnding || (capturing && capturing !== key) || longKeyPending
-      || (key === 'long' && currentSnapshot && !currentSnapshot.settings.long_available));
+    control.button.disabled = Boolean((capturePending && capturePending !== key) || captureEnding || (capturing && capturing !== key));
   }
-  if (currentSnapshot) applyLongKey(currentSnapshot.settings);
 }
 
 function finishHotkeyCaptureUi() {
@@ -462,7 +431,6 @@ function bindSwitch(control, patchKey, onSettings) {
     const enabled = !previous;
     control.setAttribute('aria-checked', String(enabled));
     control.setAttribute('aria-busy', 'true');
-    if (patchKey === 'longKey') { longKeyPending = true; updateCaptureControls(); }
     const sinceRevision = appliedRevision;
     try {
       if (patchKey === 'autostart') {
@@ -478,32 +446,15 @@ function bindSwitch(control, patchKey, onSettings) {
       showInlineError(control, error);
     } finally {
       control.removeAttribute('aria-busy');
-      if (patchKey === 'longKey') longKeyPending = false;
       if (currentSnapshot) onSettings(currentSnapshot);
       updateCaptureControls();
     }
   });
 }
 
-bindSwitch(document.getElementById('longKeySwitch'), 'longKey', (snapshot) => applyHotkeys(snapshot.settings));
 bindSwitch(document.getElementById('builtinReplaceDictSwitch'), 'builtinReplaceDict', (snapshot) => applyBuiltinReplaceDict(snapshot.settings));
 bindSwitch(document.getElementById('transcriptLogSwitch'), 'transcriptLog', (snapshot) => applyTranscriptLog(snapshot.settings));
 bindSwitch(document.getElementById('autostartSwitch'), 'autostart', (snapshot) => applyAutostart(snapshot.autostart));
-
-document.getElementById('retryLongEngineButton').addEventListener('click', async (event) => {
-  const control = event.currentTarget;
-  if (control.disabled || retryLongPending) return;
-  retryLongPending = true;
-  if (currentSnapshot) applyLongKey(currentSnapshot.settings);
-  try {
-    await invoke('retry_long_engine');
-  } catch (error) {
-    showInlineError(control, error);
-  } finally {
-    retryLongPending = false;
-    if (currentSnapshot) applyLongKey(currentSnapshot.settings);
-  }
-});
 
 for (const button of document.querySelectorAll('#asrModelSeg button')) {
   button.addEventListener('click', async () => {

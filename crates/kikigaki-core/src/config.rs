@@ -443,9 +443,6 @@ impl Config {
 
     /// Validates configuration values against supported ranges and capabilities.
     pub fn validate(&self, caps: Capabilities) -> anyhow::Result<()> {
-        if chords_match(&self.long_hotkey, &self.hotkey) {
-            bail!("long_hotkey must differ from hotkey");
-        }
         if !(1..=16).contains(&self.asr.num_threads) {
             bail!("asr.num_threads must be in 1..=16");
         }
@@ -866,36 +863,12 @@ mod tests {
         );
         let cfg = Config::load(Some(&path)).unwrap();
         assert_eq!(cfg.long_hotkey, "Alt+Shift+Space");
-        assert!(cfg
-            .validate(Capabilities {
-                punct: true,
-                remote_engine: true,
-                long_key: true
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn validate_rejects_canonical_duplicate_chords() {
-        for (hotkey, long_hotkey) in [
-            ("Shift+Alt+Space", "Alt+Shift+Space"),
-            ("Option+Space", "Alt+Space"),
-        ] {
-            let cfg = Config {
-                hotkey: hotkey.into(),
-                long_hotkey: long_hotkey.into(),
-                ..Config::default()
-            };
-            assert!(
-                cfg.validate(Capabilities {
-                    punct: true,
-                    remote_engine: true,
-                    long_key: true
-                })
-                .is_err(),
-                "{hotkey}"
-            );
-        }
+        cfg.validate(Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: false,
+        })
+        .unwrap();
     }
 
     #[test]
@@ -926,7 +899,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_long_hotkey_equal_to_hotkey() {
+    fn validate_accepts_retired_long_hotkey_equal_to_hotkey() {
+        // No build can use the long key any more, so a stale `long_hotkey` must never make an
+        // otherwise valid config unusable.
         let cfg = Config {
             long_hotkey: "  alt+SPACE  ".into(),
             ..Config::default()
@@ -934,13 +909,9 @@ mod tests {
         let caps = Capabilities {
             punct: true,
             remote_engine: true,
-            long_key: true,
+            long_key: false,
         };
-        assert!(cfg
-            .validate(caps)
-            .unwrap_err()
-            .to_string()
-            .contains("long_hotkey"));
+        cfg.validate(caps).unwrap();
     }
 
     #[test]

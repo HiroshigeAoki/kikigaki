@@ -132,7 +132,19 @@ fn run(args: Args) -> anyhow::Result<Counts> {
             "output must not be an input file"
         );
     }
-    let mut writer = BufWriter::new(File::create(args.out)?);
+    #[cfg(unix)]
+    let output = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(args.out)?
+    };
+    #[cfg(not(unix))]
+    let output = File::create(args.out)?;
+    let mut writer = BufWriter::new(output);
     let mut counts = Counts::default();
     for path in files {
         for line in BufReader::new(File::open(path)?).lines() {
@@ -168,6 +180,30 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_output_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let transcripts = temp.path().join("input");
+        fs::create_dir(&transcripts).unwrap();
+        let user_rules = temp.path().join("rules.toml");
+        fs::write(&user_rules, "").unwrap();
+        let out = temp.path().join("replay.jsonl");
+        run(Args {
+            transcripts,
+            user_rules,
+            no_builtin: true,
+            out: out.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            fs::metadata(out).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn replay_normalizes_overrides_and_limits_unicode_context() {

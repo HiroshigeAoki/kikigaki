@@ -96,6 +96,8 @@ def validate(terms, keeps):
         nonempty(target, 'term.to')
         if not isinstance(variants, list):
             raise TermError('term.variants must be an array of strings')
+        if not variants:
+            raise TermError('term.variants must not be empty')
         for variant in variants:
             nonempty(variant, 'variant')
             if variant in owners:
@@ -133,7 +135,7 @@ def load_terms(path):
 def quote(value):
     # JSON's basic string escapes are also TOML escapes (ensure_ascii=False
     # avoids JSON surrogate pairs, which TOML deliberately forbids).
-    return json.dumps(value, ensure_ascii=False).replace(chr(127), r'')
+    return json.dumps(value, ensure_ascii=False).replace(chr(127), r'\u007f')
 
 
 def array(values):
@@ -411,6 +413,27 @@ class SelfTests(unittest.TestCase):
                 path.write_text(document)
                 with self.assertRaises(TermError):
                     load_terms(path)
+
+    def test_empty_variants_rejected_on_load_and_save(self):
+        path = self.root / 'terms.toml'
+        path.write_text('[[term]]\nto="Target"\nvariants=[]\n')
+        with self.assertRaisesRegex(TermError, '^term.variants must not be empty$'):
+            load_terms(path)
+        before = path.read_bytes()
+        with self.assertRaisesRegex(TermError, '^term.variants must not be empty$'):
+            save_terms(path, {'Target': []}, set())
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_del_round_trips_through_terms_and_build(self):
+        path, out = self.root / 'terms.toml', self.root / 'replace.toml'
+        target, variant, keep = [word + chr(127) for word in ('Target', 'Variant', 'Keep')]
+        save_terms(path, {target: [variant]}, {keep})
+        self.assertNotIn(chr(127), path.read_text())
+        self.assertEqual(load_terms(path), ({target: [variant]}, {keep}))
+        build(path, out, False)
+        self.assertNotIn(chr(127), out.read_text())
+        self.assertEqual(tomllib.loads(out.read_text())['rule'],
+                         [dict(to=target, **{'from': [variant]}, whole_word=True)])
 
     def test_build_refusal_force_and_determinism(self):
         terms, out = self.root / 'terms.toml', self.root / 'replace.toml'

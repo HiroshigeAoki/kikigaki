@@ -4,7 +4,8 @@ Python 3.11+ standard-library tool for turning dictation logs into explicitly
 approved user replacement rules. Run `python3 scripts/transcript-terms/terms.py
 --self-test` for synthetic fixtures (including a local HTTP stub server).
 
-Transcripts and generated files are private: keep them outside git. `mine` emits
+Transcripts and generated files are private: keep them outside git.
+Replay output and candidates/terms files are as private as the transcripts. `mine` emits
 only tokens and counts; `suggest` sends only each candidate token to the explicitly
 provided OpenAI-compatible endpoint, never sentences. `summarize` prints only hit
 contexts, limited to ten characters on each side. Review tokens before sending

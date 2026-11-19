@@ -81,6 +81,9 @@ if ($NeedsExtract) {
         throw "fetch-sherpa-win: tar.exe lacks bz2lib support; this script requires Windows 11 24H2 or later's in-box bsdtar to extract the .tar.bz2 archive"
     }
     tar -xjf $ArchivePath -C $CacheDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "fetch-sherpa-win: tar extraction failed (exit $LASTEXITCODE)"
+    }
     if (-not (Test-Path (Join-Path $ExtractRoot "lib"))) {
         throw "fetch-sherpa-win: expected $ExtractRoot\lib not found after extraction -- archive layout changed?"
     }

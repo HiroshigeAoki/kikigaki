@@ -3,6 +3,10 @@
 #
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\win-build.ps1 build
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\win-build.ps1 test
+# With KIKIGAKI_MODELS_DIR set, test mode requires Silero VAD, ReazonSpeech, Haas-ja,
+# and mojicast punctuation models; any skipped real-model test fails the gate.
+# KIKIGAKI_TEST_WAVS_DIR overrides the WAV directory; its default is
+# KIKIGAKI_MODELS_DIR\reazonspeech-ja-en-2025-01-17\test_wavs, even for Haas tests.
 # Smart App Control can block a fresh executable, including makensis.exe downloaded by
 # tauri-bundler on the first build, with os error 4551; wait ~45 s and rerun.
 param(

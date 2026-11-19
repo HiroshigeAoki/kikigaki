@@ -36,10 +36,11 @@ Development happens on Linux; Windows builds run on a separate build machine ove
 - `scripts/win-sync-build.sh` — sync the source tree to the Windows build machine and build.
 - `scripts/win-build.ps1` — Windows-side build/test driver invoked by `win-sync-build.sh`;
   provides `build` and `test` subcommands.
+  Real-model tests need Silero VAD, ReazonSpeech, Haas-ja and mojicast punctuation; WAVs default to the ReazonSpeech `test_wavs` directory (override with `KIKIGAKI_TEST_WAVS_DIR`).
 - `scripts/release-win.ps1` — release build with signing-equivalent gates (GPL scan, DLL
   allowlist, ORT provenance, release metadata) run against the installed NSIS payload, not the
-  pre-bundle tree; installs, smoke-tests, exercises autostart, and uninstalls as part of the
-  gate; produces the NSIS installer in a versioned `release-out\windows\<version>\` directory
+  pre-bundle tree; installs, smoke-tests, seeds autostart registry values, and verifies the
+  uninstall hook removes them; produces the NSIS installer in a versioned `release-out\windows\<version>\` directory
   beside `target\`, outside the synced `src\` tree.
 - `scripts/fetch-sherpa-win.ps1` — downloads and hash-verifies the vendored sherpa-onnx
   Windows shared-library archive (five pinned files: three runtime DLLs plus two `.lib` import

@@ -7,7 +7,7 @@
 # target\, outside the src\ tree that win-sync-build.sh replaces.
 # Do not run this gate on an account with a real per-user kikigaki install: both installations
 # share the HKCU Uninstall and manufacturer keys, and uninstalling the gate copy (plus its hook)
-# removes that user's real autostart entry.
+# can affect that user's installation metadata. Autostart values are saved and restored.
 # NSIS requires unquoted /D= and _?= paths, so %TEMP% must not contain spaces (true on the build
 # machine); otherwise set $InstallDir to a space-free path.
 $ErrorActionPreference = "Stop"
@@ -54,15 +54,20 @@ if ($TauriVersionLine -ne "tauri-cli 2.11.4") {
     Invoke-Native { cargo install tauri-cli --version "=2.11.4" --locked } "install tauri-cli"
 }
 Set-Location (Join-Path $Root "crates\kikigaki")
-Invoke-Native { cargo tauri build --bundles nsis -- --locked } "cargo tauri build"
-
 $TargetDir = (Invoke-Native { cargo metadata --format-version=1 --no-deps } "cargo metadata" | ConvertFrom-Json).target_directory
 $NsisDir = Join-Path $TargetDir "release\bundle\nsis"
-$Installers = @(Get-ChildItem -Path $NsisDir -Filter "*-setup.exe")
-if ($Installers.Count -ne 1) {
-    throw "release-win: expected exactly one *-setup.exe in $NsisDir, found $($Installers.Count)"
+if (Test-Path $NsisDir) {
+    Get-ChildItem -Path $NsisDir -Filter "*-setup.exe" -File | Remove-Item -Force
 }
-$Installer = $Installers[0]
+Invoke-Native { cargo tauri build --bundles nsis -- --locked } "cargo tauri build"
+
+# tauri.windows.conf.json keeps the base productName; the Windows release target is x64.
+$InstallerName = "$($TauriConf.productName)_${Version}_x64-setup.exe"
+$InstallerPath = Join-Path $NsisDir $InstallerName
+if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
+    throw "release-win: expected installer missing: $InstallerPath"
+}
+$Installer = Get-Item -LiteralPath $InstallerPath
 
 Write-Host "== silent install into a fresh scratch directory (H6) =="
 $InstallDir = Join-Path $env:TEMP "kikigaki-release-gate-$([System.Guid]::NewGuid())"
@@ -78,6 +83,29 @@ if ($ManufacturerKeyExisted) {
         $ManufacturerDefaultKind = $SavedManufacturerKey.GetValueKind("")
     }
 }
+# Snapshot before installation: even an early failure can invoke the uninstall hook.
+$AutostartValues = @(
+    foreach ($Path in @(
+        "Software\Microsoft\Windows\CurrentVersion\Run",
+        "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+    )) {
+        $Key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($Path)
+        try {
+            $Name = "kikigaki"
+            $Existed = $Key -and (@($Key.GetValueNames()) -contains $Name)
+            $Kind = $null
+            $Data = $null
+            if ($Existed) {
+                $Kind = $Key.GetValueKind($Name)
+                $Data = $Key.GetValue(
+                    $Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            }
+            [pscustomobject]@{ Path = $Path; Name = $Name; Existed = $Existed; Kind = $Kind; Data = $Data }
+        } finally {
+            if ($Key) { $Key.Close() }
+        }
+    }
+)
 $Process = $null
 $Uninstalled = $false
 try {
@@ -151,7 +179,8 @@ if (-not (Test-Path $VsWhere)) {
 }
 $VsInstallPath = Invoke-Native {
     & $VsWhere -latest -products * -property installationPath
-} "vswhere Visual Studio installation path"
+} "vswhere Visual Studio installation path" |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
 if (-not $VsInstallPath) {
     throw "release-win: vswhere found no Visual Studio installation"
 }
@@ -294,10 +323,6 @@ if ($PostUninstallApproved) {
     if ($Process -and -not $Process.HasExited) {
         Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
     }
-    Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
-        -Name "kikigaki" -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" `
-        -Name "kikigaki" -ErrorAction SilentlyContinue
     $CleanupUninstaller = Join-Path $InstallDir "Uninstall.exe"
     if (-not $Uninstalled -and (Test-Path $CleanupUninstaller)) {
         try {
@@ -305,6 +330,19 @@ if ($PostUninstallApproved) {
                 -ArgumentList "/S", "_?=$InstallDir" -Wait -PassThru | Out-Null
         } catch {
             Write-Warning "release-win: cleanup uninstall failed: $_"
+        }
+    }
+    # Restore after cleanup uninstall, whose hook deletes these values too.
+    foreach ($Saved in $AutostartValues) {
+        $Key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($Saved.Path)
+        try {
+            if ($Saved.Existed) {
+                $Key.SetValue($Saved.Name, $Saved.Data, $Saved.Kind)
+            } else {
+                $Key.DeleteValue($Saved.Name, $false)
+            }
+        } finally {
+            $Key.Close()
         }
     }
     if ($ManufacturerKeyExisted) {

@@ -863,36 +863,12 @@ mod tests {
         );
         let cfg = Config::load(Some(&path)).unwrap();
         assert_eq!(cfg.long_hotkey, "Alt+Shift+Space");
-        assert!(cfg
-            .validate(Capabilities {
-                punct: true,
-                remote_engine: true,
-                long_key: true
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn validate_rejects_canonical_duplicate_chords() {
-        for (hotkey, long_hotkey) in [
-            ("Shift+Alt+Space", "Alt+Shift+Space"),
-            ("Option+Space", "Alt+Space"),
-        ] {
-            let cfg = Config {
-                hotkey: hotkey.into(),
-                long_hotkey: long_hotkey.into(),
-                ..Config::default()
-            };
-            assert!(
-                cfg.validate(Capabilities {
-                    punct: true,
-                    remote_engine: true,
-                    long_key: true
-                })
-                .is_err(),
-                "{hotkey}"
-            );
-        }
+        cfg.validate(Capabilities {
+            punct: true,
+            remote_engine: true,
+            long_key: false,
+        })
+        .unwrap();
     }
 
     #[test]

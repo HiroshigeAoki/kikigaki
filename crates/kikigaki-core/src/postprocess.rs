@@ -55,7 +55,7 @@ impl Punctuator for LazyPunctuator {
                 Ok(Some(punctuator)) => self.loaded = Some(punctuator),
                 Ok(None) => return Ok(text.to_owned()),
                 Err(error) => {
-                    tracing::warn!(%error, "punctuator load failed; keeping unpunctuated text for this process");
+                    tracing::warn!(%error, "punctuator load failed; keeping unpunctuated text until the app restarts");
                     self.failed = true;
                     return Ok(text.to_owned());
                 }

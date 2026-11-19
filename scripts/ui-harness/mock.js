@@ -97,7 +97,7 @@
     }),
     empty: snap({ history: [] }),
     one: snap({ history: [DEMO_HISTORY[2]] }),
-    'hotkeys-long': snap({ settings: WORST_HOTKEYS }),
+    'hotkeys-worst': snap({ settings: WORST_HOTKEYS }),
     'status-warning': snap({ status: { level: 'warning', message: 'マイクの使用が許可されていません', detail: 'システム設定 › プライバシーとセキュリティ › マイク で kikigaki を許可してください' } }),
     'status-paste': snap({ status: { level: 'warning', message: '文字を貼り付けられません', detail: 'システム設定 › プライバシーとセキュリティ › アクセシビリティ で kikigaki を許可してください' } }),
     'status-installing': snap({ status: { phase: 'installing', message: 'モデルをダウンロード中… 37%' } }),

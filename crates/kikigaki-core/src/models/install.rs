@@ -945,6 +945,37 @@ mod tests {
         );
     }
 
+    // Windows only: a Unix zombie still answers kill(pid, 0), so the same scenario reads as alive
+    // there until the parent reaps it.
+    #[cfg(windows)]
+    #[test]
+    fn exited_child_whose_handle_is_still_open_is_a_dead_lock_owner() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".lock-test");
+        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+        // Wait for the exit without dropping `child`, so its process handle stays open and
+        // OpenProcess still succeeds; the exit code is what marks it dead.
+        while child.try_wait().unwrap().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(lock_owner_is_dead_or_invalid(&path));
+        drop(child);
+    }
+
+    #[test]
+    fn current_process_is_a_live_lock_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".lock-test");
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+
+        assert!(!lock_owner_is_dead_or_invalid(&path));
+    }
+
     #[test]
     fn pid_zero_is_an_invalid_lock_owner() {
         let dir = tempfile::tempdir().unwrap();

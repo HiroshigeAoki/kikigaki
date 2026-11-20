@@ -8,11 +8,15 @@ use std::sync::{Arc, Mutex};
 /// line renders every field of its event (including `message`), so callers can assert on either
 /// the message text or structured fields attached with `tracing::warn!(field = value, "...")`.
 pub(crate) fn capture_warnings<T>(run: impl FnOnce() -> T) -> (T, String) {
-    // Keep has_just_one false while capturing: JustOne registers new callsites against
-    // only the registering thread's dispatcher, which may be NoSubscriber on another
-    // test thread. A second live dispatcher makes registration consult this capture too.
-    static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-    KEEPALIVE.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    // Two keepalive dispatchers make has_just_one false before the first capture registers.
+    // Otherwise JustOne can register a callsite against another thread's NoSubscriber
+    // and overwrite the capture's interest; multiple dispatchers consult every capture.
+    static KEEPALIVE: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+    KEEPALIVE.get_or_init(|| {
+        std::array::from_fn(
+            |_| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+        )
+    });
 
     let messages = Arc::new(Mutex::new(Vec::new()));
     let subscriber = WarningSubscriber(Arc::clone(&messages));
@@ -64,6 +68,7 @@ mod tests {
         }
 
         let (_, warnings) = capture_warnings(|| {
+            // The spawned thread has no thread default and only registers the callsite; the capturing thread's second warn() satisfies the assertion.
             std::thread::spawn(warn).join().unwrap();
             warn();
         });

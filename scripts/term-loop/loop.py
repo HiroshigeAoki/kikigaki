@@ -101,6 +101,18 @@ class SelfTests(unittest.TestCase):
             to_transcripts(results, out)
         to_transcripts(results, out, True)
 
+    def test_train_hyps(self):
+        results = self.root / 'hyp.jsonl'
+        results.write_text('{}\n' + ''.join(json.dumps(dict(id=i, hyp='h' + i, ref='', decode_ms=1)) + '\n'
+                                            for i in ('a1', 'a2', 'n1')))
+        out = self.root / 'train.tsv'
+        train_hyps(self.sentences, results, out)
+        self.assertEqual(out.read_text(), 'a1\tPRIVATE\tha1\nn1\tx\thn1\n')
+        self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+        results.write_text('{}\n' + json.dumps(dict(id='zz', hyp='', ref='', decode_ms=1)) + '\n')
+        with self.assertRaises(LoopError):
+            train_hyps(self.sentences, results, out)
+
     def test_score(self):
         self.sentences.write_text('a1\tx\tx\tAlpha|ALPHA\na2\tx\tx\tAlpha\na3\tx\tx\tAlpha,Beta\nn1\tx\tx\t\n')
         replay = self.root / 'replay.jsonl'
@@ -178,7 +190,7 @@ def load_sentences(path):
         expected = tuple(tuple(surface.split('|')) for surface in surfaces)
         if any(not alternative for group in expected for alternative in group):
             raise LoopError(f'{context}: empty expected alternative')
-        rows.append(dict(id=row_id, expected=expected, group=surfaces[0] if surfaces else None,
+        rows.append(dict(id=row_id, ref=columns[2], expected=expected, group=surfaces[0] if surfaces else None,
                          context=context))
     return rows
 
@@ -272,6 +284,24 @@ def to_transcripts(results, out, force=False):
         raise LoopError(f'{out}/results.jsonl: output exists; use --force') from error
 
 
+def train_hyps(sentences, results, out):
+    """Write id, ref_text and hypothesis for train-half rows only, so tuning never sees the test half."""
+    rows = load_sentences(sentences)
+    halves = split_rows(rows)
+    objects = iter(json_objects(results))
+    if next(objects, None) is None:
+        raise LoopError(f'{results}:1: missing metadata object')
+    hyps = {}
+    for number, row in enumerate(objects, 2):
+        row_id = row.get('id')
+        if row_id not in halves or row_id in hyps:
+            raise LoopError(f'{results}:{number}: unknown or duplicate id')
+        hyps[row_id] = (row.get('hyp') or '').replace('\t', ' ').replace('\n', ' ')
+    lines = [f"{row['id']}\t{row['ref']}\t{hyps[row['id']]}\n" for row in rows
+             if halves[row['id']] == 'train' and row['id'] in hyps]
+    private_write(out, ''.join(lines))
+
+
 def hit(row, text, ci=False):
     text = unicodedata.normalize('NFKC', text)
     normalize = lambda value: unicodedata.normalize('NFKC', value).casefold() if ci else unicodedata.normalize('NFKC', value)
@@ -359,7 +389,8 @@ def main():
     parser.add_argument('--self-test', action='store_true')
     commands = parser.add_subparsers(dest='command')
     for name, required in [('validate', ('terms', 'sentences')), ('split', ('sentences',)),
-                           ('to-transcripts', ('results', 'out')), ('score', ('sentences', 'replay')),
+                           ('to-transcripts', ('results', 'out')),
+                           ('train-hyps', ('sentences', 'results', 'out')), ('score', ('sentences', 'replay')),
                            ('install', ('rules', 'dest'))]:
         command = commands.add_parser(name)
         for flag in required:
@@ -389,6 +420,8 @@ def main():
                 print(row['id'] + '\t' + halves[row['id']])
         elif args.command == 'to-transcripts':
             to_transcripts(args.results, args.out, args.force)
+        elif args.command == 'train-hyps':
+            train_hyps(args.sentences, args.results, args.out)
         elif args.command == 'score':
             report = score(args.sentences, args.replay, args.half)
             if args.out:

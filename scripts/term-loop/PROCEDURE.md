@@ -91,23 +91,12 @@ then start at step 4.
    python3 "$REPO/scripts/term-loop/loop.py" score --sentences sentences.tsv --replay replay-round0.jsonl --half all --out score-round0.md
    ```
 
-8. Round 1: generate the deterministic split, then expose **only training
-   hypotheses** to the agent. Run the filter locally without displaying the full
-   hypothesis file to the agent.
+8. Round 1: expose **only training-half hypotheses** to the agent. `train-hyps`
+   writes `id`, `ref_text` and the hypothesis for train rows only; the agent reads
+   that file, never `hyp.jsonl` itself.
 
    ```sh
-   python3 "$REPO/scripts/term-loop/loop.py" split --sentences sentences.tsv > split.tsv
-   python3 - <<'PY'
-   import json
-   from pathlib import Path
-   train = {line.split('\t')[0] for line in Path('split.tsv').read_text().splitlines()
-            if line.split('\t')[1] == 'train'}
-   with Path('hyp.jsonl').open() as source, Path('hyp-train.jsonl').open('w') as out:
-       next(source)
-       for line in source:
-           if json.loads(line)['id'] in train:
-               out.write(line)
-   PY
+   python3 "$REPO/scripts/term-loop/loop.py" train-hyps --sentences sentences.tsv --results hyp.jsonl --out hyp-train.tsv
    "${EDITOR:-vi}" terms.toml
    python3 "$REPO/scripts/term-loop/loop.py" validate --terms terms.toml --sentences sentences.tsv
    python3 "$REPO/scripts/transcript-terms/terms.py" build --terms terms.toml --out replace.toml
@@ -115,7 +104,7 @@ then start at step 4.
    python3 "$REPO/scripts/term-loop/loop.py" score --sentences sentences.tsv --replay replay-round1.jsonl --half test --out score-round1-test.md
    ```
 
-   The agent reads `hyp-train.jsonl` to add observed variants. Keep the sentence
+   The agent reads `hyp-train.tsv` to add observed variants. Keep the sentence
    set fixed. Never tune on test hypotheses or test replay text. The headline is
    held-out test accuracy before/after round 1; retain round 0's all-row score.
    A row hits only when every expected surface has some alternative present

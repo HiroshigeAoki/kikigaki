@@ -53,6 +53,9 @@ done
 if [ "${#MANIFESTS[@]}" -eq 0 ]; then
   MANIFESTS=("$DIR/target.tsv" "$DIR/negative.tsv")
 fi
+if [ "$LIST" -eq 1 ] && [ "$DRY_RUN" -eq 1 ]; then
+  echo "--list and --dry-run cannot be combined" >&2; exit 2
+fi
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v ffmpeg >/dev/null || { echo "ffmpeg not found (brew install ffmpeg)"; exit 1; }
   if [ "$LIST" -eq 1 ]; then

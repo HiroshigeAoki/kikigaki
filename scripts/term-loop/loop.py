@@ -109,9 +109,37 @@ class SelfTests(unittest.TestCase):
         train_hyps(self.sentences, results, out)
         self.assertEqual(out.read_text(), 'a1\tPRIVATE\tha1\nn1\tx\thn1\n')
         self.assertEqual(out.stat().st_mode & 0o777, 0o600)
-        results.write_text('{}\n' + json.dumps(dict(id='zz', hyp='', ref='', decode_ms=1)) + '\n')
-        with self.assertRaises(LoopError):
-            train_hyps(self.sentences, results, out)
+        for rows in [[dict(id='zz', hyp='')], [dict(id=['a1'], hyp='PRIVATE')],
+                     [dict(id='a1', hyp=42)], [dict(id='a1', hyp='PRIVATE')], []]:
+            with self.subTest(rows=rows):
+                results.write_text('{}\n' + ''.join(json.dumps(r) + '\n' for r in rows))
+                with self.assertRaises(LoopError) as caught:
+                    train_hyps(self.sentences, results, out)
+                self.assertNotIn('PRIVATE', str(caught.exception))
+
+    def test_validate_inputs_edge_cases(self):
+        self.sentences.write_text(self.sentences.read_text() + '\n\n')
+        validate_inputs(self.terms, self.sentences, 2)
+        for to in ['A,B', 'A|B']:
+            self.terms.write_text(f'[[term]]\nto="{to}"\nvariants=["v"]\n')
+            with self.assertRaises(LoopError) as caught:
+                validate_inputs(self.terms, self.sentences, 1)
+            self.assertIn('must not contain', str(caught.exception))
+        # Beta appears only as a second surface, so both of its rows land in train.
+        self.terms.write_text('[[term]]\nto="Alpha"\nvariants=["a"]\n[[term]]\nto="Beta"\nvariants=["b"]\n')
+        self.sentences.write_text('a1\tx\tx\tAlpha,Beta\na2\tx\tx\tAlpha\nb1\tx\tx\tAlpha,Beta\nn1\tx\tx\t\n')
+        with self.assertRaises(LoopError) as caught:
+            validate_inputs(self.terms, self.sentences, 1)
+        self.assertIn('both halves', str(caught.exception))
+
+    def test_existing_output_directory_mode_is_kept(self):
+        results = self.root / 'hyp.jsonl'
+        results.write_text('{}\n' + json.dumps(dict(id='a1', hyp='x')) + '\n')
+        existing = self.root / 'shared'
+        existing.mkdir(mode=0o755)
+        existing.chmod(0o755)
+        to_transcripts(results, existing)
+        self.assertEqual(existing.stat().st_mode & 0o777, 0o755)
 
     def test_score(self):
         self.sentences.write_text('a1\tx\tx\tAlpha|ALPHA\na2\tx\tx\tAlpha\na3\tx\tx\tAlpha,Beta\nn1\tx\tx\t\n')
@@ -173,7 +201,7 @@ def terms_module():
 def load_sentences(path):
     rows, seen = [], set()
     for number, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
-        if line.startswith('#'):
+        if not line.strip() or line.startswith('#'):
             continue
         columns = line.split('\t')
         # Malformed IDs may themselves be private sentence text; never echo them.
@@ -205,6 +233,10 @@ def validate_inputs(terms_path, sentences, minimum):
         terms, _ = module.load_terms(terms_path)
     except module.TermError as error:
         raise LoopError(f'{terms_path}:1 (id=<terms>): {error}') from error
+    for term in terms:
+        if ',' in term or '|' in term:
+            raise LoopError(f'{terms_path}:1 (id=<terms>): term.to must not contain "," or "|" '
+                            '(they separate surfaces in sentences.tsv)')
     rows = load_sentences(sentences)
     counts = dict.fromkeys(terms, 0)
     for row in rows:
@@ -215,6 +247,14 @@ def validate_inputs(terms_path, sentences, minimum):
             counts[term] += 1
     if any(count < minimum for count in counts.values()):
         raise LoopError(f'{sentences}:1 (id=<all>): insufficient rows per term')
+    halves = split_rows(rows)
+    seen_in = defaultdict(set)
+    for row in rows:
+        for term in row_terms(row):
+            seen_in[term].add(halves[row['id']])
+    if any(seen_in[term] != {'train', 'test'} for term in terms):
+        raise LoopError(f'{sentences}:1 (id=<all>): every term needs rows in both halves; '
+                        'make it the first surface of more rows')
     negatives = sum(not row['expected'] for row in rows)
     if not negatives:
         raise LoopError(f'{sentences}:1 (id=<all>): at least one negative row required')
@@ -262,21 +302,26 @@ def private_directory(path):
         path.mkdir(mode=0o700)
 
 
-def to_transcripts(results, out, force=False):
+def result_hyps(results):
+    """Return {id: hypothesis} from hotword-eval results, in file order."""
     objects = iter(json_objects(results))
     if next(objects, None) is None:
         raise LoopError(f'{results}:1: missing metadata object')
-    records, seen = [], set()
+    hyps = {}
     for number, row in enumerate(objects, 2):
         row_id = row.get('id')
         hyp = row.get('hyp')
-        if (not isinstance(row_id, str) or not ID_RE.fullmatch(row_id) or row_id in seen
+        if (not isinstance(row_id, str) or not ID_RE.fullmatch(row_id) or row_id in hyps
                 or 'hyp' not in row or (hyp is not None and not isinstance(hyp, str))):
             raise LoopError(f'{results}:{number}: invalid or duplicate result record')
-        seen.add(row_id)
-        records.append(dict(at=row_id, engine='eval', raw=hyp or ''))
+        hyps[row_id] = hyp or ''
+    return hyps
+
+
+def to_transcripts(results, out, force=False):
+    records = [dict(at=row_id, engine='eval', raw=hyp) for row_id, hyp in result_hyps(results).items()]
+    # A new directory is created 0700; an existing one keeps its mode (it may be shared, e.g. ".").
     private_directory(out)
-    out.chmod(0o700)
     try:
         private_write(out / 'results.jsonl', ''.join(json.dumps(r, ensure_ascii=False) + '\n'
                                                   for r in records), force)
@@ -288,17 +333,13 @@ def train_hyps(sentences, results, out):
     """Write id, ref_text and hypothesis for train-half rows only, so tuning never sees the test half."""
     rows = load_sentences(sentences)
     halves = split_rows(rows)
-    objects = iter(json_objects(results))
-    if next(objects, None) is None:
-        raise LoopError(f'{results}:1: missing metadata object')
-    hyps = {}
-    for number, row in enumerate(objects, 2):
-        row_id = row.get('id')
-        if row_id not in halves or row_id in hyps:
-            raise LoopError(f'{results}:{number}: unknown or duplicate id')
-        hyps[row_id] = (row.get('hyp') or '').replace('\t', ' ').replace('\n', ' ')
-    lines = [f"{row['id']}\t{row['ref']}\t{hyps[row['id']]}\n" for row in rows
-             if halves[row['id']] == 'train' and row['id'] in hyps]
+    hyps = result_hyps(results)
+    if hyps.keys() != halves.keys():
+        # A partial or mismatched run would silently shrink the training set.
+        raise LoopError(f'{results}: result ids do not match the sentence ids '
+                        f'({len(halves.keys() - hyps.keys())} missing, {len(hyps.keys() - halves.keys())} extra)')
+    lines = [f"{row['id']}\t{row['ref']}\t{' '.join(hyps[row['id']].split())}\n" for row in rows
+             if halves[row['id']] == 'train']
     private_write(out, ''.join(lines))
 
 

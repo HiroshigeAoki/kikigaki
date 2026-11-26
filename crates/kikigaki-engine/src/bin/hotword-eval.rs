@@ -499,6 +499,11 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
         (None, None) if hotwords_score.is_some() => {
             bail!("--hotwords-score requires --hotwords-file\n{USAGE}")
         }
+        // The eval vocab tooling targets Reazon's bbpe units; Haas uses bpe, and the run
+        // metadata would not tell the two apart.
+        (Some(_), Some(_)) if engine == EvalEngine::Haas => {
+            bail!("--engine haas does not support hotwords in this harness\n{USAGE}")
+        }
         _ => {}
     }
     Ok(Args {
@@ -644,6 +649,33 @@ mod tests {
             EvalEngine::Reazon.model_dir(),
             kikigaki_core::models::ASR_MODEL_ID
         );
+    }
+
+    #[test]
+    fn haas_rejects_hotwords() {
+        let error = parse_args(
+            [
+                "--models-dir",
+                "m",
+                "--manifest",
+                "m.tsv",
+                "--wavs-dir",
+                "wavs",
+                "--out",
+                "out.jsonl",
+                "--engine",
+                "haas",
+                "--hotwords-file",
+                "h.txt",
+                "--bpe-vocab",
+                "v.txt",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--engine haas does not support hotwords"));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 # 設定リファレンス
 
-設定ファイルは `~/.config/kikigaki/config.toml`。任意で、省略した項目はすべて既定値のまま動く。
+設定ファイルはmacOSでは `~/.config/kikigaki/config.toml`、Windowsでは `%APPDATA%\kikigaki\config.toml`。任意で、省略した項目はすべて既定値のまま動く。
 
 ## 全項目と既定値
+
+以下のパスとホットキーはmacOSの既定値である。Windowsで異なる値は設定例の下に記載する。
 
 ```toml
 engine = "local"
@@ -12,6 +14,9 @@ strip_trailing_period = true
 silence_pad_ms = 500
 final_timeout_ms = 3000
 builtin_replace_dict = false
+transcript_log = false
+transcript_dir = "~/.config/kikigaki/transcripts"
+learned_file = "~/.config/kikigaki/learned.toml"
 replace_file = "~/.config/kikigaki/replace.toml"
 metrics_path = "~/Library/Logs/kikigaki/latency.jsonl"
 models_dir = "~/Library/Application Support/kikigaki/models"
@@ -44,7 +49,13 @@ connect_timeout_ms = 30000
 server_punctuates = true
 ```
 
-`punct.enabled` は `"auto"` / `true` / `false` を取り、`"auto"` は句読点サポート付きビルドでのみ有効になる。
+`hotkey` の既定値はmacOSで `Alt+Space`、Windowsで `Ctrl+Alt+Space`（Windowsでは `Alt+Space` がシステムメニューを開くため）。
+
+`replace_file` / `metrics_path` / `models_dir` の既定値はOSごとに異なる。一覧は [README](../README.md#ファイルの場所)を参照。Windowsの `transcript_dir` は `%APPDATA%\kikigaki\transcripts`、`learned_file` は `%APPDATA%\kikigaki\learned.toml` である。
+
+`transcript_log` は認識結果をファイルに記録するかを指定する。既定値は `false` で、設定画面の「ファイルにも記録」で切り替える。
+
+`punct.enabled` は `"auto"` / `true` / `false` を取り、`"auto"` は句読点サポート付きビルドでのみ有効になる。Haasは自身で句読点を出力するため、mojicastの句読点モデルを適用しない。
 
 ## 廃止した設定と不明な項目
 
@@ -64,7 +75,7 @@ server_punctuates = true
 
 ## 置換辞書
 
-`~/.config/kikigaki/replace.toml` の書き方は [README](../README.md#置換辞書) を参照。
+`replace_file` で指定する置換辞書ファイルの書き方は [README](../README.md#置換辞書) を参照。
 
 `builtin_replace_dict` は真偽値で、既定値は `false`。精査済みのOSSソースから構築してバイナリに同梱した、カタカナ語→英語の内蔵置換辞書を有効にする。`replace.toml` のユーザー定義ルールと学習済みの修正は、内蔵辞書より優先される。
 

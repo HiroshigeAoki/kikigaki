@@ -2898,7 +2898,11 @@ mod tests {
             utterance(&mut h, HotkeyKey::Standard);
             h.engine(EngineKind::Local)
                 .send(final_message(1, "queued before abort"));
-            h.turn();
+            // Queue postprocessing without draining its completion in the same turn:
+            // a fast worker could otherwise paste before the simulated disconnect.
+            let mut outputs = Vec::new();
+            h.controller.handle_engine_messages(&mut outputs);
+            h.controller.execute_outputs(outputs);
             rx.recv_timeout(Duration::from_secs(1)).unwrap();
             h.disconnected(None);
             h.turn();

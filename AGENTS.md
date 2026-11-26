@@ -14,7 +14,8 @@ only compiles on a Mac.
 ## Building the macOS app
 
 - Development happens on Linux; macOS builds run on a build Mac over SSH via
-  `scripts/mac-sync-build.sh` / `scripts/release-mac.sh` (env vars at the top of each script).
+  `scripts/mac-sync-build.sh` / `scripts/release-mac.sh`; env vars are documented in the
+  `mac-sync-build.sh` header. No secrets live in this repo.
 - `KIKIGAKI_MODELS_DIR` is only for test tools; it does not override the GUI's `models_dir` setting.
 
 ## Conventions

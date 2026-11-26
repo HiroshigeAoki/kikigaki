@@ -208,7 +208,7 @@ def validate_inputs(terms_path, sentences, minimum):
     rows = load_sentences(sentences)
     counts = dict.fromkeys(terms, 0)
     for row in rows:
-        alternatives = {a for group in row['expected'] for a in group}
+        alternatives = row_terms(row)
         if alternatives - terms.keys():
             raise LoopError(f"{row['context']}: expected alternative is not a term.to")
         for term in alternatives:
@@ -302,12 +302,16 @@ def train_hyps(sentences, results, out):
     private_write(out, ''.join(lines))
 
 
+def row_terms(row):
+    return {a for group in row['expected'] for a in group}
+
+
 def hit(row, text, ci=False):
-    text = unicodedata.normalize('NFKC', text)
-    normalize = lambda value: unicodedata.normalize('NFKC', value).casefold() if ci else unicodedata.normalize('NFKC', value)
-    if ci:
-        text = text.casefold()
-    return all(any(normalize(a) in text for a in group) for group in row['expected'])
+    def fold(value):
+        value = unicodedata.normalize('NFKC', value)
+        return value.casefold() if ci else value
+    text = fold(text)
+    return all(any(fold(a) in text for a in group) for group in row['expected'])
 
 
 def score(sentences, replay, half):
@@ -327,7 +331,7 @@ def score(sentences, replay, half):
     halves = split_rows(rows)
     counts = defaultdict(lambda: [0, 0, 0, 0])
     for row in rows:
-        for term in {a for group in row['expected'] for a in group}:
+        for term in row_terms(row):
             counts[term]  # Include terms with zero rows in the selected half.
     totals, negatives, false_ids, regressions = [0, 0, 0, 0], 0, [], []
     for row in rows:
@@ -345,7 +349,7 @@ def score(sentences, replay, half):
         totals = [a + b for a, b in zip(totals, values)]
         if values[2] < values[1]:
             regressions.append(row_id)
-        for term in {a for group in row['expected'] for a in group}:
+        for term in row_terms(row):
             counts[term] = [a + b for a, b in zip(counts[term], values)]
     def cell(text):
         return text.replace('&', '&amp;').replace('<', '&lt;').replace('|', '&#124;').replace('\n', '&#10;').replace('\r', '&#13;')

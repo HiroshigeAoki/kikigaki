@@ -1075,6 +1075,7 @@ mod tests {
             .map(|i| crate::replace::Rule {
                 from: vec![format!("w{i}")],
                 to: format!("r{i}"),
+                whole_word: false,
             })
             .collect();
         let learned = std::sync::Arc::new(
@@ -1204,6 +1205,7 @@ mod tests {
             .map(|index| crate::replace::Rule {
                 from: vec![synthetic_source(index)],
                 to: format!("term{index}"),
+                whole_word: false,
             })
             .collect();
         let builtin = Arc::new(crate::replace::Rules::from_learned_checked(rules).unwrap());

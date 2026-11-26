@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -102,24 +103,51 @@ fn runtime_path(models_dir: &Path) -> PathBuf {
     }
     models_dir
         .join("onnxruntime-1.27.1")
-        .join(if cfg!(target_os = "macos") {
-            "libonnxruntime.dylib"
-        } else {
-            "libonnxruntime.so"
-        })
+        .join(runtime_file_name())
 }
 
-/// The ONNX Runtime copy Tauri places in the app bundle (`Contents/Frameworks/`). A hardened-
-/// runtime app can only dlopen libraries sealed into its own bundle, so when we run from a bundle
-/// this copy wins over the development-only models-directory fallback.
-fn bundled_runtime_path() -> Option<PathBuf> {
-    if !cfg!(target_os = "macos") {
-        return None;
+/// Bare ONNX Runtime shared-library file name for the running OS.
+fn runtime_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
     }
+}
+
+/// The ONNX Runtime copy Tauri bundles with the app. macOS ships it inside the
+/// hardened-runtime app bundle (`Contents/Frameworks/`); Windows will ship it flat next to the
+/// exe via a `bundle.resources` entry in `tauri.windows.conf.json` (added by a later task on
+/// this branch). A development-only models-directory fallback exists for both platforms when
+/// neither bundled copy is present.
+///
+/// On Windows we try the exe-adjacent copy first (the installed app), then the parent
+/// directory, but only when the exe runs from Cargo's `deps\` directory: `sherpa-onnx-sys`'s
+/// build script copies the runtime DLLs into `target\<profile>\` while Cargo test binaries run
+/// from `target\<profile>\deps\`, so a test process finds the same DLL the ASR engine already
+/// loaded one level up. Gating on the `deps` directory name keeps an installed app from silently
+/// loading a stale DLL from the user-controlled parent of the install directory; it fails with a
+/// clear "not found" instead.
+fn bundled_runtime_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let contents = exe.parent()?.parent()?;
-    let candidate = contents.join("Frameworks").join("libonnxruntime.dylib");
-    candidate.is_file().then_some(candidate)
+    let candidates: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        let contents = exe.parent()?.parent()?;
+        vec![contents.join("Frameworks").join(runtime_file_name())]
+    } else if cfg!(target_os = "windows") {
+        let exe_dir = exe.parent()?;
+        let mut found = vec![exe_dir.join(runtime_file_name())];
+        if exe_dir.file_name() == Some(OsStr::new("deps")) {
+            if let Some(profile_dir) = exe_dir.parent() {
+                found.push(profile_dir.join(runtime_file_name()));
+            }
+        }
+        found
+    } else {
+        return None;
+    };
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 fn probabilities_from_logits(
@@ -160,6 +188,18 @@ fn sigmoid(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_file_name_is_dll_on_windows_dylib_on_macos_so_elsewhere() {
+        assert_eq!(
+            runtime_file_name(),
+            format!(
+                "{}onnxruntime{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            )
+        );
+    }
 
     #[test]
     fn logits_require_exact_shape_and_finite_values() {

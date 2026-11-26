@@ -93,6 +93,8 @@ impl LockGuard {
     }
 }
 
+/// Checks a lock PID using `kill(pid, 0)` on Unix and `OpenProcess` on Windows.
+/// PID reuse can make a stale lock appear live on either platform.
 fn lock_owner_is_dead_or_invalid(path: &Path) -> bool {
     let Ok(contents) = fs::read_to_string(path) else {
         return true;
@@ -117,7 +119,41 @@ fn lock_owner_is_dead_or_invalid(path: &Path) -> bool {
         let result = unsafe { kill(pid, 0) };
         result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(
+                desired_access: u32,
+                inherit_handle: i32,
+                process_id: u32,
+            ) -> *mut c_void;
+            fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+            fn CloseHandle(object: *mut c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: OpenProcess with a query-only access right has no side effects; the handle is
+        // closed before returning.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                // No such process id -> dead. Any other error (e.g. access denied for a
+                // protected process) means it exists -> alive.
+                return GetLastError() == ERROR_INVALID_PARAMETER;
+            }
+            let mut exit_code = 0u32;
+            let queried = GetExitCodeProcess(handle, &mut exit_code) != 0;
+            CloseHandle(handle);
+            // A handle can still open for a process that has exited but is not yet reaped.
+            queried && exit_code != STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -579,7 +615,7 @@ fn remove_entry(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{File, FileTimes};
+    use std::fs::FileTimes;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
@@ -862,7 +898,21 @@ mod tests {
     }
 
     fn make_old(path: &std::path::Path) {
-        let file = File::open(path).unwrap();
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // set_times needs FILE_WRITE_ATTRIBUTES, and a directory handle only opens with
+            // FILE_FLAG_BACKUP_SEMANTICS.
+            const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .unwrap()
+        };
+        #[cfg(not(windows))]
+        let file = std::fs::File::open(path).unwrap();
         let old = SystemTime::now() - Duration::from_secs(3_700);
         file.set_times(FileTimes::new().set_modified(old)).unwrap();
     }
@@ -893,6 +943,37 @@ mod tests {
             guard.is_ok(),
             "a lock held by a dead PID must be reclaimable without waiting an hour"
         );
+    }
+
+    // Windows only: a Unix zombie still answers kill(pid, 0), so the same scenario reads as alive
+    // there until the parent reaps it.
+    #[cfg(windows)]
+    #[test]
+    fn exited_child_whose_handle_is_still_open_is_a_dead_lock_owner() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".lock-test");
+        std::fs::write(&path, format!("{}\n", child.id())).unwrap();
+        // Wait for the exit without dropping `child`, so its process handle stays open and
+        // OpenProcess still succeeds; the exit code is what marks it dead.
+        while child.try_wait().unwrap().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(lock_owner_is_dead_or_invalid(&path));
+        drop(child);
+    }
+
+    #[test]
+    fn current_process_is_a_live_lock_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".lock-test");
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+
+        assert!(!lock_owner_is_dead_or_invalid(&path));
     }
 
     #[test]

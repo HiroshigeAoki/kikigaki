@@ -15,8 +15,13 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-sherpa-onnx = "=1.13.6"
 tempfile.workspace = true
 sha2 = "0.10"
 hex = "0.4"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sherpa-onnx = { version = "=1.13.6", default-features = false, features = ["shared"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+sherpa-onnx = { version = "=1.13.6", default-features = false, features = ["static"] }

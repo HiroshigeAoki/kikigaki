@@ -2310,6 +2310,7 @@ dependencies = [
  "block2",
  "chrono",
  "cpal",
+ "dasp_sample",
  "dirs 6.0.0",
  "enigo",
  "futures-util",
@@ -2334,6 +2335,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "webpki-roots 1.0.10",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -146,4 +146,4 @@ if [ "$DRY_RUN" -eq 1 ]; then exit 0; fi
 echo
 recorded=$(ls "$OUT"/*.wav 2>/dev/null | wc -l | tr -d ' ')
 echo "完了: 今回 $done_count / 対象 $total。$OUT に合計 $recorded 個の WAV があります。"
-echo "45個そろったら dgx-1 側に知らせてください(回収して評価を回します)。"
+echo "全文そろったら評価する側に知らせてください(回収して評価を回します)。"

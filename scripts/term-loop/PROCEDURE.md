@@ -64,9 +64,14 @@ then start at step 4.
    record with the same microphone used for dictation. Set `REPO` and `WORK`
    there as in step 1, then run:
 
+   First list the microphones and pick the real one: index 0 can be a virtual
+   device (for example a meeting app's audio driver) that records silence.
+
    ```sh
    umask 077
-   "$REPO/scripts/hotword-eval/record-voice.sh" --manifest sentences.tsv --out "$WORK/wavs"
+   "$REPO/scripts/hotword-eval/record-voice.sh" --list
+   DEVICE=<index of the dictation microphone>
+   "$REPO/scripts/hotword-eval/record-voice.sh" --device "$DEVICE" --manifest sentences.tsv --out "$WORK/wavs"
    ```
 
    Keep or re-record each take; re-record only reading mistakes. If transcription

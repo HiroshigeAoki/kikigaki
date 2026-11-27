@@ -62,15 +62,14 @@ then start at step 4.
 
 5. On the Mac, copy the private inputs into a private directory outside Git and
    record with the same microphone used for dictation. Set `REPO` and `WORK`
-   there as in step 1, then run:
-
-   First list the microphones and pick the real one: index 0 can be a virtual
-   device (for example a meeting app's audio driver) that records silence.
+   there as in step 1. List the microphones first and set `DEVICE` to the
+   dictation microphone's index: index 0 can be a virtual device (for example a
+   meeting app's audio driver) that records silence. Then run:
 
    ```sh
    umask 077
    "$REPO/scripts/hotword-eval/record-voice.sh" --list
-   DEVICE=<index of the dictation microphone>
+   DEVICE=1  # index shown by --list
    "$REPO/scripts/hotword-eval/record-voice.sh" --device "$DEVICE" --manifest sentences.tsv --out "$WORK/wavs"
    ```
 

@@ -59,7 +59,7 @@ fi
 if [ "$DRY_RUN" -eq 0 ]; then
   command -v ffmpeg >/dev/null || { echo "ffmpeg not found (brew install ffmpeg)"; exit 1; }
   if [ "$LIST" -eq 1 ]; then
-    ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | sed -n '/audio devices/,$p'
+    ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | sed -n '/audio devices/,$p' || true
     exit 0
   fi
   umask 077

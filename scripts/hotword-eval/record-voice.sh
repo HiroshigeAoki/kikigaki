@@ -8,6 +8,9 @@
 #   bash record-voice.sh --device 1   # pick another avfoundation mic index
 #   bash record-voice.sh --list      # list microphones and exit
 #   bash record-voice.sh --only t01   # (re-)record a single id
+#   bash record-voice.sh --manifest FILE [--manifest FILE ...] --out DIR
+#                                    # replace default TSVs / output directory
+#   bash record-voice.sh --dry-run    # print id<TAB>text without recording
 #
 # Per sentence: any key to start, any key to stop, then
 #   [k]eep / [p]lay / [r]e-record / [s]kip / [q]uit (single keypress, no Enter).
@@ -23,20 +26,48 @@ DIR="$(cd "$(dirname -- "$0")" && pwd)"
 OUT="$HOME/eval-wavs-real"
 DEVICE=":0"
 ONLY=""
+MANIFESTS=()
+DRY_RUN=0
+LIST=0
+
+require_value() {
+  if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+    echo "$1 requires a value" >&2
+    exit 2
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --device) DEVICE=":$2"; shift 2 ;;
-    --list) ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | sed -n '/audio devices/,$p'; exit 0 ;;
-    --only) ONLY="$2"; shift 2 ;;
+    --device) require_value "$@"; DEVICE=":$2"; shift 2 ;;
+    --list) LIST=1; shift ;;
+    --only) require_value "$@"; ONLY="$2"; shift 2 ;;
+    --manifest) require_value "$@"; MANIFESTS+=("$2"); shift 2 ;;
+    --out) require_value "$@"; OUT="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
-command -v ffmpeg >/dev/null || { echo "ffmpeg not found (brew install ffmpeg)"; exit 1; }
-mkdir -p "$OUT"
+# Bash 3.2 with nounset cannot expand an empty array.
+if [ "${#MANIFESTS[@]}" -eq 0 ]; then
+  MANIFESTS=("$DIR/target.tsv" "$DIR/negative.tsv")
+fi
+if [ "$LIST" -eq 1 ] && [ "$DRY_RUN" -eq 1 ]; then
+  echo "--list and --dry-run cannot be combined" >&2; exit 2
+fi
+if [ "$DRY_RUN" -eq 0 ]; then
+  command -v ffmpeg >/dev/null || { echo "ffmpeg not found (brew install ffmpeg)"; exit 1; }
+  if [ "$LIST" -eq 1 ]; then
+    ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | sed -n '/audio devices/,$p' || true
+    exit 0
+  fi
+  umask 077
+  mkdir -p -m 700 "$OUT"
+  chmod 700 "$OUT"
+fi
 FFPID=""
-trap '[ -n "$FFPID" ] && kill -INT "$FFPID" 2>/dev/null' EXIT
+trap 'if [ -n "$FFPID" ]; then kill -INT "$FFPID" 2>/dev/null || true; fi' EXIT
 
 record_one() {
   local id="$1" text="$2" tmp="$OUT/.take.wav" final="$OUT/$id.wav"
@@ -93,11 +124,15 @@ record_one() {
 }
 
 total=0 done_count=0
-for tsv in "$DIR/target.tsv" "$DIR/negative.tsv"; do
+for tsv in "${MANIFESTS[@]}"; do
   [ -f "$tsv" ] || { echo "missing $tsv (copy the data TSVs next to this script)"; exit 1; }
-  while IFS=$'\t' read -r id spoken _rest; do
+  while IFS=$'\t' read -r id spoken _rest || [ -n "$id" ]; do
     case "$id" in \#*|"") continue ;; esac
     if [ -n "$ONLY" ] && [ "$id" != "$ONLY" ]; then continue; fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '%s\t%s\n' "$id" "$spoken"
+      continue
+    fi
     total=$((total + 1))
     if record_one "$id" "$spoken"; then done_count=$((done_count + 1)); else
       echo; echo "中断しました($done_count 件保存済み)。再開はもう一度実行してください(録音済みはスキップ可)。"
@@ -106,7 +141,9 @@ for tsv in "$DIR/target.tsv" "$DIR/negative.tsv"; do
   done < "$tsv"
 done
 
+if [ "$DRY_RUN" -eq 1 ]; then exit 0; fi
+
 echo
 recorded=$(ls "$OUT"/*.wav 2>/dev/null | wc -l | tr -d ' ')
 echo "完了: 今回 $done_count / 対象 $total。$OUT に合計 $recorded 個の WAV があります。"
-echo "45個そろったら dgx-1 側に知らせてください(回収して評価を回します)。"
+echo "全文そろったら評価する側に知らせてください(回収して評価を回します)。"

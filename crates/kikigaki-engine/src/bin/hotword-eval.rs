@@ -9,20 +9,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, ensure, Context};
-use kikigaki_core::config::AsrConfig;
-use kikigaki_core::models::ASR_MODEL_ID;
+use kikigaki_core::config::{AsrConfig, AsrModel};
+use kikigaki_core::models::{ASR_MODEL_ID, HAAS_MODEL_ID};
 use kikigaki_engine::audio::load_wav_16k;
 use kikigaki_engine::local::Recognizer;
 use kikigaki_engine::sherpa::{build_recognizer, build_recognizer_with_hotwords};
 use serde::Serialize;
 
 const DEFAULT_HOTWORDS_SCORE: f32 = 1.5;
-const USAGE: &str = "usage: hotword-eval --models-dir D --manifest M.tsv [--manifest M.tsv ...] --wavs-dir W --out R.jsonl [--engine reazon] [--hotwords-file F --bpe-vocab V] [--hotwords-score S] [--num-threads N]";
+const USAGE: &str = "usage: hotword-eval --models-dir D --manifest M.tsv [--manifest M.tsv ...] --wavs-dir W --out R.jsonl [--engine reazon|haas] [--hotwords-file F --bpe-vocab V] [--hotwords-score S] [--num-threads N]";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EvalEngine {
     Reazon,
+    Haas,
+}
+
+impl EvalEngine {
+    fn model(self) -> AsrModel {
+        match self {
+            Self::Reazon => AsrModel::ReazonSpeech,
+            Self::Haas => AsrModel::Haas,
+        }
+    }
+
+    fn model_dir(self) -> &'static str {
+        match self {
+            Self::Reazon => ASR_MODEL_ID,
+            Self::Haas => HAAS_MODEL_ID,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -39,13 +56,13 @@ struct Args {
 }
 
 enum EvalRecognizer {
-    Reazon(Box<dyn Recognizer>),
+    Sherpa(Box<dyn Recognizer>),
 }
 
 impl EvalRecognizer {
     fn transcribe(&mut self, samples: &[f32]) -> anyhow::Result<Option<String>> {
         match self {
-            Self::Reazon(recognizer) => Ok(recognizer.transcribe(samples)),
+            Self::Sherpa(recognizer) => Ok(recognizer.transcribe(samples)),
         }
     }
 }
@@ -125,34 +142,29 @@ fn run() -> anyhow::Result<()> {
 
     let asr_config = AsrConfig {
         num_threads: args.num_threads,
-        model: kikigaki_core::config::AsrModel::ReazonSpeech,
+        model: args.engine.model(),
         ..AsrConfig::default()
     };
-    let mut recognizer = match args.engine {
-        EvalEngine::Reazon => EvalRecognizer::Reazon(match &hotwords {
-            Some(metadata) => Box::new(
-                build_recognizer_with_hotwords(
-                    &args.models_dir,
-                    &asr_config,
-                    metadata.path.as_path(),
-                    metadata.score,
-                    metadata.bpe_vocab_path.as_path(),
-                )
-                .context("build recognizer with hotwords")?,
-            ),
-            None => Box::new(
-                build_recognizer(&args.models_dir, &asr_config).context("build recognizer")?,
-            ),
-        }),
-    };
+    let mut recognizer = EvalRecognizer::Sherpa(match &hotwords {
+        Some(metadata) => Box::new(
+            build_recognizer_with_hotwords(
+                &args.models_dir,
+                &asr_config,
+                metadata.path.as_path(),
+                metadata.score,
+                metadata.bpe_vocab_path.as_path(),
+            )
+            .context("build recognizer with hotwords")?,
+        ),
+        None => {
+            Box::new(build_recognizer(&args.models_dir, &asr_config).context("build recognizer")?)
+        }
+    });
 
     let (mut pending, file) = create_pending_output(&args.out)?;
     let mut writer = BufWriter::new(file);
     let header = RunMetadata {
-        condition: match args.engine {
-            EvalEngine::Reazon if hotwords.is_some() => "D",
-            EvalEngine::Reazon => "B",
-        },
+        condition: if hotwords.is_some() { "D" } else { "B" },
         hotwords_file_sha256: hotwords.as_ref().map(|metadata| metadata.sha256.clone()),
         hotwords_line_count: hotwords.as_ref().map(|metadata| metadata.line_count),
         hotwords_score: hotwords.as_ref().map(|metadata| metadata.score),
@@ -165,7 +177,7 @@ fn run() -> anyhow::Result<()> {
         num_threads: args.num_threads,
         manifest_sha256,
         git_head,
-        model_dir: ASR_MODEL_ID.to_owned(),
+        model_dir: args.engine.model_dir().to_owned(),
         // Preserve the JSONL schema for comparison with older evaluation results.
         whisper_audio_ctx: None,
     };
@@ -180,6 +192,8 @@ fn run() -> anyhow::Result<()> {
         let samples = load_wav_16k(&wav_path)
             .with_context(|| format!("{}: load {}", row.context(), wav_path.display()))?;
 
+        // Whole-WAV evaluation has no VAD boundary/history to prepend. Haas uses
+        // the app's SherpaAsr path with its zero synthetic onset-padding floor.
         let started = Instant::now();
         let hypothesis = recognizer
             .transcribe(&samples)
@@ -455,7 +469,8 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
                 let value = take_utf8(&mut arguments, flag)?;
                 let value = match value.as_str() {
                     "reazon" => EvalEngine::Reazon,
-                    _ => bail!("invalid --engine value {value:?}; expected reazon"),
+                    "haas" => EvalEngine::Haas,
+                    _ => bail!("invalid --engine value {value:?}; expected reazon or haas"),
                 };
                 set_once(&mut engine, value, flag)?;
             }
@@ -483,6 +498,11 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<A
         (None, Some(_)) => bail!("--bpe-vocab requires --hotwords-file\n{USAGE}"),
         (None, None) if hotwords_score.is_some() => {
             bail!("--hotwords-score requires --hotwords-file\n{USAGE}")
+        }
+        // The eval vocab tooling targets Reazon's bbpe units; Haas uses bpe, and the run
+        // metadata would not tell the two apart.
+        (Some(_), Some(_)) if engine == EvalEngine::Haas => {
+            bail!("--engine haas does not support hotwords in this harness\n{USAGE}")
         }
         _ => {}
     }
@@ -599,6 +619,64 @@ fn sha256_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn haas_engine_and_model_metadata() {
+        let args = parse_args(
+            [
+                "--models-dir",
+                "models",
+                "--manifest",
+                "m.tsv",
+                "--wavs-dir",
+                "wavs",
+                "--out",
+                "out.jsonl",
+                "--engine",
+                "haas",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(args.engine, EvalEngine::Haas);
+        assert_eq!(args.engine.model(), AsrModel::Haas);
+        assert_eq!(EvalEngine::Reazon.model(), AsrModel::ReazonSpeech);
+        assert_eq!(
+            args.engine.model_dir(),
+            kikigaki_core::models::HAAS_MODEL_ID
+        );
+        assert_eq!(
+            EvalEngine::Reazon.model_dir(),
+            kikigaki_core::models::ASR_MODEL_ID
+        );
+    }
+
+    #[test]
+    fn haas_rejects_hotwords() {
+        let error = parse_args(
+            [
+                "--models-dir",
+                "m",
+                "--manifest",
+                "m.tsv",
+                "--wavs-dir",
+                "wavs",
+                "--out",
+                "out.jsonl",
+                "--engine",
+                "haas",
+                "--hotwords-file",
+                "h.txt",
+                "--bpe-vocab",
+                "v.txt",
+            ]
+            .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--engine haas does not support hotwords"));
+    }
 
     #[test]
     fn parses_canonical_manifest_and_preserves_order() {

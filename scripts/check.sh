@@ -68,6 +68,7 @@ fi
 echo "== transcript term tool self-tests =="
 if command -v python3 >/dev/null 2>&1; then
   python3 scripts/transcript-terms/terms.py --self-test
+  python3 scripts/term-loop/loop.py --self-test
 else
   echo "SKIP: python3 is unavailable; transcript term tool self-tests not run"
 fi
